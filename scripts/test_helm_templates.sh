@@ -85,6 +85,19 @@ grep -q "type: RollingUpdate" <<<"$rolling_output"
 grep -q "rollingUpdate:" <<<"$rolling_output"
 grep -Eq '^[[:space:]]*replicas:[[:space:]]*1[[:space:]]*$' <<<"$rolling_output"
 
+standalone_command_count=$(yq eval '(.spec.template.spec.containers[0].command // []) | length' - <<<"$rolling_output")
+if [[ "$standalone_command_count" != "0" ]]; then
+  echo "Standalone must use the image entrypoint and command" >&2
+  exit 1
+fi
+
+distributed_output=$(render_distributed_statefulset)
+distributed_command_count=$(yq eval '(.spec.template.spec.containers[0].command // []) | length' - <<<"$distributed_output")
+if [[ "$distributed_command_count" != "0" ]]; then
+  echo "Distributed mode must use the image entrypoint and command" >&2
+  exit 1
+fi
+
 scaled_to_zero_output=$(render_standalone_deployment --set replicaCount=0)
 grep -Eq '^[[:space:]]*replicas:[[:space:]]*0[[:space:]]*$' <<<"$scaled_to_zero_output"
 

@@ -14,6 +14,7 @@
 
 use crate::storage_api::startup::lifecycle::ECStore;
 use crate::{
+    product,
     server::{ServiceStateManager, ShutdownHandle, start_persisted_event_notifier_reconciler, wait_for_shutdown},
     startup_iam::{IamBootstrapDisposition, publish_ready_for_iam_bootstrap},
     startup_runtime_sources,
@@ -134,11 +135,13 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
         event = EVENT_SERVER_READY,
         component = LOG_COMPONENT_MAIN,
         subsystem = LOG_SUBSYSTEM_STARTUP,
-        version = %crate::version::get_version(),
+        product = product::NAME,
+        version = product::VERSION,
+        upstream_version = product::UPSTREAM_VERSION,
         server_address = %server_address,
         started_at = %jiff::Zoned::now(),
         iam_bootstrap = ?iam_bootstrap,
-        "RustFS server ready"
+        "Server ready"
     );
     publish_ready_for_iam_bootstrap(iam_bootstrap, readiness.as_ref(), Some(state_manager.as_ref())).await?;
     startup_runtime_sources::publish_init_time_now().await;
@@ -177,7 +180,8 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
         subsystem = LOG_SUBSYSTEM_STARTUP,
         state = ?state_manager.current_state(),
         result = "stopped",
-        "RustFS server stopped"
+        product = product::NAME,
+        "Server stopped"
     );
     startup_runtime_sources::shutdown_observability_guard()
         .map_err(|err| Error::other(format!("shutdown_global_guard: {err}")))?;
@@ -211,7 +215,8 @@ pub(crate) fn log_embedded_server_ready(endpoint_address: SocketAddr) {
         subsystem = LOG_SUBSYSTEM_EMBEDDED,
         event = EVENT_EMBEDDED_SERVER_STATE,
         state = "ready",
-        "RustFS embedded server ready at http://{}",
+        product = product::NAME,
+        "Embedded server ready at http://{}",
         endpoint_address
     );
 }

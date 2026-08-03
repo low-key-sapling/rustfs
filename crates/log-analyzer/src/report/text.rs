@@ -23,7 +23,7 @@ const HEAVY_RULE: &str = "══════════════════
 const LIGHT_RULE: &str = "────────────────────────────────────────";
 
 pub(super) fn render(report: &AnalysisReport, w: &mut dyn io::Write) -> io::Result<()> {
-    writeln!(w, "RustFS 日志诊断报告")?;
+    writeln!(w, "ZfFS 日志诊断报告")?;
     writeln!(w, "{HEAVY_RULE}")?;
 
     match report.summary.time_range {

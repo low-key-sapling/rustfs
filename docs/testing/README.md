@@ -19,7 +19,7 @@ not observable below it.
 | Unit & crate integration | Per-crate logic and in-process integration tests, run under nextest | `cargo nextest run --all --exclude e2e_test` (or `-p <crate>`) | Every PR (required) |
 | ecstore black-box | Erasure-coded read/write/recovery validation of the ecstore stack | `scripts/run_ecstore_validation_suite.sh --profile quick` | Local / release validation (not in CI workflows) |
 | e2e (`e2e_test` crate) | Full server spun up per test, driven over the S3 API | `cargo nextest run --profile e2e-smoke -p e2e_test` | PR smoke lane + scheduled full/nightly lanes |
-| s3s-e2e conformance | External S3 conformance tool run against a live rustfs server | `./scripts/e2e-run.sh ./target/debug/rustfs /tmp/rustfs-e2e-data` | Per-PR e2e gate (`e2e-tests` job) |
+| s3s-e2e conformance | External S3 conformance tool run against a live ZfFS server | `./scripts/e2e-run.sh ./target/debug/zffs /tmp/rustfs-e2e-data` | Per-PR e2e gate (`e2e-tests` job) |
 | S3 compatibility | Third-party suites: `ceph/s3-tests` (boto3) and MinIO `mint` (many SDKs) | `scripts/s3-tests/run.sh` (mint: `.github/workflows/mint.yml`) | s3-tests: per-PR gate; mint: scheduled, report-only |
 | Chaos / fault-injection | Multi-node, power-loss, and disk-fault harness | — (harness planned) | Planned — tracked in backlog#1100 |
 | Fuzz | `cargo-fuzz` targets over untrusted parsing/validation surfaces | `./scripts/fuzz/run.sh` (or `cd fuzz && cargo +nightly fuzz run <target>`) | PR smoke + nightly corpus (`.github/workflows/fuzz.yml`) |

@@ -120,7 +120,7 @@ export RUST_LOG=debug
 ### Required binaries
 
 Tests look for:
-- `../../target/debug/rustfs` – RustFS server
+- `../../target/debug/zffs` - ZfFS server
 - `vault` – Vault CLI (must be on PATH)
 - `/Users/dandan/Library/Python/3.9/bin/awscurl` – AWS SigV4 helper
 

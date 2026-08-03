@@ -182,15 +182,15 @@ fn json_format_has_a_stable_schema() {
 
     let mut md = Vec::new();
     render(&report, ReportFormat::Markdown, &mut md).expect("render md");
-    assert!(String::from_utf8(md).expect("utf8").starts_with("# RustFS 日志诊断报告"));
+    assert!(String::from_utf8(md).expect("utf8").starts_with("# ZfFS 日志诊断报告"));
 }
 
 /// CLI parsing: diagnose is a first-class subcommand and the legacy
-/// `rustfs <volume>` form still routes to the server.
+/// `zffs <volume>` form still routes to the server.
 #[test]
 fn cli_parses_diagnose_and_keeps_legacy_server_routing() {
     let parsed = Opt::parse_command(vec![
-        "rustfs".to_string(),
+        "zffs".to_string(),
         "diagnose".to_string(),
         "/tmp/customer-logs".to_string(),
         "--format".to_string(),
@@ -211,7 +211,7 @@ fn cli_parses_diagnose_and_keeps_legacy_server_routing() {
     assert_eq!(opts.rules.as_deref(), Some(std::path::Path::new("/tmp/extra-rules.json")));
 
     // Legacy preprocessor regression: a bare volume still means `server`.
-    let legacy = Opt::parse_command(vec!["rustfs".to_string(), "/data".to_string()]);
+    let legacy = Opt::parse_command(vec!["zffs".to_string(), "/data".to_string()]);
     assert!(matches!(legacy, Ok(CommandResult::Server(_))));
 }
 
@@ -224,7 +224,7 @@ fn binary_smoke_diagnose_json() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(dir.path().join("rustfs.log"), quorum_and_faulty_lines()).expect("write");
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_rustfs"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_zffs"))
         .arg("diagnose")
         .arg(dir.path())
         .args(["--format", "json"])

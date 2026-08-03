@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
-# RustFS Binary Build Script
-# This script compiles RustFS binaries for different platforms and architectures
+# ZfFS Binary Build Script
+# This script compiles ZfFS binaries for different platforms and architectures
 
 set -e
 
@@ -101,7 +101,7 @@ generate_sha256() {
 # Default values
 OUTPUT_DIR="target/release"
 PLATFORM=$(detect_platform)  # Auto-detect current platform
-BINARY_NAME="rustfs"
+BINARY_NAME="zffs"
 BUILD_TYPE="release"
 SIGN=false
 WITH_CONSOLE=true
@@ -116,13 +116,13 @@ usage() {
     echo "Usage: $0 [OPTIONS]"
     echo ""
     echo "Description:"
-    echo "  Build RustFS binary for the current platform. Designed for CI/CD pipelines"
+    echo "  Build ZfFS binary for the current platform. Designed for CI/CD pipelines"
     echo "  where different runners build platform-specific binaries natively."
     echo "  Includes automatic verification to ensure the built binary is functional."
     echo ""
     echo "Options:"
     echo "  -o, --output-dir DIR       Output directory (default: target/release)"
-    echo "  -b, --binary-name NAME     Binary name (default: rustfs)"
+    echo "  -b, --binary-name NAME     Binary name (default: zffs)"
     echo "  -p, --platform TARGET      Target platform (default: auto-detect)"
     echo "                              Supported platforms:"
     echo "                                x86_64-unknown-linux-gnu"
@@ -495,7 +495,7 @@ build_binary() {
 build_rustfs() {
     local version=$(get_version)
 
-    print_message $BLUE "🚀 Starting RustFS binary build process..."
+    print_message $BLUE "🚀 Starting ZfFS binary build process..."
     print_message $YELLOW "   Version: $version"
     print_message $YELLOW "   Platform: $PLATFORM"
     print_message $YELLOW "   Output Directory: $OUTPUT_DIR"
@@ -601,7 +601,7 @@ done
 
 # Main execution
 main() {
-    print_message $BLUE "🦀 RustFS Binary Build Script"
+    print_message $BLUE "🦀 ZfFS Binary Build Script"
     echo ""
 
     # Check if we're in a Rust project

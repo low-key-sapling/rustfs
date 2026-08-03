@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! `rustfs diagnose` — offline log fault analysis (rustfs/backlog#1288).
+//! `zffs diagnose` — offline log fault analysis (rustfs/backlog#1288).
 //!
 //! Runs before any observability/storage/network initialization, like
-//! `rustfs info` / `rustfs tls inspect`: the report goes to stdout and must
+//! `zffs info` / `zffs tls inspect`: the report goes to stdout and must
 //! not be wrapped by the JSON logger.
 //!
 //! Exit codes: 0 = diagnosis completed (findings or not); 2 = a rejected

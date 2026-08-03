@@ -10,7 +10,7 @@ what Claude Code needs on top: commands and pointers.
 ## Commands
 
 ```bash
-cargo build --release --bin rustfs   # production binary
+cargo build --release --bin zffs   # production binary
 cargo check -p <crate>               # fast type-check one crate
 cargo test -p <crate>                # test one crate
 cargo fmt --all                      # format (required before PR)

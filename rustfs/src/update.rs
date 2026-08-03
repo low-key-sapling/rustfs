@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::version;
+use crate::{product, version};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
@@ -79,7 +79,7 @@ impl VersionChecker {
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
-            .user_agent(format!("RustFS/{}", get_current_version()))
+            .user_agent(format!("{}/{}", product::NAME, get_current_version()))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
@@ -95,7 +95,7 @@ impl VersionChecker {
     pub fn with_config(url: String, timeout: Duration) -> Self {
         let client = reqwest::Client::builder()
             .timeout(timeout)
-            .user_agent(format!("RustFS/{}", get_current_version()))
+            .user_agent(format!("{}/{}", product::NAME, get_current_version()))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
@@ -165,7 +165,7 @@ impl VersionChecker {
 
 /// Get current version number
 pub fn get_current_version() -> String {
-    version::get_version()
+    product::VERSION.to_string()
 }
 
 /// Convenience function for async update checking
@@ -188,7 +188,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_current_version() {
         let version = get_current_version();
-        assert!(!version.is_empty());
+        assert_eq!(version, product::VERSION);
         debug!("Current version: {version}");
     }
 

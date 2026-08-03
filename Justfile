@@ -3,6 +3,7 @@ IMAGE_NAME := env("IMAGE_NAME", "rustfs:v1.0.0")
 DOCKERFILE_SOURCE := env("DOCKERFILE_SOURCE", "Dockerfile.source")
 DOCKERFILE_PRODUCTION := env("DOCKERFILE_PRODUCTION", "Dockerfile")
 CONTAINER_NAME := env("CONTAINER_NAME", "rustfs-dev")
+RELEASE_REPOSITORY := env("RELEASE_REPOSITORY", "low-key-sapling/rustfs")
 
 [group("📒 Help")]
 [private]
@@ -58,13 +59,13 @@ setup-hooks:
 [doc("use `release` mode for building")]
 [group("🔨 Build")]
 build:
-    @echo "🔨 Building RustFS using build-rustfs.sh script..."
+    @echo "🔨 Building ZfFS using build-rustfs.sh script..."
     ./build-rustfs.sh
 
 [doc("use `debug` mode for building")]
 [group("🔨 Build")]
 build-dev:
-    @echo "🔨 Building RustFS in development mode..."
+    @echo "🔨 Building ZfFS in development mode..."
     ./build-rustfs.sh --dev
 
 [group("🔨 Build")]
@@ -118,8 +119,8 @@ build-docker os="rockylinux9.3" cli=(DOCKER_CLI) dockerfile=(DOCKERFILE_SOURCE):
     #!/usr/bin/env bash
     SOURCE_BUILD_IMAGE_NAME="rustfs/rustfs-{{ os }}:v1"
     SOURCE_BUILD_CONTAINER_NAME="rustfs-{{ os }}-build"
-    BUILD_CMD="/root/.cargo/bin/cargo build --release --bin rustfs --target-dir /root/s3-rustfs/target/{{ os }}"
-    echo "🐳 Building RustFS using Docker ({{ os }})..."
+    BUILD_CMD="/root/.cargo/bin/cargo build --release --bin zffs --target-dir /root/s3-rustfs/target/{{ os }}"
+    echo "🐳 Building ZfFS using Docker ({{ os }})..."
     {{ cli }} buildx build -t $SOURCE_BUILD_IMAGE_NAME -f {{ dockerfile }} .
     {{ cli }} run --rm --name $SOURCE_BUILD_CONTAINER_NAME -v $(pwd):/root/s3-rustfs -it $SOURCE_BUILD_IMAGE_NAME $BUILD_CMD
 
@@ -171,7 +172,8 @@ docker-buildx-production-local cli=(DOCKER_CLI) source=(DOCKERFILE_PRODUCTION):
     	--tag rustfs:production-latest \
     	--tag rustfs:latest \
     	--load \
-    	--build-arg RELEASE=latest \
+        --build-arg RELEASE=latest \
+        --build-arg RELEASE_REPOSITORY={{ RELEASE_REPOSITORY }} \
     	.
 
 # Development/Source builds using direct buildx commands
@@ -207,7 +209,7 @@ docker-dev-local cli=(DOCKER_CLI) source=(DOCKERFILE_SOURCE):
 docker-build-production cli=(DOCKER_CLI) source=(DOCKERFILE_PRODUCTION):
     @echo "🏗️ Building single-architecture production Docker image..."
     @echo "💡 Consider using 'make docker-buildx-production-local' for multi-arch support"
-    {{ cli }} build -f {{ source }} -t rustfs:latest .
+    {{ cli }} build --build-arg RELEASE_REPOSITORY={{ RELEASE_REPOSITORY }} -f {{ source }} -t rustfs:latest .
 
 [group("🐳 Build Image")]
 docker-build-source cli=(DOCKER_CLI) source=(DOCKERFILE_SOURCE):

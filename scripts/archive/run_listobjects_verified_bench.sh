@@ -10,7 +10,7 @@ RUSTFS_BIN_USER_SET="false"
 if [[ -n "${RUSTFS_BIN:-}" ]]; then
   RUSTFS_BIN_USER_SET="true"
 else
-  RUSTFS_BIN="${PROJECT_ROOT}/target/${BUILD_PROFILE}/rustfs"
+  RUSTFS_BIN="${PROJECT_ROOT}/target/${BUILD_PROFILE}/zffs"
 fi
 WARP_BIN="${WARP_BIN:-warp}"
 ADDRESS="${ADDRESS:-127.0.0.1:9000}"
@@ -71,7 +71,7 @@ Options:
   --warmup-duration <d>  Warmup duration before timed run (default: 5s).
   --concurrency <n>      warp --concurrent value (default: 16).
   --max-keys <n>         warp --max-keys value (default: 1000).
-  --release              Build and run target/release/rustfs.
+  --release              Build and run target/release/zffs.
   --skip-build           Use existing RustFS binary.
   --index-provider <v>   Opt-in provider (default: persistent_key_only).
   --key-index-path <p>   Persistent key-only index path.
@@ -123,7 +123,7 @@ parse_args() {
       --release)
         BUILD_PROFILE="release"
         if [[ "$RUSTFS_BIN_USER_SET" == "false" ]]; then
-          RUSTFS_BIN="${PROJECT_ROOT}/target/release/rustfs"
+          RUSTFS_BIN="${PROJECT_ROOT}/target/release/zffs"
         fi
         shift
         ;;

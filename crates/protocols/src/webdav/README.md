@@ -71,7 +71,7 @@ RUSTFS_WEBDAV_ADDRESS=0.0.0.0:8080 \
 RUSTFS_WEBDAV_TLS_ENABLED=false \
 RUSTFS_ACCESS_KEY=rustfsadmin \
 RUSTFS_SECRET_KEY=rustfsadmin \
-./target/release/rustfs /path/to/data
+./target/release/zffs /path/to/data
 ```
 
 ### Test with curl

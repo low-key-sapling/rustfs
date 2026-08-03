@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::product;
 use atomic_enum::atomic_enum;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -25,6 +26,10 @@ const SERVICE_STATUS_STARTING: &str = "Starting";
 const SERVICE_STATUS_RUNNING: &str = "Running";
 const SERVICE_STATUS_STOPPING: &str = "Stopping";
 const SERVICE_STATUS_STOPPED: &str = "Stopped";
+const LOG_COMPONENT_SERVICE_STATE: &str = "service_state";
+const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
+const EVENT_SHUTDOWN_SIGNAL_RECEIVED: &str = "shutdown_signal_received";
+const EVENT_SERVICE_STATE_CHANGED: &str = "service_state_changed";
 
 #[derive(Debug)]
 pub enum ShutdownSignal {
@@ -62,30 +67,36 @@ pub async fn wait_for_shutdown() -> ShutdownSignal {
     let mut sigterm = signal(SignalKind::terminate()).expect("failed to create SIGTERM signal handler");
     let mut sigint = signal(SignalKind::interrupt()).expect("failed to create SIGINT signal handler");
 
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            info!("RustFS Received Ctrl-C signal");
-            ShutdownSignal::CtrlC
-        }
-        _ = sigint.recv() => {
-            info!("RustFS Received SIGINT signal");
-            ShutdownSignal::Sigint
-        }
-        _ = sigterm.recv() => {
-            info!("RustFS Received SIGTERM signal");
-            ShutdownSignal::Sigterm
-        }
-    }
+    let signal = tokio::select! {
+        _ = tokio::signal::ctrl_c() => ShutdownSignal::CtrlC,
+        _ = sigint.recv() => ShutdownSignal::Sigint,
+        _ = sigterm.recv() => ShutdownSignal::Sigterm,
+    };
+    info!(
+        event = EVENT_SHUTDOWN_SIGNAL_RECEIVED,
+        component = LOG_COMPONENT_SERVICE_STATE,
+        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+        product = product::NAME,
+        signal = signal.log_label(),
+        "Shutdown signal received"
+    );
+    signal
 }
 
 #[cfg(not(unix))]
 pub async fn wait_for_shutdown() -> ShutdownSignal {
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            info!("Received Ctrl-C signal");
-            ShutdownSignal::CtrlC
-        }
-    }
+    let signal = tokio::select! {
+        _ = tokio::signal::ctrl_c() => ShutdownSignal::CtrlC,
+    };
+    info!(
+        event = EVENT_SHUTDOWN_SIGNAL_RECEIVED,
+        component = LOG_COMPONENT_SERVICE_STATE,
+        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+        product = product::NAME,
+        signal = signal.log_label(),
+        "Shutdown signal received"
+    );
+    signal
 }
 
 #[derive(Clone)]
@@ -129,24 +140,15 @@ impl ServiceStateManager {
     }
 
     fn notify_systemd(&self, state: ServiceState) {
-        match state {
-            ServiceState::Starting => {
-                info!("RustFS Service is starting...");
-                notify_systemd_daemon(state);
-            }
-            ServiceState::Ready => {
-                info!("RustFS Service is running");
-                notify_systemd_daemon(state);
-            }
-            ServiceState::Stopping => {
-                info!("RustFS Service is stopping...");
-                notify_systemd_daemon(state);
-            }
-            ServiceState::Stopped => {
-                info!("RustFS Service has stopped");
-                notify_systemd_daemon(state);
-            }
-        }
+        info!(
+            event = EVENT_SERVICE_STATE_CHANGED,
+            component = LOG_COMPONENT_SERVICE_STATE,
+            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+            product = product::NAME,
+            state = systemd_status_text(state),
+            "Service state changed"
+        );
+        notify_systemd_daemon(state);
     }
 }
 

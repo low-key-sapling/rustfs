@@ -195,7 +195,7 @@ cargo nextest run --profile e2e-repl-nightly -p e2e_test
 cargo nextest run -j1 --run-ignored ignored-only -p rustfs-scanner -p rustfs \
   -E 'binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))'
 # s3s-e2e black box
-./scripts/e2e-run.sh ./target/debug/rustfs /tmp/rustfs-e2e-data
+./scripts/e2e-run.sh ./target/debug/zffs /tmp/rustfs-e2e-data
 ```
 
 **Stale binary.** Tests build the `rustfs` binary once and reuse it. To avoid
@@ -211,7 +211,7 @@ one.
 `rustfs` child holding its port. Find and kill it:
 
 ```bash
-pkill -f 'target/debug/rustfs' ; pkill -f 'target/release/rustfs'
+pkill -f 'target/debug/zffs' ; pkill -f 'target/release/zffs'
 ```
 
 The `s3s-e2e` CI job selects a random `RUSTFS_TEST_PORT` (see the `e2e-tests`

@@ -35,7 +35,7 @@ COPY . .
 
 RUN ./scripts/static.sh
 RUN cargo run --bin gproto
-RUN cargo build --release --locked --bin rustfs
+RUN cargo build --release --locked --bin zffs
 
 RUN set -eux; \
     groupadd -g 10001 rustfs; \
@@ -49,7 +49,7 @@ RUN set -eux; \
     chmod 0750 /data /logs
 
 COPY entrypoint.sh /entrypoint.sh
-RUN install -m 0755 /usr/src/rustfs/target/release/rustfs /usr/bin/rustfs && chmod +x /entrypoint.sh
+RUN install -m 0755 /usr/src/rustfs/target/release/zffs /usr/bin/zffs && chmod +x /entrypoint.sh
 
 ENV RUSTFS_VOLUMES="/data" \
     RUST_LOG="warn" \
@@ -62,4 +62,4 @@ ENV RUSTFS_VOLUMES="/data" \
 EXPOSE 9000 9001
 
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["/usr/bin/rustfs"]
+CMD ["/usr/bin/zffs"]

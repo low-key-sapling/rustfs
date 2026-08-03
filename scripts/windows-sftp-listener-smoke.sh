@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Confirms rustfs.exe with --features sftp binds an SFTP listener on Windows.
+# Confirms zffs.exe with --features sftp binds an SFTP listener on Windows.
 # Checks the listener bind and the warn-once host-key log line. S3 traffic is out of scope.
 
 set -euo pipefail
@@ -27,9 +27,9 @@ export RUST_LOG=info
 mkdir -p "$RUSTFS_VOLUMES"
 
 # Launch the server in the background. The CI step that runs this script
-# has already built the rustfs.exe binary with the sftp feature. The
+# has already built the zffs.exe binary with the sftp feature. The
 # RUSTFS_BIN override lets the CI step point at a non-default location.
-BIN="${RUSTFS_BIN:-target/release/rustfs.exe}"
+BIN="${RUSTFS_BIN:-target/release/zffs.exe}"
 if [ ! -x "$BIN" ]; then
     echo "FAIL: $BIN is not an executable binary" >&2
     exit 1
@@ -55,7 +55,7 @@ for _ in $(seq 1 60); do
 done
 
 if [ -z "$PORT" ]; then
-    echo "FAIL: rustfs.exe did not bind any 127.0.0.1 LISTENING port within 60s" >&2
+    echo "FAIL: zffs.exe did not bind any 127.0.0.1 LISTENING port within 60s" >&2
     echo "--- server.log tail ---" >&2
     tail -50 "$TMP/server.log" >&2 || true
     exit 1

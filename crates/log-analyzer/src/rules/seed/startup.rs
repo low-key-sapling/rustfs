@@ -80,7 +80,7 @@ pub(super) fn rules() -> Vec<Rule> {
                     prefix("unable to load root directory certificate"),
                 ]),
                 "TLS 证书加载失败(路径/权限/格式)。",
-                "用 `rustfs tls inspect --path <dir>` 现场检查证书目录。",
+                "用 `zffs tls inspect --path <dir>` 现场检查证书目录。",
             )
         },
         Rule {

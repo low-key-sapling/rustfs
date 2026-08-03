@@ -7,7 +7,7 @@ set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-RUSTFS_BIN="${RUSTFS_BIN:-${PROJECT_ROOT}/target/debug/rustfs}"
+RUSTFS_BIN="${RUSTFS_BIN:-${PROJECT_ROOT}/target/debug/zffs}"
 BUILD_BIN="${BUILD_BIN:-true}"
 BASE_PORT="${BASE_PORT:-19100}"
 NODE_COUNT="${NODE_COUNT:-4}"
@@ -41,7 +41,7 @@ Usage:
   scripts/run_issue797_local_4node_16disk_ab.sh [options]
 
 Options:
-  --rustfs-bin <path>          RustFS binary (default: target/debug/rustfs)
+  --rustfs-bin <path>          ZfFS binary (default: target/debug/zffs)
   --skip-build                 Do not build rustfs before running
   --base-port <port>           First node port; uses port..port+3
   --sizes <csv>                Object sizes for warp (default: 4KiB,1MiB)
@@ -564,7 +564,7 @@ main() {
 
   if [[ "$BUILD_BIN" == "true" ]]; then
     log "building rustfs binary"
-    cargo build -p rustfs --bin rustfs
+    cargo build -p rustfs --bin zffs
   fi
   [[ -x "$RUSTFS_BIN" ]] || die "rustfs binary is not executable: $RUSTFS_BIN"
 

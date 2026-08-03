@@ -4,7 +4,7 @@
 Name:           rustfs
 Version:        1.0.0
 Release:        beta.12
-Summary:       High-performance distributed object storage for MinIO alternative
+Summary:       ZfFS S3-compatible distributed object storage
 
 License:        Apache-2.0
 URL:            https://github.com/rustfs/rustfs
@@ -24,7 +24,7 @@ BuildRequires: cmake
 BuildRequires: clang-devel
 
 %description
-RustFS is a high-performance distributed object storage software built using Rust, one of the most popular languages worldwide. Along with MinIO, it shares a range of advantages such as simplicity, S3 compatibility, open-source nature, support for data lakes, AI, and big data. Furthermore, it has a better and more user-friendly open-source license in comparison to other storage systems, being constructed under the Apache license. As Rust serves as its foundation, RustFS provides faster speed and safer distributed features for high-performance object storage.
+ZfFS is a high-performance S3-compatible distributed object storage product based on the RustFS compatibility core. It preserves existing storage, protocol, and operational compatibility while providing an independent ZfFS binary and release identity under the Apache License 2.0.
 
 %prep 
 %autosetup -n %{name}-%{version}-%{prerelease}
@@ -50,11 +50,13 @@ CARGO_TARGET_DIR=$TARGET_DIR RUSTFLAGS="-C link-arg=-fuse-ld=mold -C link-arg=-l
 
 %install
 mkdir -p %buildroot/usr/bin/
-install %_builddir/%{name}-%{version}-%{prerelease}/target/%_arch/%_arch-unknown-linux-gnu/release/rustfs %buildroot/usr/bin/
+install %_builddir/%{name}-%{version}-%{prerelease}/target/%_arch/%_arch-unknown-linux-gnu/release/zffs %buildroot/usr/bin/
+ln -s zffs %buildroot/usr/bin/rustfs
 
 %files
 %license LICENSE
 %doc docs
+%_bindir/zffs
 %_bindir/rustfs
 
 %changelog

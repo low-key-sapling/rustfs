@@ -3,7 +3,7 @@ set -euo pipefail
 
 PIDFILE=/private/tmp/issue708-single-node-multidisk/rustfs.pid
 LOGFILE=/private/tmp/issue708-single-node-multidisk/rustfs.log
-RUSTFS_CMD_PATTERN='target/debug/rustfs server /private/tmp/issue708-single-node-multidisk/d1 /private/tmp/issue708-single-node-multidisk/d2 /private/tmp/issue708-single-node-multidisk/d3 /private/tmp/issue708-single-node-multidisk/d4'
+RUSTFS_CMD_PATTERN='target/debug/zffs server /private/tmp/issue708-single-node-multidisk/d1 /private/tmp/issue708-single-node-multidisk/d2 /private/tmp/issue708-single-node-multidisk/d3 /private/tmp/issue708-single-node-multidisk/d4'
 
 mkdir -p /private/tmp/issue708-single-node-multidisk/{d1,d2,d3,d4}
 
@@ -41,7 +41,7 @@ launch_rustfs() {
       RUSTFS_REGION=us-east-1 \
       RUSTFS_CONSOLE_ENABLE=false \
       RUSTFS_OBS_ENDPOINT=http://127.0.0.1:4318 \
-      target/debug/rustfs server \
+      target/debug/zffs server \
       /private/tmp/issue708-single-node-multidisk/d1 \
       /private/tmp/issue708-single-node-multidisk/d2 \
       /private/tmp/issue708-single-node-multidisk/d3 \
@@ -57,7 +57,7 @@ launch_rustfs() {
       RUSTFS_REGION=us-east-1 \
       RUSTFS_CONSOLE_ENABLE=false \
       RUSTFS_OBS_ENDPOINT=http://127.0.0.1:4318 \
-      target/debug/rustfs server \
+      target/debug/zffs server \
       /private/tmp/issue708-single-node-multidisk/d1 \
       /private/tmp/issue708-single-node-multidisk/d2 \
       /private/tmp/issue708-single-node-multidisk/d3 \

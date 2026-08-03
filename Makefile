@@ -28,6 +28,7 @@ CONTAINER_NAME ?= rustfs-dev
 # Docker build configurations
 DOCKERFILE_PRODUCTION = Dockerfile
 DOCKERFILE_SOURCE = Dockerfile.source
+RELEASE_REPOSITORY ?= low-key-sapling/rustfs
 BUILD_OS ?= rockylinux9.3
 
 # Makefile colors config
@@ -71,7 +72,7 @@ How to use me:
 		make pre-pr                              # Full pre-PR gate: pre-commit gates + clippy-check + test
 
 	🚀 Quick Start:
-		make build                               # Build RustFS binary
+		make build                               # Build ZfFS binary
 		make docker-dev-local                    # Build development Docker image (local)
 		make dev-env-start                       # Start development environment
 

@@ -21,7 +21,7 @@ HEALTH_TIMEOUT_SECS=60
 OUT_DIR=""
 DATA_ROOT=""
 BUCKET=""
-RUSTFS_BIN="${PROJECT_ROOT}/target/release/rustfs"
+RUSTFS_BIN="${PROJECT_ROOT}/target/release/zffs"
 WARP_BIN="warp"
 BASELINE_CSV=""
 DRY_RUN=false
@@ -55,10 +55,10 @@ Options:
   --health-timeout-secs <n>      Health wait timeout (default: 60)
   --out-dir <path>               Output directory (default: target/bench/get-metrics-gate-<timestamp>)
   --data-root <path>             Data root for d1..d4 (default: /private/tmp/get-metrics-gate-<timestamp>)
-  --rustfs-bin <path>            RustFS binary (default: target/release/rustfs)
+  --rustfs-bin <path>            ZfFS binary (default: target/release/zffs)
   --warp-bin <path>              warp binary (default: warp)
   --baseline-csv <path>          Optional baseline median_summary.csv for delta output
-  --skip-build                   Skip cargo build --release -p rustfs --bin rustfs
+  --skip-build                   Skip cargo build --release -p rustfs --bin zffs
   --dry-run                      Print commands only
   -h, --help                     Show help
 USAGE
@@ -183,7 +183,7 @@ build_rustfs_if_needed() {
   if [[ "$DRY_RUN" == "true" || "$SKIP_BUILD" == "true" ]]; then
     return
   fi
-  cargo build --release -p rustfs --bin rustfs
+  cargo build --release -p rustfs --bin zffs
 }
 
 write_manifest() {

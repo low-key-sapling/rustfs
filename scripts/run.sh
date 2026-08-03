@@ -537,16 +537,16 @@ fi
 
 # Start main service
 # To run with profiling enabled, uncomment the following line and comment the next line
-#cargo run --profile profiling --bin rustfs
+#cargo run --profile profiling --bin zffs
 
 # To run with FTP/FTPS support, use:
-# cargo run --bin rustfs --features ftps
+# cargo run --bin zffs --features ftps
 
 # To run in release mode, use the following line
-#cargo run --profile release --bin rustfs
+#cargo run --profile release --bin zffs
 
 # To run in debug mode, use the following line
-#cargo run --bin rustfs
+#cargo run --bin zffs
 
 # Default local run mode: release
-cargo run --profile release --bin rustfs
+cargo run --profile release --bin zffs

@@ -30,7 +30,7 @@ WARP_WARMUP_GET_BEFORE_BENCH=false
 OUTER_READER_STREAM_BUFFER_SIZES="65536,1048576"
 PROFILE_ORDERS="normal,reverse"
 CODEC_MIN_SIZE=1048576
-RUSTFS_BIN="${PROJECT_ROOT}/target/release/rustfs"
+RUSTFS_BIN="${PROJECT_ROOT}/target/release/zffs"
 WARP_BIN="warp"
 PYTHON_BIN="python3"
 OUT_DIR=""
@@ -108,7 +108,7 @@ Diagnostics:
                                  probe to the underlying smoke runner
 
 Binary/options:
-  --rustfs-bin <path>            RustFS binary (default: target/release/rustfs)
+  --rustfs-bin <path>            ZfFS binary (default: target/release/zffs)
   --warp-bin <path>              warp binary (default: warp)
   --python-bin <path>            Python binary (default: python3)
   --skip-build                   Do not build RustFS in the smoke runner

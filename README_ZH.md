@@ -1,6 +1,6 @@
-[![RustFS](https://repository-images.githubusercontent.com/722597620/0fa936a2-8164-4f53-867f-def4beb64b21)](https://rustfs.com.cn)
+<h1 align="center">ZfFS</h1>
 
-<p align="center">RustFS 是一个基于 Rust 构建的高性能分布式对象存储系统。</p>
+<p align="center">基于 RustFS 兼容内核的 S3 兼容对象存储产品。</p>
 
 <p align="center">
   <a href="https://github.com/rustfs/rustfs/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/rustfs/rustfs/actions/workflows/ci.yml/badge.svg" /></a>
@@ -34,9 +34,9 @@
   <a href="https://readme-i18n.com/rustfs/rustfs?lang=ru">Русский</a>
 </p>
 
-RustFS 是一个基于 Rust 构建的高性能分布式对象存储系统。Rust 是全球最受开发者喜爱的编程语言之一，RustFS 结合了 MinIO 的简洁性与 Rust 的内存安全及高性能优势。它为已支持功能提供广泛的 S3 API 兼容性，完全开源，并专为数据湖、人工智能（AI）和大数据负载进行了优化。
+ZfFS 是基于 RustFS 兼容内核构建的高性能分布式对象存储产品。它保留既有的 S3、MinIO、存储格式和运维兼容边界，同时提供独立的 ZfFS 产品与发布体验。
 
-与其他存储系统不同，RustFS 采用更宽松、商业友好的 Apache 2.0 许可证，避免了 AGPL 协议的限制。以 Rust 为基石，RustFS 为下一代对象存储提供了更快的速度和更安全的分布式特性。
+ZfFS 及其 RustFS 上游基线均遵循 Apache License 2.0。产品版本输出与发布元数据会保留上游署名和兼容基线信息。
 
 ## 特征和功能状态
 
@@ -56,7 +56,7 @@ RustFS 是一个基于 Rust 构建的高性能分布式对象存储系统。Rust
 | **事件通知**       | ✅ 可用 | **分布式模式**          | 🚧 测试中 |
 | **K8s Helm Chart** | ✅ 可用 | **OPA (策略引擎)**      | 🚧 测试中 |
 
-## RustFS vs MinIO 性能对比
+## ZfFS vs MinIO 性能对比
 
 **压力测试环境参数：**
 
@@ -185,7 +185,7 @@ nix run github:rustfs/rustfs
 
 # 编译二进制文件
 nix build github:rustfs/rustfs
-./result/bin/rustfs --help
+./result/bin/zffs --help
 
 # 或者从本地检出的代码库运行/编译
 nix build

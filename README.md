@@ -1,6 +1,6 @@
-[![RustFS](https://repository-images.githubusercontent.com/722597620/0fa936a2-8164-4f53-867f-def4beb64b21)](https://rustfs.com)
+<h1 align="center">ZfFS</h1>
 
-<p align="center">RustFS is a high-performance, distributed object storage system built in Rust.</p>
+<p align="center">S3-compatible object storage based on the RustFS compatibility core.</p>
 
 <p align="center">
   <a href="https://github.com/rustfs/rustfs/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/rustfs/rustfs/actions/workflows/ci.yml/badge.svg" /></a>
@@ -34,9 +34,9 @@ English | <a href="https://github.com/rustfs/rustfs/blob/main/README_ZH.md">简�
   <a href="https://readme-i18n.com/rustfs/rustfs?lang=ru">Русский</a>
 </p>
 
-RustFS is a high-performance, distributed object storage system built in Rust—one of the most loved programming languages worldwide. RustFS combines the simplicity of MinIO with the memory safety and raw performance of Rust. It offers broad S3 API compatibility for supported features, is completely open-source, and is optimized for data lakes, AI, and big data workloads.
+ZfFS is a high-performance distributed object storage product built on the RustFS compatibility core. It preserves the established S3, MinIO, storage-format, and operational compatibility boundaries while providing an independent ZfFS product and release experience.
 
-Unlike other storage systems, RustFS is released under the permissible Apache 2.0 license, avoiding the restrictions of AGPL. With Rust as its foundation, RustFS delivers superior speed and secure distributed features for next-generation object storage.
+ZfFS and its RustFS upstream base are distributed under the Apache License 2.0. Upstream attribution and compatibility details remain visible in product version output and release metadata.
 
 ## Feature & Status
 
@@ -60,7 +60,7 @@ Unlike other storage systems, RustFS is released under the permissible Apache 2.
 | **Keystone Auth**       | ✅ Available | **Multi-Tenancy**        | ✅ Available     |
 | **Swift API**           | ✅ Available | **Swift Metadata Ops**   | 🚧 Partial       |
 
-## RustFS vs MinIO Performance
+## ZfFS vs MinIO Performance
 
 **Stress Test Environment:**
 
@@ -239,7 +239,7 @@ nix run github:rustfs/rustfs
 
 # Build the binary
 nix build github:rustfs/rustfs
-./result/bin/rustfs --help
+./result/bin/zffs --help
 
 # Or from a local checkout
 nix build

@@ -1,15 +1,15 @@
-# Nix flake for building RustFS
+# Nix flake for building ZfFS
 #
 # Prerequisites:
 #   Install Nix: https://nixos.org/download/
 #   Enable flakes: https://nixos.wiki/wiki/Flakes#Enable_flakes
 #
 # Usage:
-#   nix build          # Build rustfs binary
-#   nix run            # Build and run rustfs
-#   ./result/bin/rustfs --help
+#   nix build          # Build zffs binary
+#   nix run            # Build and run zffs
+#   ./result/bin/zffs --help
 {
-  description = "RustFS - High-performance S3-compatible object storage";
+  description = "ZfFS - S3-compatible object storage based on RustFS";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
@@ -33,6 +33,7 @@
         "aarch64-darwin"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
+      productVersion = builtins.replaceStrings [ "\n" "\r" ] [ "" "" ] (builtins.readFile ./ZFFS_VERSION);
     in
     {
       packages = forAllSystems (
@@ -58,8 +59,8 @@
         in
         {
           default = rustPlatform.buildRustPackage {
-            pname = "rustfs";
-            version = "1.0.0-beta.12";
+            pname = "zffs";
+            version = productVersion;
 
             src = ./.;
 
@@ -84,6 +85,7 @@
 
             # Set environment variables for build
             PROTOC = "${pkgs.protobuf}/bin/protoc";
+            ZFFS_VERSION = productVersion;
 
             doCheck = false;
 
@@ -91,7 +93,7 @@
               description = "High-performance S3-compatible object storage";
               homepage = "https://rustfs.com";
               license = pkgs.lib.licenses.asl20;
-              mainProgram = "rustfs";
+              mainProgram = "zffs";
             };
           };
         }

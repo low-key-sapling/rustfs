@@ -181,7 +181,6 @@ spec:
       containers:
         - name: {{ $.Chart.Name }}
           image: "{{ $.Values.image.rustfs.repository }}:{{ $.Values.image.rustfs.tag | default $.Chart.AppVersion }}"
-          command: ["/usr/bin/rustfs"]
           imagePullPolicy: {{ $.Values.image.rustfs.pullPolicy }}
           securityContext:
             {{- toYaml $.Values.containerSecurityContext | nindent 12 }}

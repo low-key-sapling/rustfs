@@ -38,4 +38,5 @@ docker-buildx-production-local: ## Build production single-arch image locally
 		--tag rustfs:latest \
 		--load \
 		--build-arg RELEASE=latest \
+		--build-arg RELEASE_REPOSITORY=$(RELEASE_REPOSITORY) \
 		.

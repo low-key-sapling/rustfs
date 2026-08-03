@@ -64,8 +64,8 @@ done
 
 if [[ -n "$target" ]]; then
   mkdir -p "target/$target/$profile"
-  printf '#!/usr/bin/env bash\nexit 0\n' >"target/$target/$profile/rustfs"
-  chmod +x "target/$target/$profile/rustfs"
+  printf '#!/usr/bin/env bash\nexit 0\n' >"target/$target/$profile/zffs"
+  chmod +x "target/$target/$profile/zffs"
 fi
 STUB
 

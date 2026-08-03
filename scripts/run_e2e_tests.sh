@@ -15,7 +15,7 @@ NC='\033[0m' # No Color
 # Default values
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET_DIR="$PROJECT_ROOT/target/debug"
-RUSTFS_BINARY="$TARGET_DIR/rustfs"
+RUSTFS_BINARY="$TARGET_DIR/zffs"
 DATA_DIR="$TARGET_DIR/rustfs_test_data"
 RUSTFS_PID=""
 TEST_FILTER=""
@@ -92,7 +92,7 @@ build_rustfs() {
     print_info "Building RustFS..."
     cd "$PROJECT_ROOT"
     
-    if ! cargo build --bin rustfs; then
+    if ! cargo build --bin zffs; then
         print_error "Failed to build RustFS"
         exit 1
     fi

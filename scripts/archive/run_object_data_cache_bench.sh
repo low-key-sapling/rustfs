@@ -31,7 +31,7 @@ PROFILES="current"
 MATRIX_PRESET="quick-gate"
 BUFFERED_FILL_DIRECT_MEMORY_THRESHOLD=1048576
 OUT_DIR=""
-RUSTFS_BIN="${PROJECT_ROOT}/target/release/rustfs"
+RUSTFS_BIN="${PROJECT_ROOT}/target/release/zffs"
 WARP_BIN="warp"
 PYTHON_BIN="python3"
 SKIP_BUILD=false
@@ -156,7 +156,7 @@ Object cache env overrides:
   --object-cache-identity-keys-max <n>
 
 Binary/options:
-  --rustfs-bin <path>            RustFS binary (default: target/release/rustfs)
+  --rustfs-bin <path>            ZfFS binary (default: target/release/zffs)
   --warp-bin <path>              warp binary (default: warp)
   --python-bin <path>            Python binary for summary parsing
   --skip-build                   do not build RustFS release binary

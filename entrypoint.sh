@@ -2,23 +2,29 @@
 set -e
 
 # 1) Normalize command:
-# - No arguments: default to execute rustfs with DATA_VOLUMES
-# - First argument starts with '-': treat as rustfs arguments, auto-prefix rustfs
-# - First argument is 'rustfs': replace with absolute path to avoid PATH interference
-# - Otherwise: treat as full rustfs arguments (e.g., /data paths)
+# - No arguments: default to execute zffs with DATA_VOLUMES
+# - First argument starts with '-': treat as zffs arguments, auto-prefix zffs
+# - First argument is 'zffs' or legacy 'rustfs': use the available server path
+# - Otherwise: treat as full zffs arguments (e.g., /data paths)
+SERVER_BIN=/usr/bin/zffs
+if [ ! -x "$SERVER_BIN" ] && [ -x /usr/bin/rustfs ]; then
+  SERVER_BIN=/usr/bin/rustfs
+fi
+
 if [ $# -eq 0 ]; then
-  set -- /usr/bin/rustfs
+  set -- "$SERVER_BIN"
 elif [ "${1#-}" != "$1" ]; then
-  set -- /usr/bin/rustfs "$@"
-elif [ "$1" = "rustfs" ]; then
+  set -- "$SERVER_BIN" "$@"
+elif [ "$1" = "zffs" ] || [ "$1" = "rustfs" ]; then
   shift
-  set -- /usr/bin/rustfs "$@"
-elif [ "$1" = "/usr/bin/rustfs" ]; then
-  : # already normalized
+  set -- "$SERVER_BIN" "$@"
+elif [ "$1" = "/usr/bin/zffs" ] || [ "$1" = "/usr/bin/rustfs" ]; then
+  shift
+  set -- "$SERVER_BIN" "$@"
 elif [ "$1" = "cargo" ]; then
   : # Pass through cargo command as-is
 else
-  set -- /usr/bin/rustfs "$@"
+  set -- "$SERVER_BIN" "$@"
 fi
 
 DEFAULT_ROOT_CREDENTIAL="rustfsadmin"
@@ -140,7 +146,7 @@ validate_credential_source() {
       exit 1
       ;;
     missing)
-      echo "WARNING: $CREDENTIAL_NAME or $FILE_NAME is not set; unless credentials are provided via another supported source (e.g. $ALIAS_HINT), rustfs falls back to its built-in default credential. Set non-default credentials for production deployments." >&2
+      echo "WARNING: $CREDENTIAL_NAME or $FILE_NAME is not set; unless credentials are provided via another supported source (e.g. $ALIAS_HINT), ZfFS falls back to its built-in default credential. Set non-default credentials for production deployments." >&2
       ;;
     value:*)
       CREDENTIAL_VALUE=$(trim_credential "${CREDENTIAL_SOURCE#value:}")
@@ -177,7 +183,7 @@ validate_credential_source() {
   esac
 }
 
-if [ "$1" = "/usr/bin/rustfs" ]; then
+if [ "$1" = "$SERVER_BIN" ]; then
   ACCESS_SOURCE=$(resolve_credential_source "RUSTFS_ACCESS_KEY" "RUSTFS_ACCESS_KEY_FILE" "access-key" "access-key-file" "$@")
   SECRET_SOURCE=$(resolve_credential_source "RUSTFS_SECRET_KEY" "RUSTFS_SECRET_KEY_FILE" "secret-key" "secret-key-file" "$@")
   validate_credential_source "RUSTFS_ACCESS_KEY" "RUSTFS_ACCESS_KEY_FILE" "RUSTFS_ROOT_USER or MINIO_ROOT_USER" "$ACCESS_SOURCE"
@@ -309,7 +315,7 @@ process_log_directory
 HAS_DATA_PATH=false
 for arg in "$@"; do
   case "$arg" in
-    /usr/bin/rustfs) continue ;;
+    "$SERVER_BIN") continue ;;
     -*) continue ;;
     /*) HAS_DATA_PATH=true; break ;;
   esac

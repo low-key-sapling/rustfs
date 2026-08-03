@@ -16,12 +16,12 @@
 
 # Script name: scp_to_servers.sh
 
-rm ./target/x86_64-unknown-linux-gnu/release/rustfs.zip
-# Compress ./target/x86_64-unknown-linux-gnu/release/rustfs
-zip -j ./target/x86_64-unknown-linux-gnu/release/rustfs.zip ./target/x86_64-unknown-linux-gnu/release/rustfs
+rm ./target/x86_64-unknown-linux-gnu/release/zffs.zip
+# Compress ./target/x86_64-unknown-linux-gnu/release/zffs
+zip -j ./target/x86_64-unknown-linux-gnu/release/zffs.zip ./target/x86_64-unknown-linux-gnu/release/zffs
 
 # Upload to server
-LOCAL_FILE="./target/x86_64-unknown-linux-gnu/release/rustfs.zip"
+LOCAL_FILE="./target/x86_64-unknown-linux-gnu/release/zffs.zip"
 REMOTE_PATH="~"
 
 # IP parameter must be provided, otherwise exit with error

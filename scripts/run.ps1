@@ -193,8 +193,8 @@ if (-not $env:MALLOC_CONF)
 
 # Start main service
 # To run with profiling enabled:
-# cargo run --profile profiling --bin rustfs
+# cargo run --profile profiling --bin zffs
 # To run in release mode:
-# cargo run --profile release --bin rustfs
+# cargo run --profile release --bin zffs
 # To run in debug mode:
-cargo run --bin rustfs
+cargo run --bin zffs

@@ -30,6 +30,7 @@ use crate::admin::storage_api::cluster::{
 };
 use crate::admin::storage_api::storageclass as storage_class_contract;
 use crate::auth::{check_key_valid, get_session_token};
+use crate::product;
 use crate::runtime_capabilities::{EndpointTopologySnapshotProvider, RustFsObservabilitySnapshotProvider};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use crate::workload_admission::workload_admission_registry_snapshot;
@@ -371,17 +372,17 @@ impl Operation for UpdateHandler {
         )
         .await?;
 
-        // MinIO's server-update downloads and swaps the binary in place. RustFS
+        // MinIO's server-update downloads and swaps the binary in place. ZfFS
         // intentionally does not implement in-process self-update: binaries are
         // managed by the packaging/orchestration layer (container image, systemd
         // unit, package manager). We honor the request/response contract and
         // report that no update was applied rather than faking success.
-        let current = crate::version::get_version();
+        let current = product::VERSION.to_string();
         let response = ServerUpdateStatus {
             current_version: current.clone(),
             updated_version: current,
             update_applied: false,
-            message: "in-process self-update is not supported; manage the RustFS binary via your image/package/orchestrator",
+            message: "in-process self-update is not supported; manage the ZfFS binary via your image/package/orchestrator",
         };
         info!(
             event = "server_update",

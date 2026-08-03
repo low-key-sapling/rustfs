@@ -133,7 +133,7 @@ mod tests {
         render(&report, ReportFormat::Text, &mut out).expect("render");
         let text = String::from_utf8(out).expect("utf8");
 
-        assert!(text.starts_with("RustFS 日志诊断报告\n"));
+        assert!(text.starts_with("ZfFS 日志诊断报告\n"));
         assert!(text.ends_with('\n'));
         for needle in [
             "时间范围",
@@ -175,7 +175,7 @@ mod tests {
         let mut out = Vec::new();
         render(&report, ReportFormat::Markdown, &mut out).expect("render");
         let md = String::from_utf8(out).expect("utf8");
-        assert!(md.starts_with("# RustFS 日志诊断报告\n"));
+        assert!(md.starts_with("# ZfFS 日志诊断报告\n"));
         assert!(md.ends_with('\n'));
         for needle in [
             "## 概览",

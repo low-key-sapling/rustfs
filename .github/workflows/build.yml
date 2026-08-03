@@ -168,7 +168,7 @@ jobs:
           echo "  - Short SHA: $short_sha"
           echo "  - Is prerelease: $is_prerelease"
 
-  # Build RustFS binaries
+  # Build ZfFS binaries
   prepare-platform-matrix:
     name: Prepare Platform Matrix
     needs: build-check
@@ -240,7 +240,7 @@ jobs:
           echo "Selected platforms: ${selected}"
 
   build-rustfs:
-    name: Build RustFS
+    name: Build ZfFS
     needs: [ build-check, prepare-platform-matrix ]
     if: needs.build-check.outputs.should_build == 'true' && needs.prepare-platform-matrix.result == 'success'
     runs-on: ${{ matrix.os }}
@@ -400,8 +400,10 @@ jobs:
           asset_count=$(find ./rustfs/static -type f | wc -l | tr -d '[:space:]')
           echo "Console assets ready: version=${console_tag:-unknown}, ${asset_count} files extracted to ./rustfs/static"
 
-      - name: Build RustFS
+      - name: Build ZfFS
         shell: bash
+        env:
+          ZFFS_VERSION: ${{ needs.build-check.outputs.version }}
         run: |
           # Force rebuild by touching build.rs
           touch rustfs/build.rs
@@ -472,13 +474,13 @@ jobs:
           else
             ARCH_WITH_VARIANT="${ARCH}"
           fi
-          PACKAGE_BASENAME="rustfs-${PLATFORM}-${ARCH_WITH_VARIANT}"
+          PACKAGE_BASENAME="zffs-${PLATFORM}-${ARCH_WITH_VARIANT}"
 
           if [[ "$BUILD_TYPE" == "development" ]]; then
-            # Development build: rustfs-${platform}-${arch}-${variant}-dev-${short_sha}.zip
-            PACKAGE_NAME="rustfs-${PLATFORM}-${ARCH_WITH_VARIANT}-dev-${SHORT_SHA}"
+            # Development build: zffs-${platform}-${arch}-${variant}-dev-${short_sha}.zip
+            PACKAGE_NAME="zffs-${PLATFORM}-${ARCH_WITH_VARIANT}-dev-${SHORT_SHA}"
           else
-            # Release/Prerelease build: rustfs-${platform}-${arch}-${variant}-v${version}.zip
+            # Release/Prerelease build: zffs-${platform}-${arch}-${variant}-v${version}.zip
             PACKAGE_NAME="${PACKAGE_BASENAME}-v${PACKAGE_VERSION}"
           fi
           
@@ -493,9 +495,9 @@ jobs:
           cd target/${{ matrix.target }}/release
           # Determine the binary name based on platform
           if [[ "${{ matrix.platform }}" == "windows" ]]; then
-            BINARY_NAME="rustfs.exe"
+            BINARY_NAME="zffs.exe"
           else
-            BINARY_NAME="rustfs"
+            BINARY_NAME="zffs"
           fi
 
           # Verify the binary exists before packaging
@@ -548,7 +550,7 @@ jobs:
           LATEST_FILES=""
           if [[ "$BUILD_TYPE" == "release" ]] || [[ "$BUILD_TYPE" == "prerelease" ]]; then
             # Create latest version filename
-            # Convert from rustfs-linux-x86_64-musl-v1.0.0 to rustfs-linux-x86_64-musl-latest
+            # Convert from zffs-linux-x86_64-musl-v1.0.0 to zffs-linux-x86_64-musl-latest
             LATEST_FILE="${PACKAGE_BASENAME}-latest.zip"
 
             echo "🔄 Creating latest version: ${PACKAGE_NAME}.zip -> $LATEST_FILE"
@@ -561,7 +563,7 @@ jobs:
           elif [[ "$BUILD_TYPE" == "development" ]]; then
             # Development builds (only main branch triggers development builds)
             # Create main-latest version filename
-            # Convert from rustfs-linux-x86_64-dev-abc123 to rustfs-linux-x86_64-main-latest
+            # Convert from zffs-linux-x86_64-dev-abc123 to zffs-linux-x86_64-main-latest
             MAIN_LATEST_FILE="${PACKAGE_BASENAME}-main-latest.zip"
 
             echo "🔄 Creating main-latest version: ${PACKAGE_NAME}.zip -> $MAIN_LATEST_FILE"
@@ -573,7 +575,7 @@ jobs:
 
               # Also create a generic main-latest for Docker builds (Linux only)
               if [[ "${{ matrix.platform }}" == "linux" ]]; then
-                DOCKER_MAIN_LATEST_FILE="rustfs-linux-${ARCH_WITH_VARIANT}-main-latest.zip"
+                DOCKER_MAIN_LATEST_FILE="zffs-linux-${ARCH_WITH_VARIANT}-main-latest.zip"
 
                 echo "🔄 Creating Docker main-latest version: ${PACKAGE_NAME}.zip -> $DOCKER_MAIN_LATEST_FILE"
                 cp "${PACKAGE_NAME}.zip" "$DOCKER_MAIN_LATEST_FILE"
@@ -634,7 +636,7 @@ jobs:
           console_port="$(find_free_port)"
           console_url="http://127.0.0.1:${console_port}/rustfs/console/"
 
-          "$package_dir/rustfs" server \
+          "$package_dir/zffs" server \
             --address "127.0.0.1:${api_port}" \
             --console-enable \
             --console-address "127.0.0.1:${console_port}" \
@@ -659,7 +661,7 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: ${{ steps.package.outputs.package_name }}
-          path: "rustfs-*.zip"
+          path: "zffs-*.zip"
           retention-days: ${{ startsWith(github.ref, 'refs/tags/') && 30 || 7 }}
 
       - name: Upload to Cloudflare R2
@@ -700,16 +702,16 @@ jobs:
 
           # Determine upload path based on build type
           if [[ "$BUILD_TYPE" == "development" ]]; then
-            R2_PATH="s3://${R2_BUCKET}/artifacts/rustfs/dev/"
+            R2_PATH="s3://${R2_BUCKET}/artifacts/zffs/dev/"
             echo "📤 Uploading development build to R2 dev directory"
           else
-            R2_PATH="s3://${R2_BUCKET}/artifacts/rustfs/release/"
+            R2_PATH="s3://${R2_BUCKET}/artifacts/zffs/release/"
             echo "📤 Uploading release build to R2 release directory"
           fi
 
-          # Upload all rustfs zip files to R2 using S3-compatible API
-          echo "📤 Uploading all rustfs-*.zip files to $R2_PATH..."
-          for zip_file in rustfs-*.zip; do
+          # Upload all ZfFS zip files to R2 using S3-compatible API
+          echo "📤 Uploading all zffs-*.zip files to $R2_PATH..."
+          for zip_file in zffs-*.zip; do
             if [[ -f "$zip_file" ]]; then
               echo "Uploading: $zip_file to $R2_PATH..."
               aws s3 cp "$zip_file" "$R2_PATH" --endpoint-url "$R2_ENDPOINT" --only-show-errors
@@ -832,9 +834,9 @@ jobs:
 
           # Create release title
           if [[ "$IS_PRERELEASE" == "true" ]]; then
-            TITLE="RustFS $VERSION (${RELEASE_TYPE})"
+            TITLE="ZfFS $VERSION (${RELEASE_TYPE})"
           else
-            TITLE="RustFS $VERSION"
+            TITLE="ZfFS $VERSION"
           fi
 
           ./scripts/release/create_or_update_release.sh \
@@ -863,7 +865,7 @@ jobs:
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           path: ./artifacts
-          pattern: rustfs-*
+          pattern: zffs-*
           merge-multiple: true
 
       - name: Prepare release assets

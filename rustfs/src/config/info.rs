@@ -19,6 +19,7 @@
 //! configuration, and dependencies.
 
 use super::{InfoOpts, InfoType};
+use crate::product;
 use crate::runtime_sources::current_buffer_config;
 use crate::version::build;
 use rustfs_credentials::Masked;
@@ -453,6 +454,7 @@ impl BuildInfo {
              | Property | Value |\n\
              |----------|-------|\n\
              | Version | {} |\n\
+             | RustFS Base | {} |\n\
              | Build Time | {} |\n\
              | Build Profile | {} |\n\
              | Build OS | {} |\n\
@@ -461,7 +463,8 @@ impl BuildInfo {
              | Git Commit | {} |\n\
              | Git Tag | {} |\n\
              | Git Status | {} |",
-            build::PKG_VERSION,
+            product::VERSION,
+            product::UPSTREAM_VERSION,
             build::BUILD_TIME,
             build::BUILD_RUST_CHANNEL,
             build::BUILD_OS,
@@ -488,6 +491,7 @@ impl fmt::Display for BuildInfo {
 #[derive(Serialize)]
 struct BuildInfoJson {
     version: &'static str,
+    upstream_version: &'static str,
     build_time: &'static str,
     build_profile: &'static str,
     build_os: &'static str,
@@ -501,7 +505,8 @@ struct BuildInfoJson {
 impl BuildInfo {
     fn collect_json() -> BuildInfoJson {
         BuildInfoJson {
-            version: build::PKG_VERSION,
+            version: product::VERSION,
+            upstream_version: product::UPSTREAM_VERSION,
             build_time: build::BUILD_TIME,
             build_profile: build::BUILD_RUST_CHANNEL,
             build_os: build::BUILD_OS,
@@ -1001,6 +1006,17 @@ mod tests {
     fn test_runtime_info_collect() {
         let info = RuntimeInfo::collect();
         assert!(info.process_id > 0);
+    }
+
+    #[test]
+    fn test_build_info_identifies_product_and_upstream_versions() {
+        let output = BuildInfo::format();
+        let json = BuildInfo::collect_json();
+
+        assert!(output.contains(&format!("| Version | {} |", product::VERSION)));
+        assert!(output.contains(&format!("| RustFS Base | {} |", product::UPSTREAM_VERSION)));
+        assert_eq!(json.version, product::VERSION);
+        assert_eq!(json.upstream_version, product::UPSTREAM_VERSION);
     }
 
     #[test]

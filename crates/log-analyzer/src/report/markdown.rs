@@ -27,7 +27,7 @@ fn cell(s: &str) -> String {
 }
 
 pub(super) fn render(report: &AnalysisReport, w: &mut dyn io::Write) -> io::Result<()> {
-    writeln!(w, "# RustFS 日志诊断报告")?;
+    writeln!(w, "# ZfFS 日志诊断报告")?;
     writeln!(w)?;
     writeln!(w, "## 概览")?;
     writeln!(w)?;

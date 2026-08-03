@@ -29,6 +29,7 @@ PLATFORMS="linux/amd64,linux/arm64"
 PUSH=false
 NO_CACHE=false
 RELEASE=""
+RELEASE_REPOSITORY="${RELEASE_REPOSITORY:-low-key-sapling/rustfs}"
 CHANNEL="release"
 
 # Print usage
@@ -113,7 +114,12 @@ build_and_push() {
     local build_date=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     local vcs_ref=$(git rev-parse --short HEAD)
 
-    print_message $BLUE "🚀 Building RustFS Docker images..."
+    if [[ ! "$RELEASE_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+        print_message $RED "Invalid RELEASE_REPOSITORY (expected owner/repository): $RELEASE_REPOSITORY"
+        return 2
+    fi
+
+    print_message $BLUE "🚀 Building ZfFS Docker images..."
     print_message $YELLOW "   Version: $version"
     print_message $YELLOW "   Registry: $REGISTRY"
     print_message $YELLOW "   Namespace: $NAMESPACE"
@@ -129,6 +135,7 @@ build_and_push() {
     local build_cmd="docker buildx build"
     build_cmd+=" --platform $PLATFORMS"
     build_cmd+=" --build-arg RELEASE=$version"
+    build_cmd+=" --build-arg RELEASE_REPOSITORY=$RELEASE_REPOSITORY"
     build_cmd+=" --build-arg CHANNEL=$CHANNEL"
     build_cmd+=" --build-arg BUILD_DATE=$build_date"
     build_cmd+=" --build-arg VCS_REF=$vcs_ref"
@@ -163,7 +170,7 @@ build_and_push() {
     else
         print_message $RED "❌ Failed to build latest variant"
         print_message $YELLOW "💡 Note: Make sure rustfs binaries are available at:"
-        print_message $YELLOW "   https://github.com/rustfs/rustfs/releases"
+        print_message $YELLOW "   https://github.com/$RELEASE_REPOSITORY/releases"
         exit 1
     fi
 
@@ -252,7 +259,7 @@ done
 
 # Main execution
 main() {
-    print_message $BLUE "🐳 RustFS Docker Buildx Build Script"
+    print_message $BLUE "🐳 ZfFS Docker Buildx Build Script"
     print_message $YELLOW "📋 Build Strategy: Uses pre-built binaries from GitHub Releases"
     print_message $YELLOW "🚀 Production images only - optimized for distribution"
     echo ""

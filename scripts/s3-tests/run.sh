@@ -304,13 +304,13 @@ Options:
 
 Deployment Modes (via DEPLOY_MODE environment variable):
   1. build      - Compile with cargo build --release and run (default)
-  2. binary     - Use pre-compiled binary (use RUSTFS_BINARY or default: ./target/release/rustfs)
+  2. binary     - Use pre-compiled binary (use RUSTFS_BINARY or default: ./target/release/zffs)
   3. docker     - Build Docker image and run in container
   4. existing   - Use already running service (specify S3_HOST and S3_PORT)
 
 Environment Variables:
   DEPLOY_MODE            - Deployment mode: "build", "binary", "docker", or "existing" (default: "build")
-  RUSTFS_BINARY          - Path to RustFS binary (for binary mode, default: ./target/release/rustfs)
+  RUSTFS_BINARY          - Path to ZfFS binary (for binary mode, default: ./target/release/zffs)
   S3_HOST                - S3 service host (default: 127.0.0.1)
   S3_PORT                - S3 service port (default: 9000)
   S3_ACCESS_KEY          - Main user access key (default: rustfsadmin)
@@ -347,7 +347,7 @@ Examples:
   $0
 
   # Use pre-compiled binary
-  DEPLOY_MODE=binary RUSTFS_BINARY=./target/release/rustfs $0
+  DEPLOY_MODE=binary RUSTFS_BINARY=./target/release/zffs $0
 
   # Use Docker
   DEPLOY_MODE=docker $0
@@ -415,7 +415,7 @@ if [ "${DEPLOY_MODE}" = "existing" ]; then
 elif [ "${DEPLOY_MODE}" = "binary" ]; then
     # Determine binary path
     if [ -z "${RUSTFS_BINARY}" ]; then
-        RUSTFS_BINARY="${PROJECT_ROOT}/target/release/rustfs"
+        RUSTFS_BINARY="${PROJECT_ROOT}/target/release/zffs"
     fi
 
     if [ ! -f "${RUSTFS_BINARY}" ]; then
@@ -448,7 +448,7 @@ elif [ "${DEPLOY_MODE}" = "binary" ]; then
     log_info "RustFS started with PID: ${RUSTFS_PID}"
 
 elif [ "${DEPLOY_MODE}" = "build" ]; then
-    RUSTFS_BINARY="${PROJECT_ROOT}/target/release/rustfs"
+    RUSTFS_BINARY="${PROJECT_ROOT}/target/release/zffs"
 
     # Check if we should skip compilation
     SHOULD_BUILD=true

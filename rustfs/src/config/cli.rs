@@ -23,7 +23,7 @@
 //! - `InfoType`: Information type enum
 //! - `CommandResult`: Result of parsing command line arguments
 
-use crate::version::build;
+use crate::{product, version::build};
 use clap::builder::NonEmptyStringValueParser;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use const_str::concat;
@@ -31,19 +31,13 @@ use rustfs_config::{DEFAULT_ADDRESS, DEFAULT_CONSOLE_ADDRESS, DEFAULT_CONSOLE_EN
 use std::path::PathBuf;
 // build module is re-exported from crate::build
 
-#[allow(clippy::const_is_empty)]
-pub(super) const SHORT_VERSION: &str = {
-    if !build::TAG.is_empty() {
-        build::TAG
-    } else if !build::SHORT_COMMIT.is_empty() {
-        concat!("@", build::SHORT_COMMIT)
-    } else {
-        build::PKG_VERSION
-    }
-};
+pub(super) const BINARY_NAME: &str = product::BINARY_NAME;
+pub(super) const SHORT_VERSION: &str = product::VERSION;
+pub(super) const UPSTREAM_VERSION: &str = product::UPSTREAM_VERSION;
 
 pub(super) const LONG_VERSION: &str = concat!(
     concat!(SHORT_VERSION, "\n"),
+    concat!("RustFS base  : ", UPSTREAM_VERSION, "\n"),
     concat!("build time   : ", build::BUILD_TIME, "\n"),
     concat!("build profile: ", build::BUILD_RUST_CHANNEL, "\n"),
     concat!("build os     : ", build::BUILD_OS, "\n"),
@@ -58,13 +52,13 @@ pub(super) const LONG_VERSION: &str = concat!(
 /// Known subcommands. When the first arg matches one of these, it is treated as a subcommand.
 pub const KNOWN_SUBCOMMANDS: &[&str] = &["server", "info", "tls", "diagnose"];
 
-/// Preprocess argv for legacy compatibility: `rustfs <volume>` and `rustfs --address ...` are
-/// treated as `rustfs server <volume>` and `rustfs server --address ...` respectively.
-/// Also: `rustfs` with no args becomes `rustfs server` (volumes from env), and `rustfs --info`
-/// is treated as `rustfs info`.
+/// Preprocess argv for legacy compatibility: `zffs <volume>` and `zffs --address ...` are
+/// treated as `zffs server <volume>` and `zffs server --address ...` respectively.
+/// Also: `zffs` with no args becomes `zffs server` (volumes from env), and `zffs --info`
+/// is treated as `zffs info`.
 pub fn preprocess_args_for_legacy(args: Vec<String>) -> Vec<String> {
     if args.len() < 2 {
-        // rustfs -> rustfs server (volumes from RUSTFS_VOLUMES env)
+        // zffs -> zffs server (volumes from RUSTFS_VOLUMES env)
         return vec![args[0].clone(), "server".to_string()];
     }
     let first = &args[1];
@@ -72,7 +66,7 @@ pub fn preprocess_args_for_legacy(args: Vec<String>) -> Vec<String> {
     if KNOWN_SUBCOMMANDS.contains(&first.as_str()) {
         return args;
     }
-    // Preserve the traditional `rustfs help` entry point without exposing
+    // Preserve the traditional `zffs help` entry point without exposing
     // Clap's generated `help` subcommand in the top-level command list.
     if first == "help" {
         let mut out = vec![args[0].clone()];
@@ -90,7 +84,7 @@ pub fn preprocess_args_for_legacy(args: Vec<String>) -> Vec<String> {
     if first == "--help" || first == "-h" || first == "--version" || first == "-V" {
         return args;
     }
-    // Legacy: rustfs <volume> or rustfs --address ... -> rustfs server <volume|--address ...>
+    // Legacy: zffs <volume> or zffs --address ... -> zffs server <volume|--address ...>
     let mut out = vec![args[0].clone(), "server".to_string()];
     out.extend(args[1..].iter().cloned());
     out
@@ -98,7 +92,7 @@ pub fn preprocess_args_for_legacy(args: Vec<String>) -> Vec<String> {
 
 /// Main CLI parser
 #[derive(Parser, Clone)]
-#[command(name = "rustfs", version = SHORT_VERSION, long_version = LONG_VERSION)]
+#[command(name = BINARY_NAME, version = SHORT_VERSION, long_version = LONG_VERSION)]
 #[command(disable_help_subcommand = true)]
 pub struct Cli {
     #[command(subcommand)]
@@ -114,7 +108,7 @@ pub enum Commands {
     Info(InfoOpts),
     /// Inspect TLS certificate directory layout and parsing status
     Tls(TlsOpts),
-    /// Analyze RustFS log files and report probable failure causes
+    /// Analyze ZfFS log files and report probable failure causes
     Diagnose(DiagnoseOpts),
 }
 
@@ -300,7 +294,7 @@ pub struct ServerOpts {
     )]
     pub obs_endpoint: String,
 
-    /// tls path for rustfs API and console.
+    /// tls path for ZfFS API and console.
     #[arg(long, env = "RUSTFS_TLS_PATH")]
     pub tls_path: Option<String>,
 
@@ -407,20 +401,37 @@ pub fn default_server_opts() -> ServerOpts {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, preprocess_args_for_legacy};
+    use super::{Cli, LONG_VERSION, SHORT_VERSION, UPSTREAM_VERSION, preprocess_args_for_legacy};
     use clap::Parser;
     use clap::error::ErrorKind;
 
     #[test]
     fn preprocess_help_command_displays_top_level_help() {
-        let args = preprocess_args_for_legacy(vec!["rustfs".to_string(), "help".to_string()]);
+        let args = preprocess_args_for_legacy(vec!["zffs".to_string(), "help".to_string()]);
 
-        assert_eq!(args, vec!["rustfs".to_string(), "--help".to_string()]);
+        assert_eq!(args, vec!["zffs".to_string(), "--help".to_string()]);
 
         let err = match Cli::try_parse_from(args) {
-            Ok(_) => panic!("rustfs help should display help"),
+            Ok(_) => panic!("zffs help should display help"),
             Err(err) => err,
         };
         assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+        let help = err.to_string();
+        assert!(help.contains("Usage: zffs"));
+        assert!(!help.contains("Usage: rustfs"));
+    }
+
+    #[test]
+    fn version_output_identifies_zffs_and_the_rustfs_base() {
+        let err = match Cli::try_parse_from(["zffs", "--version"]) {
+            Ok(_) => panic!("--version should display version information"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), ErrorKind::DisplayVersion);
+        let output = err.to_string();
+        assert!(output.starts_with(&format!("zffs {SHORT_VERSION}\n")));
+        assert!(output.contains(&format!("RustFS base  : {UPSTREAM_VERSION}")));
+        assert_eq!(LONG_VERSION.lines().next(), Some(SHORT_VERSION));
     }
 }

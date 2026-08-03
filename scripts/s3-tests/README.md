@@ -57,11 +57,11 @@ DEPLOY_MODE=build ./scripts/s3-tests/run.sh
 Use pre-compiled binary file:
 
 ```bash
-# Use default path (./target/release/rustfs)
+# Use default path (./target/release/zffs)
 DEPLOY_MODE=binary ./scripts/s3-tests/run.sh
 
 # Specify custom binary path
-DEPLOY_MODE=binary RUSTFS_BINARY=./target/release/rustfs ./scripts/s3-tests/run.sh
+DEPLOY_MODE=binary RUSTFS_BINARY=./target/release/zffs ./scripts/s3-tests/run.sh
 ```
 
 **Behavior**:
@@ -123,7 +123,7 @@ DEPLOY_MODE=existing S3_HOST=192.168.1.100 S3_PORT=9000 ./scripts/s3-tests/run.s
   - `binary`: Use pre-compiled binary file
   - `docker`: Build Docker image and run in container
   - `existing`: Use already running service
-- `RUSTFS_BINARY`: Path to binary file (for binary mode, default: `./target/release/rustfs`)
+- `RUSTFS_BINARY`: Path to binary file (for binary mode, default: `./target/release/zffs`)
 - `DATA_ROOT`: Root directory for test data storage (default: `target`)
   - Final path: `${DATA_ROOT}/test-data/${CONTAINER_NAME}`
   - Example: `DATA_ROOT=/tmp` stores data in `/tmp/test-data/rustfs-single/`

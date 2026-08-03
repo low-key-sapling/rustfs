@@ -7,10 +7,10 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 
 ENTRYPOINT="$ROOT_DIR/entrypoint.sh"
 
-# Warn-path cases run the entrypoint through to `exec /usr/bin/rustfs`; on a
+# Warn-path cases run the entrypoint through to `exec /usr/bin/zffs`; on a
 # host that actually has the binary they would start real servers and hang.
-if [ -e /usr/bin/rustfs ]; then
-  echo "refusing to run: /usr/bin/rustfs exists on this host" >&2
+if [ -e /usr/bin/zffs ] || [ -e /usr/bin/rustfs ]; then
+  echo "refusing to run: a ZfFS or legacy RustFS binary exists under /usr/bin" >&2
   exit 1
 fi
 
@@ -40,8 +40,8 @@ assert_lacks() {
   fi
 }
 
-# The test environment has no /usr/bin/rustfs, so a run that passes credential
-# validation still exits non-zero at exec time. "Starting: /usr/bin/rustfs" on
+# The test environment has no /usr/bin/zffs, so a run that passes credential
+# validation still exits non-zero at exec time. "Starting: /usr/bin/zffs" on
 # stdout is the proof that validation let startup proceed.
 run_expect_start() {
   label="$1"
@@ -49,10 +49,10 @@ run_expect_start() {
   shift 2
 
   log_file="$TMP_DIR/$label.log"
-  env -i PATH="$PATH" RUSTFS_VOLUMES="$TMP_DIR/data" RUSTFS_OBS_LOG_DIRECTORY= "$@" sh "$ENTRYPOINT" rustfs >"$log_file" 2>&1 || true
+  env -i PATH="$PATH" RUSTFS_VOLUMES="$TMP_DIR/data" RUSTFS_OBS_LOG_DIRECTORY= "$@" sh "$ENTRYPOINT" zffs >"$log_file" 2>&1 || true
 
   assert_contains "$log_file" "$expected"
-  assert_contains "$log_file" "Starting: /usr/bin/rustfs"
+  assert_contains "$log_file" "Starting: /usr/bin/zffs"
   assert_lacks "$log_file" "^ERROR:"
 }
 
@@ -62,13 +62,13 @@ run_expect_failure() {
   shift 2
 
   log_file="$TMP_DIR/$label.log"
-  if env -i PATH="$PATH" RUSTFS_VOLUMES="$TMP_DIR/data" RUSTFS_OBS_LOG_DIRECTORY= "$@" sh "$ENTRYPOINT" rustfs >"$log_file" 2>&1; then
+  if env -i PATH="$PATH" RUSTFS_VOLUMES="$TMP_DIR/data" RUSTFS_OBS_LOG_DIRECTORY= "$@" sh "$ENTRYPOINT" zffs >"$log_file" 2>&1; then
     echo "Expected $label to fail" >&2
     exit 1
   fi
 
   assert_contains "$log_file" "$expected"
-  assert_lacks "$log_file" "Starting: /usr/bin/rustfs"
+  assert_lacks "$log_file" "Starting: /usr/bin/zffs"
 }
 
 # CLI-flag variants cannot go through the env-pair helpers, so they run
@@ -79,10 +79,10 @@ run_cli_expect_start() {
   shift 2
 
   log_file="$TMP_DIR/$label.log"
-  env -i PATH="$PATH" RUSTFS_VOLUMES="$TMP_DIR/data" RUSTFS_OBS_LOG_DIRECTORY= RUSTFS_SECRET_KEY=custom-secret sh "$ENTRYPOINT" rustfs "$@" >"$log_file" 2>&1 || true
+  env -i PATH="$PATH" RUSTFS_VOLUMES="$TMP_DIR/data" RUSTFS_OBS_LOG_DIRECTORY= RUSTFS_SECRET_KEY=custom-secret sh "$ENTRYPOINT" zffs "$@" >"$log_file" 2>&1 || true
 
   assert_contains "$log_file" "$expected"
-  assert_contains "$log_file" "Starting: /usr/bin/rustfs"
+  assert_contains "$log_file" "Starting: /usr/bin/zffs"
   assert_lacks "$log_file" "^ERROR:"
 }
 
@@ -92,13 +92,13 @@ run_cli_expect_failure() {
   shift 2
 
   log_file="$TMP_DIR/$label.log"
-  if env -i PATH="$PATH" RUSTFS_VOLUMES="$TMP_DIR/data" RUSTFS_OBS_LOG_DIRECTORY= RUSTFS_SECRET_KEY=custom-secret sh "$ENTRYPOINT" rustfs "$@" >"$log_file" 2>&1; then
+  if env -i PATH="$PATH" RUSTFS_VOLUMES="$TMP_DIR/data" RUSTFS_OBS_LOG_DIRECTORY= RUSTFS_SECRET_KEY=custom-secret sh "$ENTRYPOINT" zffs "$@" >"$log_file" 2>&1; then
     echo "Expected $label to fail" >&2
     exit 1
   fi
 
   assert_contains "$log_file" "$expected"
-  assert_lacks "$log_file" "Starting: /usr/bin/rustfs"
+  assert_lacks "$log_file" "Starting: /usr/bin/zffs"
 }
 
 # Missing credentials warn for both keys but still start.
@@ -160,7 +160,7 @@ no_newline_file="$TMP_DIR/no-newline-access-key"
 printf 'custom-access' >"$no_newline_file"
 run_expect_start \
   "proper-access-file-no-newline" \
-  "Starting: /usr/bin/rustfs" \
+  "Starting: /usr/bin/zffs" \
   RUSTFS_ACCESS_KEY_FILE="$no_newline_file" \
   RUSTFS_SECRET_KEY=custom-secret
 assert_lacks "$TMP_DIR/proper-access-file-no-newline.log" "WARNING:"
@@ -168,10 +168,16 @@ assert_lacks "$TMP_DIR/proper-access-file-no-newline.log" "WARNING:"
 # Proper credentials start with no credential diagnostics at all.
 run_expect_start \
   "proper-creds" \
-  "Starting: /usr/bin/rustfs" \
+  "Starting: /usr/bin/zffs" \
   RUSTFS_ACCESS_KEY=custom-access \
   RUSTFS_SECRET_KEY=custom-secret
 assert_lacks "$TMP_DIR/proper-creds.log" "WARNING:"
+
+# Legacy container command spelling still normalizes to the branded binary.
+legacy_command_log="$TMP_DIR/legacy-command.log"
+env -i PATH="$PATH" RUSTFS_VOLUMES="$TMP_DIR/data" RUSTFS_OBS_LOG_DIRECTORY= RUSTFS_ACCESS_KEY=custom-access RUSTFS_SECRET_KEY=custom-secret sh "$ENTRYPOINT" rustfs >"$legacy_command_log" 2>&1 || true
+assert_contains "$legacy_command_log" "Starting: /usr/bin/zffs"
+assert_lacks "$legacy_command_log" "^ERROR:"
 
 # Malformed configuration still fails hard: conflicting sources, unreadable
 # credential files, empty values, and flags missing their argument must stop

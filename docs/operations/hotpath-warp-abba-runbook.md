@@ -69,7 +69,7 @@ previous accepted release:
 git fetch origin main
 git switch --detach origin/main
 cargo build --release -p rustfs --bins
-cp target/release/rustfs /tmp/rustfs-baseline
+cp target/release/zffs /tmp/rustfs-baseline
 ```
 
 Build the candidate from the PR commit:
@@ -77,7 +77,7 @@ Build the candidate from the PR commit:
 ```bash
 git switch <candidate-branch>
 cargo build --release -p rustfs --bins
-cp target/release/rustfs /tmp/rustfs-candidate
+cp target/release/zffs /tmp/rustfs-candidate
 ```
 
 For cross-compiled cluster binaries, keep both outputs on the bench host and

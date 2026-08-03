@@ -49,6 +49,7 @@ pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
 pub const ENV_RUSTFS_BUILD_FEATURES: &str = "RUSTFS_BUILD_FEATURES";
 pub const TEST_BUCKET: &str = "e2e-test-bucket";
 const RUSTFS_FULL_FEATURE: &str = "full";
+const SERVER_BINARY_NAME: &str = "zffs";
 
 fn capture_log_path(log_dir: &Path, temp_dir: &str) -> Option<PathBuf> {
     let temp_name = Path::new(temp_dir).file_name()?.to_string_lossy();
@@ -154,7 +155,7 @@ pub fn rustfs_binary_path() -> PathBuf {
 
 /// Resolve the RustFS binary relative to the workspace, optionally requesting build features.
 pub fn rustfs_binary_path_with_features(requested_features: Option<&str>) -> PathBuf {
-    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_rustfs") {
+    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_zffs") {
         return PathBuf::from(path);
     }
     let requested_features = requested_features.and_then(normalize_rustfs_build_features);
@@ -163,7 +164,7 @@ pub fn rustfs_binary_path_with_features(requested_features: Option<&str>) -> Pat
     binary_path.push("target");
     let profile_dir = if cfg!(debug_assertions) { "debug" } else { "release" };
     binary_path.push(profile_dir);
-    binary_path.push(format!("rustfs{}", std::env::consts::EXE_SUFFIX));
+    binary_path.push(format!("{SERVER_BINARY_NAME}{}", std::env::consts::EXE_SUFFIX));
 
     let features_match = binary_features_match(&binary_path, requested_features.as_deref());
     let source_is_newer = workspace_sources_newer_than_binary(&binary_path);
@@ -295,7 +296,7 @@ fn build_rustfs_binary(requested_features: Option<&str>) {
     };
 
     let mut cmd = Command::new("cargo");
-    cmd.current_dir(&workspace).args(["build", "--bin", "rustfs"]);
+    cmd.current_dir(&workspace).args(["build", "--bin", SERVER_BINARY_NAME]);
 
     if let Some(features) = requested_features {
         cmd.arg("--features").arg(features);
@@ -307,7 +308,7 @@ fn build_rustfs_binary(requested_features: Option<&str>) {
     }
 
     info!(
-        "Executing: cargo build --bin rustfs {}",
+        "Executing: cargo build --bin {SERVER_BINARY_NAME} {}",
         if cfg!(debug_assertions) { "" } else { "--release" }
     );
 
@@ -321,7 +322,7 @@ fn build_rustfs_binary(requested_features: Option<&str>) {
     let mut binary_path = workspace;
     binary_path.push("target");
     binary_path.push(if cfg!(debug_assertions) { "debug" } else { "release" });
-    binary_path.push(format!("rustfs{}", std::env::consts::EXE_SUFFIX));
+    binary_path.push(format!("{SERVER_BINARY_NAME}{}", std::env::consts::EXE_SUFFIX));
     let stamp_path = rustfs_binary_features_stamp_path(&binary_path);
     if let Err(err) = stdfs::write(&stamp_path, requested_features.unwrap_or_default()) {
         warn!("Failed to write RustFS feature stamp {:?}: {}", stamp_path, err);

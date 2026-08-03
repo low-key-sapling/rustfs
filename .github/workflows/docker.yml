@@ -394,8 +394,8 @@ jobs:
           echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
 
           # Generate labels
-          LABELS="org.opencontainers.image.title=RustFS"
-          LABELS="$LABELS,org.opencontainers.image.description=RustFS distributed object storage system"
+          LABELS="org.opencontainers.image.title=ZfFS"
+          LABELS="$LABELS,org.opencontainers.image.description=ZfFS S3-compatible object storage based on RustFS"
           LABELS="$LABELS,org.opencontainers.image.version=$VERSION"
           LABELS="$LABELS,org.opencontainers.image.revision=${{ github.sha }}"
           LABELS="$LABELS,org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}"
@@ -436,6 +436,7 @@ jobs:
           # supplying them would change the published image labels.
           build-args: |
             RELEASE=${{ steps.meta.outputs.docker_release }}
+            RELEASE_REPOSITORY=${{ github.repository }}
           provenance: true
           sbom: true
           # Add retry mechanism by splitting the build process

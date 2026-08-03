@@ -429,7 +429,7 @@ export RUSTFS_KEYSTONE_ADMIN_PROJECT=admin
 export RUSTFS_KEYSTONE_ADMIN_DOMAIN=Default
 
 # Start RustFS
-cargo run --bin rustfs -- \
+cargo run --bin zffs -- \
   --address 127.0.0.1:9000 \
   --access-key minioadmin \
   --secret-key minioadmin \

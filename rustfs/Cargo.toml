@@ -20,8 +20,8 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 homepage.workspace = true
-default-run = "rustfs"
-description = "RustFS is a high-performance, distributed file system designed for modern cloud-native applications, providing efficient data storage and retrieval with advanced features like S3 Select, IAM, and policy management."
+default-run = "zffs"
+description = "ZfFS is an S3-compatible object storage distribution based on RustFS."
 keywords.workspace = true
 categories.workspace = true
 documentation = "https://docs.rustfs.com/"
@@ -32,7 +32,7 @@ name = "rustfs"
 path = "src/lib.rs"
 
 [[bin]]
-name = "rustfs"
+name = "zffs"
 path = "src/main.rs"
 
 [features]

@@ -65,7 +65,7 @@ COMPRESSED_FALLBACK_PROBE=false
 COMPRESSED_PROBE_EXTENSION=".compressed-probe.txt"
 COMPRESSED_PROBE_MIME_TYPE="text/plain"
 OUT_DIR=""
-RUSTFS_BIN="${PROJECT_ROOT}/target/release/rustfs"
+RUSTFS_BIN="${PROJECT_ROOT}/target/release/zffs"
 WARP_BIN="warp"
 PYTHON_BIN="python3"
 CODEC_MIN_SIZE=""
@@ -192,7 +192,7 @@ Core options:
   --out-dir <path>               output directory (default: target/bench/get-codec-streaming-<timestamp>)
 
 Binary/options:
-  --rustfs-bin <path>            RustFS binary (default: target/release/rustfs)
+  --rustfs-bin <path>            ZfFS binary (default: target/release/zffs)
   --warp-bin <path>              warp binary (default: warp)
   --python-bin <path>            Python binary for SigV4 compatibility probe (default: python3)
   --codec-min-size <bytes>       Override RUSTFS_GET_CODEC_STREAMING_MIN_SIZE

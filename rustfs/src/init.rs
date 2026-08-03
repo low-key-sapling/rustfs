@@ -20,7 +20,7 @@ use crate::storage_api::startup::init::{
     get_bucket_notification_config, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
 };
 use crate::storage_api::startup::sse::log_sse_kms_key_policy_mode;
-use crate::{admin, config, startup_runtime_sources, version};
+use crate::{admin, config, product, startup_runtime_sources};
 use rustfs_config::{
     DEFAULT_BUFFER_MAX_SIZE, DEFAULT_BUFFER_MIN_SIZE, DEFAULT_BUFFER_PROFILE, DEFAULT_BUFFER_UNKNOWN_SIZE, DEFAULT_UPDATE_CHECK,
     ENV_RUSTFS_BUFFER_DEFAULT_SIZE, ENV_RUSTFS_BUFFER_MAX_SIZE, ENV_RUSTFS_BUFFER_MIN_SIZE, ENV_UPDATE_CHECK, RUSTFS_REGION,
@@ -56,11 +56,12 @@ pub fn print_server_info() {
         event = "server_identity",
         component = LOG_COMPONENT_INIT,
         subsystem = LOG_SUBSYSTEM_STARTUP,
-        product = "RustFS Object Storage Server",
-        version = %version::get_version(),
+        product = product::FULL_NAME,
+        version = product::VERSION,
+        upstream_product = product::UPSTREAM_NAME,
+        upstream_version = product::UPSTREAM_VERSION,
         copyright_year = current_year,
         license = "Apache-2.0",
-        docs_url = "https://rustfs.com/docs/",
         "Server identity loaded"
     );
 }

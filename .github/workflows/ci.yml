@@ -521,7 +521,7 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: rustfs-debug-binary
-          path: target/debug/rustfs
+          path: target/debug/zffs
           if-no-files-found: error
           retention-days: 1
 
@@ -554,7 +554,7 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: rustfs-debug-binary-rio-v2
-          path: target/debug/rustfs
+          path: target/debug/zffs
           if-no-files-found: error
           retention-days: 1
 
@@ -665,7 +665,7 @@ jobs:
           path: target/debug
 
       - name: Make binary executable
-        run: chmod +x ./target/debug/rustfs
+        run: chmod +x ./target/debug/zffs
 
       # Build the e2e test graph once. The archive is reused by the security
       # count-floor check and the smoke run below, avoiding a second compile of
@@ -725,7 +725,7 @@ jobs:
           RUSTFS_TEST_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
           RUSTFS_TEST_PORT="${RUSTFS_TEST_PORT}" \
           RUSTFS_TEST_LOG="${RUN_ROOT}/rustfs.log" \
-          ./scripts/e2e-run.sh ./target/debug/rustfs "${RUN_ROOT}/data"
+          ./scripts/e2e-run.sh ./target/debug/zffs "${RUN_ROOT}/data"
 
       - name: Upload test logs
         if: failure()
@@ -773,7 +773,7 @@ jobs:
           path: target/debug
 
       - name: Make binary executable
-        run: chmod +x ./target/debug/rustfs
+        run: chmod +x ./target/debug/zffs
 
       # Full single-node e2e lane (backlog#1149 ci-5). The e2e-full
       # default-filter in .config/nextest.toml is the single wiring mechanism —
@@ -813,7 +813,7 @@ jobs:
           path: target/debug
 
       - name: Make binary executable
-        run: chmod +x ./target/debug/rustfs
+        run: chmod +x ./target/debug/zffs
 
       - name: Setup Rust toolchain for s3s-e2e installation
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -836,7 +836,7 @@ jobs:
       - name: Run end-to-end tests
         run: |
           s3s-e2e --version
-          ./scripts/e2e-run.sh ./target/debug/rustfs /tmp/rustfs
+          ./scripts/e2e-run.sh ./target/debug/zffs /tmp/rustfs
 
       - name: Upload test logs
         if: failure()
@@ -864,7 +864,7 @@ jobs:
           path: target/debug
 
       - name: Make binary executable
-        run: chmod +x ./target/debug/rustfs
+        run: chmod +x ./target/debug/zffs
 
       - name: Run implemented s3-tests
         run: |
@@ -872,7 +872,7 @@ jobs:
           mkdir -p "${RUN_ROOT}"
           S3_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
           DEPLOY_MODE=binary \
-          RUSTFS_BINARY=./target/debug/rustfs \
+          RUSTFS_BINARY=./target/debug/zffs \
           TEST_MODE=single \
           MAXFAIL=0 \
           XDIST=4 \
@@ -938,7 +938,7 @@ jobs:
           path: target/debug
 
       - name: Make binary executable
-        run: chmod +x ./target/debug/rustfs
+        run: chmod +x ./target/debug/zffs
 
       - name: Run lifecycle behavior s3-tests
         run: |
@@ -946,7 +946,7 @@ jobs:
           mkdir -p "${RUN_ROOT}"
           S3_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
           DEPLOY_MODE=binary \
-          RUSTFS_BINARY=./target/debug/rustfs \
+          RUSTFS_BINARY=./target/debug/zffs \
           TEST_MODE=single \
           MAXFAIL=0 \
           XDIST=0 \

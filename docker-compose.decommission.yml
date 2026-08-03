@@ -24,7 +24,7 @@ services:
             /data/pool0/disk1 /data/pool0/disk2 /data/pool0/disk3 /data/pool0/disk4 \
             /data/pool1/disk1 /data/pool1/disk2 /data/pool1/disk3 /data/pool1/disk4 \
             /logs
-          exec /usr/bin/rustfs '/data/pool0/disk{1...4}' '/data/pool1/disk{1...4}'
+          exec /usr/bin/zffs '/data/pool0/disk{1...4}' '/data/pool1/disk{1...4}'
     ports:
       - "9100:9000"
       - "9101:9001"

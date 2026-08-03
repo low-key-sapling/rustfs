@@ -14,6 +14,7 @@
 
 use crate::storage_api::startup::shutdown::shutdown_background_services;
 use crate::{
+    product,
     server::{ServiceState, ServiceStateManager, ShutdownHandle, ShutdownSignal, shutdown_event_notifier, stop_audit_system},
     startup_optional_runtime_sidecars::{
         OptionalRuntimeServices, prepare_optional_runtime_shutdowns, shutdown_optional_runtime_services,
@@ -343,7 +344,8 @@ pub(crate) async fn run_startup_shutdown_sequence(
         component = LOG_COMPONENT_MAIN,
         subsystem = LOG_SUBSYSTEM_STARTUP,
         state = "stopping",
-        "RustFS server stopping"
+        product = product::NAME,
+        "Server stopping"
     );
     if let Some(s3_shutdown_handle) = s3_shutdown_handle {
         s3_shutdown_handle.shutdown().await;
@@ -362,7 +364,8 @@ pub(crate) async fn run_startup_shutdown_sequence(
         component = LOG_COMPONENT_MAIN,
         subsystem = LOG_SUBSYSTEM_STARTUP,
         state = "stopped",
-        "RustFS server stopped"
+        product = product::NAME,
+        "Server stopped"
     );
 }
 

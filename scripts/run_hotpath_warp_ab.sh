@@ -200,8 +200,10 @@ build_ref_binary() {
   # at …" on stdout, which polluted the captured path and made the rig exec
   # a two-line string as the binary (2026-07-10 dispatch run failure).
   run git worktree add --detach "$wt" "$ref" >&2
-  run bash -c "cd '$wt' && cargo build --release --bin rustfs" >&2
-  run cp "$wt/target/release/rustfs" "$dest" 2>/dev/null >&2 || true
+  run bash -c "cd '$wt' && cargo build --release -p rustfs --bins" >&2
+  if ! run cp "$wt/target/release/zffs" "$dest" 2>/dev/null >&2; then
+    run cp "$wt/target/release/rustfs" "$dest" 2>/dev/null >&2
+  fi
   run git worktree remove --force "$wt" 2>/dev/null >&2 || true
   [[ "$DRY_RUN" == "true" || -x "$dest" ]] || { echo "error: baseline binary missing at $dest (baseline build failed?)" >&2; return 1; }
   echo "$dest"
@@ -217,8 +219,8 @@ elif [[ "$SKIP_BUILD" == "true" ]]; then
 else
   [[ -n "$CANDIDATE_BIN" ]] || {
     log "building candidate (current worktree)"
-    run cargo build --release --bin rustfs
-    CANDIDATE_BIN="${PROJECT_ROOT}/target/release/rustfs"
+    run cargo build --release --bin zffs
+    CANDIDATE_BIN="${PROJECT_ROOT}/target/release/zffs"
   }
   [[ -n "$BASELINE_BIN" ]] || {
     log "building baseline ($BASELINE_REF)"

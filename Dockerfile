@@ -16,22 +16,24 @@ FROM alpine:3.24.1 AS build
 
 ARG TARGETARCH
 ARG RELEASE=latest
+ARG RELEASE_REPOSITORY
 
 RUN apk add --no-cache ca-certificates curl jq unzip
 WORKDIR /build
 
 RUN set -eux; \
+    : "${RELEASE_REPOSITORY:?RELEASE_REPOSITORY build argument is required}"; \
     case "$TARGETARCH" in \
       amd64)  ARCH_SUBSTR="x86_64-musl"  ;; \
       arm64)  ARCH_SUBSTR="aarch64-musl" ;; \
       *) echo "Unsupported TARGETARCH=$TARGETARCH" >&2; exit 1 ;; \
     esac; \
     if [ "$RELEASE" = "latest" ]; then \
-      RELEASE_JSON="$(curl -fsSL https://api.github.com/repos/rustfs/rustfs/releases | jq -c '.[0]')"; \
+      RELEASE_JSON="$(curl -fsSL "https://api.github.com/repos/${RELEASE_REPOSITORY}/releases" | jq -c '.[0]')"; \
       TAG="$(printf '%s' "$RELEASE_JSON" | jq -r '.tag_name // empty')"; \
     else \
       TAG="$RELEASE"; \
-      RELEASE_JSON="$(curl -fsSL "https://api.github.com/repos/rustfs/rustfs/releases/tags/$TAG" 2>/dev/null || true)"; \
+      RELEASE_JSON="$(curl -fsSL "https://api.github.com/repos/${RELEASE_REPOSITORY}/releases/tags/$TAG" 2>/dev/null || true)"; \
       if [ -z "$RELEASE_JSON" ]; then \
         if [ "${TAG#v}" = "$TAG" ]; then \
           ALT_TAG="v$TAG"; \
@@ -39,7 +41,7 @@ RUN set -eux; \
           ALT_TAG="${TAG#v}"; \
         fi; \
         echo "Primary tag lookup failed, retrying with alternate tag: $ALT_TAG"; \
-        RELEASE_JSON="$(curl -fsSL "https://api.github.com/repos/rustfs/rustfs/releases/tags/$ALT_TAG")"; \
+        RELEASE_JSON="$(curl -fsSL "https://api.github.com/repos/${RELEASE_REPOSITORY}/releases/tags/$ALT_TAG")"; \
         TAG="$ALT_TAG"; \
       fi; \
     fi; \
@@ -54,20 +56,19 @@ RUN set -eux; \
     if [ -z "$URL" ] || [ -z "$ASSET_NAME" ]; then echo "Failed to locate release asset for $ARCH_SUBSTR at tag $TAG" >&2; exit 1; fi; \
     if [ -z "$SHA256" ] || [ "$SHA256" = "$DIGEST" ]; then echo "Release asset $ASSET_NAME is missing a sha256 digest" >&2; exit 1; fi; \
     echo "Downloading: $URL"; \
-    curl -fL "$URL" -o rustfs.zip; \
-    printf '%s  rustfs.zip\n' "$SHA256" | sha256sum -c -; \
-    unzip -q rustfs.zip -d /build; \
-    # If binary is not in root directory, try to locate and move from zip to /build/rustfs
-    if [ ! -x /build/rustfs ]; then \
-      BIN_PATH="$(unzip -Z -1 rustfs.zip | grep -E '(^|/)rustfs$' | head -n 1 || true)"; \
+    curl -fL "$URL" -o zffs.zip; \
+    printf '%s  zffs.zip\n' "$SHA256" | sha256sum -c -; \
+    unzip -q zffs.zip -d /build; \
+    if [ ! -x /build/zffs ]; then \
+      BIN_PATH="$(unzip -Z -1 zffs.zip | grep -E '(^|/)zffs$' | head -n 1 || true)"; \
       if [ -n "$BIN_PATH" ]; then \
-        mkdir -p /build/.tmp && unzip -q rustfs.zip "$BIN_PATH" -d /build/.tmp && \
-        mv "/build/.tmp/$BIN_PATH" /build/rustfs; \
+        mkdir -p /build/.tmp && unzip -q zffs.zip "$BIN_PATH" -d /build/.tmp && \
+        mv "/build/.tmp/$BIN_PATH" /build/zffs; \
       fi; \
     fi; \
-    [ -x /build/rustfs ] || { echo "rustfs binary not found in asset" >&2; exit 1; }; \
-    chmod +x /build/rustfs; \
-    rm -rf rustfs.zip /build/.tmp || true
+    [ -x /build/zffs ] || { echo "zffs binary not found in asset" >&2; exit 1; }; \
+    chmod +x /build/zffs; \
+    rm -rf zffs.zip /build/.tmp || true
 
 
 FROM alpine:3.24.1
@@ -76,16 +77,13 @@ ARG RELEASE=latest
 ARG BUILD_DATE
 ARG VCS_REF
 
-LABEL name="RustFS" \
-      vendor="RustFS Team" \
-      maintainer="RustFS Team <dev@rustfs.com>" \
+LABEL name="ZfFS" \
       version="v${RELEASE#v}" \
       release="${RELEASE}" \
       build-date="${BUILD_DATE}" \
       vcs-ref="${VCS_REF}" \
       summary="High-performance distributed object storage system compatible with S3 API" \
-      description="RustFS is a distributed object storage system written in Rust, supporting erasure coding, multi-tenant management, and observability." \
-      url="https://rustfs.com" \
+      description="ZfFS is an S3-compatible object storage distribution based on RustFS." \
       license="Apache-2.0"
 
 # Upgrade base-image packages so published images pick up security fixes
@@ -94,10 +92,10 @@ RUN apk upgrade --no-cache && \
     apk add --no-cache ca-certificates coreutils curl
 
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
-COPY --from=build /build/rustfs /usr/bin/rustfs
+COPY --from=build /build/zffs /usr/bin/zffs
 COPY entrypoint.sh /entrypoint.sh
 
-RUN chmod +x /usr/bin/rustfs /entrypoint.sh
+RUN chmod +x /usr/bin/zffs /entrypoint.sh
 
 RUN addgroup -g 10001 -S rustfs && \
     adduser -u 10001 -G rustfs -S rustfs -D && \
@@ -119,4 +117,4 @@ USER rustfs
 
 ENTRYPOINT ["/entrypoint.sh"]
 
-CMD ["rustfs"]
+CMD ["zffs"]

@@ -15,6 +15,7 @@
 use crate::{
     capacity::capacity_integration::init_capacity_management,
     config::Config,
+    product,
     server::{ServiceState, ServiceStateManager, ShutdownHandle, start_http_server},
     startup_runtime_sources,
     storage_api::server::http::ServerContextSlot,
@@ -116,8 +117,10 @@ pub(crate) async fn init_startup_listen_context(
         server_address = %server_address,
         ip = %server_addr.ip(),
         port = %server_port,
-        version = %crate::version::get_version(),
-        "Starting RustFS server"
+        product = product::NAME,
+        version = product::VERSION,
+        upstream_version = product::UPSTREAM_VERSION,
+        "Server starting"
     );
 
     init_startup_action_credentials(config)?;

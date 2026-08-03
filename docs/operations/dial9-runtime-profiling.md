@@ -55,7 +55,7 @@ constructed, so enabling or disabling it requires a process restart.
 make build-profiling
 ```
 
-That is `cargo build --release --bin rustfs --features dial9` with
+That is `cargo build --release --bin zffs --features dial9` with
 `RUSTFLAGS="--cfg tokio_unstable"`. There are no other telemetry features: task
 dumps and S3 upload are both unavailable, for the reasons given above and below.
 

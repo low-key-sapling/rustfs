@@ -109,14 +109,18 @@ jobs:
           cache-shared-key: warp-ab-${{ hashFiles('**/Cargo.lock') }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Build release rustfs
-        run: cargo build --release --bin rustfs
+      - name: Build release server
+        run: cargo build --release -p rustfs --bins
 
       - name: Stage binary for cache
         run: |
           set -euo pipefail
           mkdir -p baseline-bin
-          cp target/release/rustfs baseline-bin/rustfs
+          if [[ -x target/release/zffs ]]; then
+            cp target/release/zffs baseline-bin/rustfs
+          else
+            cp target/release/rustfs baseline-bin/rustfs
+          fi
 
       - name: Cache baseline binary by SHA
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
@@ -220,9 +224,13 @@ jobs:
           steps.commits.outputs.baseline_sha == steps.commits.outputs.candidate_sha
         run: |
           set -euo pipefail
-          cargo build --release --bin rustfs
+          cargo build --release -p rustfs --bins
           mkdir -p baseline-bin
-          cp target/release/rustfs baseline-bin/rustfs
+          if [[ -x target/release/zffs ]]; then
+            cp target/release/zffs baseline-bin/rustfs
+          else
+            cp target/release/rustfs baseline-bin/rustfs
+          fi
           echo "built=true" >> "$GITHUB_OUTPUT"
 
       - name: Build baseline on cache miss (different candidate)
@@ -235,9 +243,13 @@ jobs:
           baseline_root="$RUNNER_TEMP/rustfs-baseline-${{ github.run_id }}"
           baseline_target="$RUNNER_TEMP/rustfs-baseline-target-${{ github.run_id }}"
           git worktree add --detach "$baseline_root" "${{ steps.commits.outputs.baseline_sha }}"
-          cargo build --release --manifest-path "$baseline_root/Cargo.toml" --bin rustfs --target-dir "$baseline_target"
+          cargo build --release --manifest-path "$baseline_root/Cargo.toml" -p rustfs --bins --target-dir "$baseline_target"
           mkdir -p baseline-bin
-          cp "$baseline_target/release/rustfs" baseline-bin/rustfs
+          if [[ -x "$baseline_target/release/zffs" ]]; then
+            cp "$baseline_target/release/zffs" baseline-bin/rustfs
+          else
+            cp "$baseline_target/release/rustfs" baseline-bin/rustfs
+          fi
           git worktree remove --force "$baseline_root"
           echo "built=true" >> "$GITHUB_OUTPUT"
 
@@ -246,9 +258,13 @@ jobs:
         if: steps.commits.outputs.baseline_sha != steps.commits.outputs.candidate_sha
         run: |
           set -euo pipefail
-          cargo build --release --bin rustfs
+          cargo build --release -p rustfs --bins
           mkdir -p candidate-bin
-          cp target/release/rustfs candidate-bin/rustfs
+          if [[ -x target/release/zffs ]]; then
+            cp target/release/zffs candidate-bin/rustfs
+          else
+            cp target/release/rustfs candidate-bin/rustfs
+          fi
           echo "built=true" >> "$GITHUB_OUTPUT"
 
       - name: Save self-healed baseline to cache

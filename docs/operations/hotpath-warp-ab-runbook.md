@@ -70,7 +70,7 @@ Builds both binaries and runs a throwaway single-node server on local disks.
 scripts/run_hotpath_warp_ab.sh --baseline-ref origin/main
 # or with prebuilt binaries:
 scripts/run_hotpath_warp_ab.sh --skip-build \
-  --baseline-bin ./rustfs-main --candidate-bin ./target/release/rustfs
+  --baseline-bin ./rustfs-main --candidate-bin ./target/release/zffs
 ```
 
 Preview the full plan without running anything:

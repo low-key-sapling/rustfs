@@ -15,6 +15,7 @@
 use crate::admin::runtime_sources::{current_federated_identity_service, default_admin_usecase};
 use crate::admin::storage_api::access::RequestContext;
 use crate::license::has_valid_license;
+use crate::product;
 use crate::server::has_path_prefix;
 use crate::server::rate_limit::{
     LABEL_RATE_LIMIT_DIMENSION, LABEL_RATE_LIMIT_SCOPE, METRIC_HTTP_SERVER_REQUESTS_RATE_LIMITED_TOTAL,
@@ -111,7 +112,7 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
     } else {
         Response::builder()
             .status(StatusCode::NOT_FOUND)
-            .body(Body::from(" 404 Not Found \n RustFS "))
+            .body(Body::from(" 404 Not Found \n ZfFS "))
             .unwrap()
     }
 }
@@ -267,21 +268,8 @@ struct License {
 /// Global console configuration
 static CONSOLE_CONFIG: OnceLock<Config> = OnceLock::new();
 
-#[allow(clippy::const_is_empty)]
 pub(crate) fn init_console_cfg(local_ip: IpAddr, port: u16) {
-    CONSOLE_CONFIG.get_or_init(|| {
-        let ver = {
-            if !build::TAG.is_empty() {
-                build::TAG.to_string()
-            } else if !build::SHORT_COMMIT.is_empty() {
-                format!("@{}", build::SHORT_COMMIT)
-            } else {
-                build::PKG_VERSION.to_string()
-            }
-        };
-
-        Config::new(local_ip, port, ver.as_str(), build::COMMIT_DATE_3339)
-    });
+    CONSOLE_CONFIG.get_or_init(|| Config::new(local_ip, port, product::VERSION, build::COMMIT_DATE_3339));
 }
 
 #[derive(Serialize)]
@@ -880,6 +868,7 @@ mod tests {
         let bytes = body.collect().await.expect("collect console config body").to_bytes();
         let value: serde_json::Value = serde_json::from_slice(&bytes).expect("console config JSON should deserialize");
 
+        assert_eq!(value["release"]["version"], product::VERSION);
         assert_eq!(value["api"]["discovery"]["runtimeCapabilities"], "/rustfs/admin/v4/runtime/capabilities");
         assert_eq!(value["api"]["discovery"]["clusterSnapshot"], "/rustfs/admin/v4/cluster/snapshot");
         assert_eq!(value["api"]["discovery"]["extensionsCatalog"], "/rustfs/admin/v4/extensions/catalog");

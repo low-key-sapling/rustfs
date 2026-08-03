@@ -1,13 +1,13 @@
 ## —— Local Native Build using build-rustfs.sh script (Recommended) --------------------------------
 
 .PHONY: build
-build: ## Build RustFS binary (includes console by default)
-	@echo "🔨 Building RustFS using build-rustfs.sh script..."
+build: ## Build ZfFS binary (includes console by default)
+	@echo "🔨 Building ZfFS using build-rustfs.sh script..."
 	./build-rustfs.sh
 
 .PHONY: build-dev
-build-dev: ## Build RustFS in Development mode
-	@echo "🔨 Building RustFS in development mode..."
+build-dev: ## Build ZfFS in Development mode
+	@echo "🔨 Building ZfFS in development mode..."
 	./build-rustfs.sh --dev
 
 .PHONY: build-musl
@@ -49,10 +49,10 @@ DIAL9_FEATURES ?= dial9
 DIAL9_RUSTFLAGS ?= --cfg tokio_unstable
 
 .PHONY: build-profiling
-build-profiling: ## Build RustFS with dial9 Tokio runtime telemetry (diagnostic builds only)
-	@echo "🔬 Building RustFS with dial9 telemetry (features: $(DIAL9_FEATURES))..."
+build-profiling: ## Build ZfFS with dial9 Tokio runtime telemetry (diagnostic builds only)
+	@echo "🔬 Building ZfFS with dial9 telemetry (features: $(DIAL9_FEATURES))..."
 	@echo "⚠️  Diagnostic build: telemetry writes trace segments to disk continuously."
-	RUSTFLAGS="$(DIAL9_RUSTFLAGS)" cargo build --release --bin rustfs --features $(DIAL9_FEATURES)
+	RUSTFLAGS="$(DIAL9_RUSTFLAGS)" cargo build --release --bin zffs --features $(DIAL9_FEATURES)
 
 .PHONY: build-cross-all
 build-cross-all: core-deps ## Build binaries for all architectures

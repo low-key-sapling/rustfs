@@ -1,4 +1,4 @@
-# RustFS Service Installation Guide
+# ZfFS Service Installation Guide
 
 ## 1. Prerequisites
 
@@ -29,12 +29,12 @@ sudo chown -R rustfs:rustfs /opt/rustfs /data/rustfs /var/log/rustfs
 sudo chmod 755 /opt/rustfs /data/rustfs /var/log/rustfs
 ```
 
-## 2. Install RustFS
+## 2. Install ZfFS
 
 ```bash
-# Copy RustFS binary
-sudo cp rustfs /usr/local/bin/
-sudo chmod +x /usr/local/bin/rustfs
+# Copy ZfFS binary
+sudo cp zffs /usr/local/bin/
+sudo chmod +x /usr/local/bin/zffs
 
 # Copy configuration file
 sudo cp obs.yaml /etc/rustfs/

@@ -18,11 +18,11 @@ in
     group = "rustfs";
     home = stateDir;
     createHome = false;
-    description = "RustFS service user";
+    description = "ZfFS service user";
   };
 
   systemd.services.rustfs = {
-    description = "RustFS Object Storage Server";
+    description = "ZfFS Object Storage Server";
     wantedBy = [ "multi-user.target" ];
     after = [ "network-online.target" ];
     wants = [ "network-online.target" ];
@@ -51,7 +51,7 @@ in
 
       # Explicitly use the server entrypoint instead of relying on legacy
       # CLI compatibility shims in service management.
-      ExecStart = "${rustfsPkg}/bin/rustfs server";
+      ExecStart = "${rustfsPkg}/bin/zffs server";
 
       LimitNOFILE = 1048576;
       LimitNPROC = 32768;

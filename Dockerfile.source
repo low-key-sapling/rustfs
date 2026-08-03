@@ -13,9 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Multi-stage Dockerfile for RustFS - LOCAL DEVELOPMENT ONLY
+# Multi-stage Dockerfile for ZfFS - LOCAL DEVELOPMENT ONLY
 #
-# IMPORTANT: This Dockerfile builds RustFS from source for local development and testing.
+# IMPORTANT: This Dockerfile builds ZfFS from source for local development and testing.
 # CI/CD uses the production Dockerfile with prebuilt binaries instead.
 #
 # Example:
@@ -128,7 +128,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/src/rustfs/target/docker-build \
     cargo run --bin gproto
 
-# Build RustFS (target depends on TARGETPLATFORM)
+# Build ZfFS (target depends on TARGETPLATFORM)
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/usr/src/rustfs/target/docker-build \
@@ -146,20 +146,20 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     linux/amd64) \
     echo "Building for x86_64-unknown-linux-gnu"; \
     if [ -n "${RUSTFS_BUILD_FEATURES}" ]; then \
-    cargo build --release --locked --target x86_64-unknown-linux-gnu --bin rustfs --features "${RUSTFS_BUILD_FEATURES}" -j "$(nproc)"; \
+    cargo build --release --locked --target x86_64-unknown-linux-gnu --bin zffs --features "${RUSTFS_BUILD_FEATURES}" -j "$(nproc)"; \
     else \
-    cargo build --release --locked --target x86_64-unknown-linux-gnu --bin rustfs -j "$(nproc)"; \
+    cargo build --release --locked --target x86_64-unknown-linux-gnu --bin zffs -j "$(nproc)"; \
     fi; \
-    install -m 0755 "${CARGO_TARGET_DIR}/x86_64-unknown-linux-gnu/release/rustfs" /usr/local/bin/rustfs \
+    install -m 0755 "${CARGO_TARGET_DIR}/x86_64-unknown-linux-gnu/release/zffs" /usr/local/bin/zffs \
     ;; \
     linux/arm64) \
     echo "Building for aarch64-unknown-linux-gnu"; \
     if [ -n "${RUSTFS_BUILD_FEATURES}" ]; then \
-    cargo build --release --locked --target aarch64-unknown-linux-gnu --bin rustfs --features "${RUSTFS_BUILD_FEATURES}" -j "$(nproc)"; \
+    cargo build --release --locked --target aarch64-unknown-linux-gnu --bin zffs --features "${RUSTFS_BUILD_FEATURES}" -j "$(nproc)"; \
     else \
-    cargo build --release --locked --target aarch64-unknown-linux-gnu --bin rustfs -j "$(nproc)"; \
+    cargo build --release --locked --target aarch64-unknown-linux-gnu --bin zffs -j "$(nproc)"; \
     fi; \
-    install -m 0755 "${CARGO_TARGET_DIR}/aarch64-unknown-linux-gnu/release/rustfs" /usr/local/bin/rustfs \
+    install -m 0755 "${CARGO_TARGET_DIR}/aarch64-unknown-linux-gnu/release/zffs" /usr/local/bin/zffs \
     ;; \
     *) \
     echo "Unsupported target platform=${target_platform}" >&2; exit 1 \
@@ -174,11 +174,11 @@ FROM builder AS dev
 ARG BUILD_DATE
 ARG VCS_REF
 
-LABEL name="RustFS (dev-source)" \
+LABEL name="ZfFS (dev-source)" \
     maintainer="RustFS Team" \
     build-date="${BUILD_DATE}" \
     vcs-ref="${VCS_REF}" \
-    description="RustFS - local development with Rust toolchain."
+    description="ZfFS - local development with Rust toolchain."
 
 # Install runtime dependencies that might be missing in partial builder
 # (builder already has build-essential, lld, etc.)
@@ -203,7 +203,7 @@ COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["cargo", "run", "--bin", "rustfs", "--"]
+CMD ["cargo", "run", "--bin", "zffs", "--"]
 
 # -----------------------------
 # Runtime stage (Ubuntu minimal)
@@ -213,11 +213,11 @@ FROM ubuntu:26.04
 ARG BUILD_DATE
 ARG VCS_REF
 
-LABEL name="RustFS (dev-local)" \
+LABEL name="ZfFS (dev-local)" \
     maintainer="RustFS Team" \
     build-date="${BUILD_DATE}" \
     vcs-ref="${VCS_REF}" \
-    description="RustFS - local development image built from source (NOT for production)."
+    description="ZfFS - local development image built from source (NOT for production)."
 
 # Minimal runtime deps: certificates + tzdata + coreutils (for chroot --userspec)
 RUN set -eux; \
@@ -245,9 +245,9 @@ RUN set -eux; \
     chmod 0750 /data /logs
 
 # Copy the freshly built binary and the entrypoint
-COPY --from=builder /usr/local/bin/rustfs /usr/bin/rustfs
+COPY --from=builder /usr/local/bin/zffs /usr/bin/zffs
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /usr/bin/rustfs /entrypoint.sh
+RUN chmod +x /usr/bin/zffs /entrypoint.sh
 
 # Default environment (override in docker run/compose as needed)
 ENV RUSTFS_VOLUMES="/data" \
@@ -262,4 +262,4 @@ VOLUME ["/data"]
 
 # Keep root here; entrypoint will drop privileges using chroot --userspec
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["/usr/bin/rustfs"]
+CMD ["/usr/bin/zffs"]

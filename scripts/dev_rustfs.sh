@@ -16,8 +16,8 @@
 
 # ps -ef | grep rustfs | awk '{print $2}'| xargs kill -9
 
-# Local rustfs.zip path
-ZIP_FILE="./rustfs.zip"
+# Local ZfFS package path
+ZIP_FILE="./zffs.zip"
 # Unzip target
 UNZIP_TARGET="./"
 
@@ -35,7 +35,7 @@ SERVER_LIST=(
 
 REMOTE_TMP="~/rustfs"
 
-# Deploy rustfs to all servers
+# Deploy ZfFS to all servers
 deploy() {
     echo "Unzipping $ZIP_FILE ..."
     unzip -o "$ZIP_FILE" -d "$UNZIP_TARGET"
@@ -44,9 +44,9 @@ deploy() {
         exit 1
     fi
 
-    LOCAL_RUSTFS="${UNZIP_TARGET}rustfs"
+    LOCAL_RUSTFS="${UNZIP_TARGET}zffs"
     if [ ! -f "$LOCAL_RUSTFS" ]; then
-        echo "Unzipped rustfs file not found, exiting"
+        echo "Unzipped zffs file not found, exiting"
         exit 1
     fi
 
@@ -63,9 +63,9 @@ deploy() {
 set -e
 echo "Stopping rustfs service"
 sudo systemctl stop rustfs || true
-echo "Overwriting /usr/local/bin/rustfs"
-sudo cp ~/rustfs /usr/local/bin/rustfs
-sudo chmod +x /usr/local/bin/rustfs
+echo "Overwriting /usr/local/bin/zffs"
+sudo cp ~/rustfs /usr/local/bin/zffs
+sudo chmod +x /usr/local/bin/zffs
 echo "Starting rustfs service"
 sudo systemctl start rustfs
 echo "Checking rustfs service status"

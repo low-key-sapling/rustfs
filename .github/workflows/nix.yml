@@ -124,10 +124,10 @@ jobs:
       - name: Test Binary
         run: |
           echo "Verifying the built binary..."
-          if [ -x "./result/bin/rustfs" ]; then
-              ./result/bin/rustfs --help
+          if [ -x "./result/bin/zffs" ]; then
+              ./result/bin/zffs --help
               echo "Binary verification successful."
           else
-              echo "Error: Binary not found or not executable at ./result/bin/rustfs"
+              echo "Error: Binary not found or not executable at ./result/bin/zffs"
               exit 1
           fi

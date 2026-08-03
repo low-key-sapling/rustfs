@@ -17,6 +17,7 @@ use super::{
     HEALTH_READY_PATH, MINIO_HEALTH_CLUSTER_PATH, MINIO_HEALTH_CLUSTER_READ_PATH, MINIO_HEALTH_READY_PATH,
     collect_cluster_read_health_report, collect_cluster_write_health_report, collect_node_readiness_report,
 };
+use crate::product;
 use http::{Method, StatusCode};
 use rustfs_kms::ProbeStatus;
 use rustfs_kms::probe::{DEFAULT_PROBE_INTERVAL, ENV_KMS_PROBE_INTERVAL_SECS, MIN_PROBE_INTERVAL};
@@ -346,7 +347,7 @@ pub(crate) fn build_health_payload(ctx: HealthPayloadContext<'_>) -> Value {
         "ready": ctx.health.ready,
         "service": ctx.service,
         "timestamp": jiff::Zoned::now().to_string(),
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": product::VERSION,
     });
 
     if ctx.include_dependency_details {
@@ -529,6 +530,7 @@ mod tests {
 
             assert_eq!(parts.status_code, StatusCode::OK);
             let payload = parts.payload.expect("GET should include payload");
+            assert_eq!(payload["version"], product::VERSION);
             assert!(payload["details"].get("kms").is_none());
             assert_eq!(payload["degradedReasons"], json!([]));
         });

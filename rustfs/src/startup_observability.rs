@@ -14,14 +14,13 @@
 
 use std::sync::Arc;
 
-use crate::init::{init_auto_tuner, init_update_check, print_server_info};
+use crate::init::{init_auto_tuner, print_server_info};
 use crate::startup_runtime_sources;
 use crate::storage_api::startup::storage::{ECStore, init_compression_total_memory_from_backend};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) async fn init_observability_runtime(store: Arc<ECStore>, ctx: CancellationToken) {
     print_server_info();
-    init_update_check();
     crate::allocator_reclaim::init_allocator_reclaim(ctx.clone());
 
     if startup_runtime_sources::observability_metric_enabled() {

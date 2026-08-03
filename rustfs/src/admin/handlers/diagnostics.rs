@@ -27,6 +27,7 @@ use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::storage_api::access::spawn_traced;
 use crate::auth::{check_key_valid, get_session_token};
+use crate::product;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -506,7 +507,7 @@ async fn collect_health_info() -> HealthInfoResponse {
     let drives = collect_drive_info().await;
 
     HealthInfoResponse {
-        version: crate::version::get_version(),
+        version: product::VERSION.to_string(),
         deployment_id: crate::admin::runtime_sources::current_deployment_id(),
         region: crate::admin::runtime_sources::current_region().map(|r| r.as_str().to_string()),
         timestamp: system_time_to_rfc3339(SystemTime::now()),
