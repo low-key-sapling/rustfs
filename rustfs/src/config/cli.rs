@@ -219,6 +219,10 @@ pub struct TlsInspectOpts {
 /// Server subcommand options
 #[derive(Args, Clone)]
 pub struct ServerOpts {
+    /// Load server settings from a versioned TOML configuration file.
+    #[arg(long, value_name = "FILE")]
+    pub config: Option<PathBuf>,
+
     /// DIR points to a directory on a filesystem.
     #[arg(
         required = true,
@@ -367,6 +371,7 @@ pub enum CommandResult {
 /// Create default ServerOpts from environment variables
 pub fn default_server_opts() -> ServerOpts {
     ServerOpts {
+        config: None,
         volumes: std::env::var(ENV_RUSTFS_VOLUMES)
             .unwrap_or_default()
             .split(' ')

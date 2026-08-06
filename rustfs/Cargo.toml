@@ -274,6 +274,7 @@ rustfs-signer.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["raw_value"] }
 serde_urlencoded = { workspace = true }
+toml_edit.workspace = true
 
 # Cryptography and Security
 rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
@@ -293,7 +294,7 @@ hmac = { workspace = true }
 sha2 = { workspace = true }
 rsa = { workspace = true, features = ["sha2"] }
 base64-simd.workspace = true
-clap = { workspace = true, features = ["derive", "env"] }
+clap = { workspace = true, features = ["derive", "env", "string"] }
 const-str = { workspace = true, features = ["std", "proc"] }
 datafusion = { workspace = true, default-features = false, features = ["parquet", "recursive_protection", "sql"] }
 hex-simd.workspace = true

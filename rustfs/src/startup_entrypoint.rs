@@ -15,7 +15,7 @@
 use crate::{
     config::{CommandResult, Config, Opt},
     startup_lifecycle::{StartupRuntimeLifecycle, run_startup_runtime_lifecycle},
-    startup_preflight::{StartupServerPreflightError, bootstrap_external_prefix_compat, init_startup_server_preflight},
+    startup_preflight::{StartupServerPreflightError, init_startup_server_preflight},
     startup_server::{StartupHttpServers, StartupListenContext, init_startup_http_servers, init_startup_listen_context},
     startup_services::init_startup_runtime_services,
     startup_storage::{StartupStorageRuntime, init_startup_storage_foundation, init_startup_storage_runtime},
@@ -30,10 +30,33 @@ const LOG_SUBSYSTEM_STARTUP: &str = "startup";
 const EVENT_SERVER_RUNTIME_FAILED: &str = "server_runtime_failed";
 const OBSERVABILITY_INIT_FATAL_ALREADY_REPORTED: &str = "observability initialization failure already reported";
 
+// SAFETY: run_process applies environment aliases before constructing any
+// component that can create a background thread.
+#[allow(unsafe_code)]
 pub fn run_process() {
+    // Environment compatibility and file overlays must finish before any
+    // guard or runtime can spawn threads.
+    let args: Vec<String> = std::env::args().collect();
+    // SAFETY: this is the first operation in the process entrypoint, before
+    // HotpathGuard or the Tokio runtime can create background threads.
+    let env_compat_report = unsafe { crate::apply_external_env_compat() };
+    let (command_result, env_compat_report) = match Opt::prepare_command_with_report(args, env_compat_report) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            if error.kind() == clap::error::ErrorKind::DisplayHelp || error.kind() == clap::error::ErrorKind::DisplayVersion {
+                let _ = error.print();
+                return;
+            }
+            emit_fatal_stderr("Configuration bootstrap failed", error);
+            std::process::exit(1);
+        }
+    };
+
+    let _hotpath_guard = hotpath::HotpathGuardBuilder::new("main").build();
+
     // Building the process runtime is a startup fatal boundary.
     let (runtime, dial9_guard) = crate::server::build_tokio_runtime().expect("Failed to build Tokio runtime");
-    let result = runtime.block_on(async_main());
+    let result = runtime.block_on(async_main(command_result, env_compat_report));
 
     // Flush and seal the trace segment before any exit path. `process::exit`
     // below does not run destructors, and neither does returning from `main`
@@ -61,21 +84,8 @@ fn emit_fatal_stderr(context: &str, error: impl std::fmt::Display) {
     eprintln!("{}", format_fatal_stderr_message(context, error));
 }
 
-async fn async_main() -> Result<()> {
+async fn async_main(command_result: CommandResult, env_compat_report: rustfs_utils::ExternalEnvCompatReport) -> Result<()> {
     hotpath::tokio_runtime!();
-
-    let env_compat_report = bootstrap_external_prefix_compat()?;
-
-    // Parse command line arguments
-    let args: Vec<String> = std::env::args().collect();
-    let command_result = match Opt::parse_command(args) {
-        Ok(result) => result,
-        Err(e) => {
-            emit_fatal_stderr("Command parse failed", e);
-            let _ = crate::startup_runtime_sources::shutdown_observability_guard();
-            std::process::exit(1);
-        }
-    };
 
     // Execute subcommand, or prepare config for `server` subcommand
     let config = match command_result {

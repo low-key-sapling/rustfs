@@ -41,6 +41,7 @@
 //! ```
 
 mod cli;
+mod config_file;
 mod config_struct;
 mod info;
 mod opt;

@@ -54,8 +54,6 @@ static GLOBAL: hotpath::CountingAllocator<MiMallocAllocator> = hotpath::Counting
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() {
-    let _hotpath_guard = hotpath::HotpathGuardBuilder::new("main").build();
-
     rustfs::startup_entrypoint::run_process();
 }
 

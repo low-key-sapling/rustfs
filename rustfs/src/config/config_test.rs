@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_external_prefixed_envs_are_accepted_by_parser() {
+    fn test_external_prefixed_envs_are_accepted_without_process_mutation() {
         temp_env::with_vars(
             [
                 ("MINIO_VOLUMES", Some("/compat/vol1")),
@@ -211,8 +211,8 @@ mod tests {
                 let opt = Opt::parse_from(["rustfs"]);
                 assert_eq!(opt.volumes, vec!["/compat/vol1"]);
                 assert_eq!(opt.address, ":9100");
-                assert_eq!(std::env::var("RUSTFS_VOLUMES").as_deref(), Ok("/compat/vol1"));
-                assert_eq!(std::env::var("RUSTFS_ADDRESS").as_deref(), Ok(":9100"));
+                assert!(std::env::var("RUSTFS_VOLUMES").is_err());
+                assert!(std::env::var("RUSTFS_ADDRESS").is_err());
             },
         );
     }

@@ -215,6 +215,56 @@ fn cli_parses_diagnose_and_keeps_legacy_server_routing() {
     assert!(matches!(legacy, Ok(CommandResult::Server(_))));
 }
 
+#[test]
+fn binary_help_and_version_exit_successfully() {
+    for (argument, expected) in [("--help", "Usage: zffs"), ("--version", "RustFS base")] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_zffs"))
+            .env_clear()
+            .arg(argument)
+            .output()
+            .expect("run ZfFS CLI display command");
+        let stdout = String::from_utf8(output.stdout).expect("CLI display output must be UTF-8");
+        let stderr = String::from_utf8(output.stderr).expect("CLI display error output must be UTF-8");
+
+        assert!(output.status.success(), "{argument} failed: {stderr}");
+        assert!(stdout.contains(expected), "{argument} output did not contain {expected:?}: {stdout}");
+        assert!(!stderr.contains("[FATAL]"), "{argument} was reported as fatal: {stderr}");
+    }
+}
+
+#[test]
+fn binary_rejects_invalid_toml_during_process_bootstrap() {
+    let config = tempfile::NamedTempFile::new().expect("create invalid ZfFS configuration file");
+    std::fs::write(config.path(), "version = 2\n").expect("write invalid ZfFS configuration file");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_zffs"))
+        .env_clear()
+        .args(["server", "--config"])
+        .arg(config.path())
+        .output()
+        .expect("run ZfFS with invalid configuration file");
+    let stderr = String::from_utf8(output.stderr).expect("configuration bootstrap error must be UTF-8");
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("Configuration bootstrap failed"), "unexpected bootstrap error: {stderr}");
+    assert!(stderr.contains("unsupported schema version 2"), "unexpected bootstrap error: {stderr}");
+}
+
+#[test]
+fn binary_applies_product_environment_before_command_execution() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_zffs"))
+        .env_clear()
+        .env("ZFFS_REGION", "eu-central-1")
+        .args(["info", "config", "--json"])
+        .output()
+        .expect("run ZfFS info command with product environment");
+    let stderr = String::from_utf8(output.stderr).expect("ZfFS info error output must be UTF-8");
+
+    assert!(output.status.success(), "ZfFS info command failed: {stderr}");
+    let config: serde_json::Value = serde_json::from_slice(&output.stdout).expect("parse ZfFS config info JSON");
+    assert_eq!(config["region"], "eu-central-1");
+}
+
 /// True-binary smoke test. Ignored by default: building the full rustfs
 /// binary is expensive; run locally with
 /// `cargo test -p rustfs --test diagnose_e2e -- --ignored`.

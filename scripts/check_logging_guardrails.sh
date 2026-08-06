@@ -104,6 +104,7 @@ checked_files=(
   "crates/obs/src/telemetry/dial9/config.rs"
   "crates/obs/src/telemetry/dial9/enabled.rs"
   "crates/obs/src/telemetry/local.rs"
+  "crates/obs/src/telemetry/otel.rs"
   "crates/obs/src/metrics/scheduler.rs"
   "crates/obs/src/cleaner/core.rs"
   "crates/obs/src/cleaner/compress.rs"
@@ -132,6 +133,12 @@ forbidden_patterns=(
   'secret_key={}'
   'Authorization={}'
   'token={}'
+  '%trace_ep'
+  '%metric_ep'
+  '%log_ep'
+  '?trace_ep'
+  '?metric_ep'
+  '?log_ep'
   'debug!("http_client headers: {:?}"'
   'warn!("err_body: {}"'
   'debug!("config: {:?}"'

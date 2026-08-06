@@ -13,11 +13,8 @@
 // limitations under the License.
 
 use crate::{config::Config, license::init_license, startup_runtime::init_startup_runtime_foundation, startup_runtime_sources};
-use rustfs_utils::{ExternalEnvCompatReport, apply_external_env_compat};
-use std::{
-    fmt,
-    io::{Error, Result},
-};
+use rustfs_utils::ExternalEnvCompatReport;
+use std::{fmt, io::Error};
 use tracing::{debug, error, info, warn};
 
 const LOG_COMPONENT_MAIN: &str = "main";
@@ -51,11 +48,6 @@ impl std::error::Error for StartupServerPreflightError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(self.as_io_error())
     }
-}
-
-pub(crate) fn bootstrap_external_prefix_compat() -> Result<ExternalEnvCompatReport> {
-    let env_compat_report = apply_external_env_compat();
-    Ok(env_compat_report)
 }
 
 pub(crate) async fn init_startup_server_preflight(
@@ -152,6 +144,8 @@ mod tests {
                 ),
             ],
             conflict_keys: Vec::new(),
+            product_conflict_keys: Vec::new(),
+            unsupported_product_keys: Vec::new(),
         };
 
         let formatted = format_external_prefix_mappings(&report);

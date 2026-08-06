@@ -184,6 +184,7 @@ rmp-serde = { version = "1.3.1" }
 serde = { version = "1.0.229" }
 serde_json = { version = "1.0.151" }
 serde_urlencoded = "0.7.1"
+toml_edit = { version = "0.25.13", features = ["parse", "serde"] }
 
 # Cryptography and Security
 # NOTE: These direct cryptography dependencies use RC versions because the

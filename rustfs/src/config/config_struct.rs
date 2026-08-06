@@ -18,7 +18,6 @@
 //! after processing command line arguments, environment variables, and files.
 
 use super::Opt;
-use crate::apply_external_env_compat;
 use rustfs_config::{
     DEFAULT_CONSOLE_ADDRESS, DEFAULT_CONSOLE_ENABLE, ENV_RUSTFS_ACCESS_KEY, ENV_RUSTFS_SECRET_KEY, RUSTFS_REGION,
 };
@@ -267,7 +266,6 @@ impl Config {
     /// This includes some intermediate checks for mutually exclusive options.
     #[allow(dead_code)] // used in config_test
     pub fn parse() -> std::io::Result<Self> {
-        let _ = apply_external_env_compat();
         let args: Vec<String> = std::env::args().collect();
         let opt = Opt::parse_from(args);
         Self::from_opt(opt)

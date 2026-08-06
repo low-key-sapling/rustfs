@@ -285,11 +285,14 @@ pub(super) fn init_observability_http(
         .map_err(|err| TelemetryError::SubscriberInit(err.to_string()))?;
 
     counter!("rustfs_start_total").increment(1);
+    let trace_endpoint = endpoint_origin_for_log(&trace_ep);
+    let metric_endpoint = endpoint_origin_for_log(&metric_ep);
+    let log_endpoint = endpoint_origin_for_log(&log_ep);
     info!(
         backend = "otlp_http",
-        trace_endpoint = %trace_ep,
-        metric_endpoint = %metric_ep,
-        log_endpoint = %log_ep,
+        trace_endpoint,
+        metric_endpoint,
+        log_endpoint,
         local_file_fallback_enabled,
         stdout_mirror_enabled,
         output_format = "json",
@@ -398,6 +401,17 @@ fn resolve_signal_endpoint(signal_endpoint: Option<&str>, root_ep: &str, suffix:
                 format!("{root_ep}{suffix}")
             }
         })
+}
+
+fn endpoint_origin_for_log(endpoint: &str) -> String {
+    if endpoint.is_empty() {
+        return String::new();
+    }
+    url::Url::parse(endpoint)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_else(|| "[redacted]".to_string())
 }
 
 /// Build an optional [`SdkMeterProvider`] for the given metrics endpoint.
@@ -772,6 +786,20 @@ mod tests {
             "http://custom:4318/v1/custom"
         );
         assert_eq!(resolve_signal_endpoint(None, "", "/v1/traces"), "");
+    }
+
+    #[test]
+    fn test_endpoint_origin_for_log_strips_credentials_path_query_and_fragment() {
+        let endpoint = "https://collector-user:collector-token@collector.example:4318/private?access_token=query-secret#fragment";
+
+        let rendered = endpoint_origin_for_log(endpoint);
+
+        assert_eq!(rendered, "https://collector.example:4318");
+        for secret in ["collector-user", "collector-token", "private", "query-secret", "fragment"] {
+            assert!(!rendered.contains(secret), "redacted endpoint leaked {secret}: {rendered}");
+        }
+        assert_eq!(endpoint_origin_for_log("not a URL with secret"), "[redacted]");
+        assert_eq!(endpoint_origin_for_log(""), "");
     }
 
     #[test]

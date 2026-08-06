@@ -120,6 +120,7 @@ fn resolve_env_with_aliases(key: &str, deprecated: &[&str]) -> Option<(String, S
 }
 
 const EXTERNAL_ENV_PREFIX_BYTES: [u8; 6] = [77, 73, 78, 73, 79, 95];
+const PRODUCT_ENV_PREFIX: &str = "ZFFS_";
 
 const EXTERNAL_COMPATIBLE_SUFFIXES: &[&str] = &[
     "ACCESS_KEY",
@@ -186,10 +187,68 @@ const EXTERNAL_COMPATIBLE_SUFFIXES: &[&str] = &[
 
 const EXTERNAL_DYNAMIC_COMPATIBLE_PREFIXES: &[&str] = &["AUDIT_MQTT_", "AUDIT_WEBHOOK_", "NOTIFY_MQTT_", "NOTIFY_WEBHOOK_"];
 
+const PRODUCT_WEBHOOK_COMPATIBLE_FIELDS: &[&str] = &[
+    "AUTH_TOKEN",
+    "CLIENT_CA",
+    "CLIENT_CERT",
+    "CLIENT_KEY",
+    "ENABLE",
+    "ENDPOINT",
+    "QUEUE_DIR",
+    "QUEUE_LIMIT",
+    "SKIP_TLS_VERIFY",
+];
+
+const PRODUCT_MQTT_COMPATIBLE_FIELDS: &[&str] = &[
+    "BROKER",
+    "ENABLE",
+    "KEEP_ALIVE_INTERVAL",
+    "PASSWORD",
+    "QOS",
+    "QUEUE_DIR",
+    "QUEUE_LIMIT",
+    "RECONNECT_INTERVAL",
+    "TLS_CA",
+    "TLS_CLIENT_CERT",
+    "TLS_CLIENT_KEY",
+    "TLS_POLICY",
+    "TLS_TRUST_LEAF_AS_CA",
+    "TOPIC",
+    "USERNAME",
+    "WS_PATH_ALLOWLIST",
+];
+
+const PRODUCT_DYNAMIC_COMPATIBLE_FIELDS: &[(&str, &[&str])] = &[
+    ("AUDIT_MQTT_", PRODUCT_MQTT_COMPATIBLE_FIELDS),
+    ("AUDIT_WEBHOOK_", PRODUCT_WEBHOOK_COMPATIBLE_FIELDS),
+    ("NOTIFY_MQTT_", PRODUCT_MQTT_COMPATIBLE_FIELDS),
+    ("NOTIFY_WEBHOOK_", PRODUCT_WEBHOOK_COMPATIBLE_FIELDS),
+];
+
+const PRODUCT_ONLY_COMPATIBLE_SUFFIXES: &[&str] = &[
+    "BUFFER_PROFILE",
+    "BUFFER_PROFILE_DISABLE",
+    "CONSOLE_ENABLE",
+    "KMS_ALLOW_INSECURE_DEV_DEFAULTS",
+    "KMS_BACKEND",
+    "KMS_DEFAULT_KEY_ID",
+    "KMS_ENABLE",
+    "KMS_KEY_DIR",
+    "KMS_LOCAL_MASTER_KEY",
+    "KMS_VAULT_ADDRESS",
+    "KMS_VAULT_MOUNT_PATH",
+    "KMS_VAULT_TOKEN",
+    "OBS_ENDPOINT",
+    "SERVER_DOMAINS",
+    "TLS_PATH",
+];
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ExternalEnvCompatReport {
     pub mapped_pairs: Vec<(String, String)>,
     pub conflict_keys: Vec<String>,
+    pub product_conflict_keys: Vec<String>,
+    pub unsupported_product_keys: Vec<String>,
 }
 
 impl ExternalEnvCompatReport {
@@ -199,6 +258,14 @@ impl ExternalEnvCompatReport {
 
     pub fn conflict_count(&self) -> usize {
         self.conflict_keys.len()
+    }
+
+    pub fn product_conflict_count(&self) -> usize {
+        self.product_conflict_keys.len()
+    }
+
+    pub fn unsupported_product_count(&self) -> usize {
+        self.unsupported_product_keys.len()
     }
 }
 
@@ -216,6 +283,27 @@ fn is_external_compatible_suffix(suffix: &str) -> bool {
             .any(|prefix| suffix.starts_with(prefix))
 }
 
+fn is_product_compatible_suffix(suffix: &str) -> bool {
+    EXTERNAL_COMPATIBLE_SUFFIXES.contains(&suffix)
+        || PRODUCT_ONLY_COMPATIBLE_SUFFIXES.contains(&suffix)
+        || PRODUCT_DYNAMIC_COMPATIBLE_FIELDS.iter().any(|(prefix, fields)| {
+            let Some(candidate) = suffix.strip_prefix(prefix) else {
+                return false;
+            };
+            fields.iter().any(|field| {
+                candidate == *field
+                    || candidate.strip_prefix(field).is_some_and(|instance| {
+                        instance.strip_prefix('_').is_some_and(|instance| {
+                            !instance.is_empty()
+                                && instance
+                                    .chars()
+                                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
+                        })
+                    })
+            })
+        })
+}
+
 fn build_external_env_compat_report_from_entries<I>(entries: I) -> ExternalEnvCompatReport
 where
     I: IntoIterator<Item = (String, String)>,
@@ -223,6 +311,8 @@ where
     let env_map: std::collections::BTreeMap<String, String> = entries.into_iter().collect();
     let mut mapped_pairs = BTreeSet::new();
     let mut conflict_keys = BTreeSet::new();
+    let mut product_conflict_keys = BTreeSet::new();
+    let mut unsupported_product_keys = BTreeSet::new();
     let source_prefix = external_env_prefix();
 
     for (source_key, source_value) in env_map.iter() {
@@ -244,9 +334,37 @@ where
         }
     }
 
+    for (product_key, product_value) in env_map.iter() {
+        let Some(suffix) = product_key.strip_prefix(PRODUCT_ENV_PREFIX) else {
+            continue;
+        };
+        if !is_product_compatible_suffix(suffix) {
+            unsupported_product_keys.insert(product_key.clone());
+            continue;
+        }
+
+        let rustfs_key = format!("RUSTFS_{suffix}");
+        if env_map.get(&rustfs_key).is_some_and(|value| value != product_value) {
+            product_conflict_keys.insert(rustfs_key.clone());
+        }
+
+        if is_external_compatible_suffix(suffix) {
+            let external_key = format!("{source_prefix}{suffix}");
+            if env_map.get(&external_key).is_some_and(|value| value != product_value) {
+                product_conflict_keys.insert(rustfs_key.clone());
+            }
+        }
+
+        if !env_map.contains_key(&rustfs_key) {
+            mapped_pairs.insert((product_key.clone(), rustfs_key));
+        }
+    }
+
     ExternalEnvCompatReport {
         mapped_pairs: mapped_pairs.into_iter().collect(),
         conflict_keys: conflict_keys.into_iter().collect(),
+        product_conflict_keys: product_conflict_keys.into_iter().collect(),
+        unsupported_product_keys: unsupported_product_keys.into_iter().collect(),
     }
 }
 
@@ -713,13 +831,22 @@ pub fn get_env_opt_bool(key: &str) -> Option<bool> {
 /// Copy supported external-prefix variables such as `MINIO_*` into their
 /// canonical `RUSTFS_*` names in the current process when the canonical key is
 /// missing.
+///
+/// # Safety
+///
+/// The caller must ensure no other threads exist because this function mutates
+/// the process environment.
+// SAFETY: callers must invoke this compatibility bootstrap before background
+// threads are created because it mutates the process environment.
 #[allow(unsafe_code)]
-pub fn apply_external_env_compat() -> ExternalEnvCompatReport {
+pub unsafe fn apply_external_env_compat() -> ExternalEnvCompatReport {
     let report = build_external_env_compat_report();
+    if report.product_conflict_count() > 0 || report.unsupported_product_count() > 0 {
+        return report;
+    }
     for (source_key, rustfs_key) in &report.mapped_pairs {
         if let Ok(value) = env::var(source_key) {
-            // SAFETY: this helper is intended for early startup bootstrap
-            // before any background threads are created.
+            // SAFETY: upheld by the caller of this function.
             unsafe {
                 env::set_var(rustfs_key, value);
             }
@@ -731,14 +858,18 @@ pub fn apply_external_env_compat() -> ExternalEnvCompatReport {
 #[cfg(test)]
 mod tests {
     use super::{
-        EnvParseOutcome, apply_external_env_compat, build_external_env_compat_report_from_entries, get_env_bool_with_aliases,
-        get_env_f64, get_env_i32_with_aliases, get_env_opt_f64, get_env_opt_u64, get_env_parse_outcome, get_env_str, get_env_u64,
+        EnvParseOutcome, build_external_env_compat_report_from_entries, get_env_bool_with_aliases, get_env_f64,
+        get_env_i32_with_aliases, get_env_opt_f64, get_env_opt_u64, get_env_parse_outcome, get_env_str, get_env_u64,
     };
 
     fn source_key(suffix: &str) -> String {
         let mut key = super::external_env_prefix().to_string();
         key.push_str(suffix);
         key
+    }
+
+    fn product_key(suffix: &str) -> String {
+        format!("ZFFS_{suffix}")
     }
 
     #[test]
@@ -786,7 +917,80 @@ mod tests {
         ]);
         assert_eq!(report.mapped_count(), 0);
         assert_eq!(report.conflict_count(), 1);
+        assert_eq!(report.product_conflict_count(), 0);
         assert!(report.conflict_keys.iter().any(|key| key == "RUSTFS_ERASURE_SET_DRIVE_COUNT"));
+    }
+
+    #[test]
+    fn product_value_is_mapped_when_canonical_missing() {
+        let report = build_external_env_compat_report_from_entries(vec![(product_key("KMS_ENABLE"), "true".to_string())]);
+
+        assert_eq!(report.mapped_pairs, vec![(product_key("KMS_ENABLE"), "RUSTFS_KMS_ENABLE".to_string())]);
+        assert_eq!(report.product_conflict_count(), 0);
+        assert_eq!(report.unsupported_product_count(), 0);
+    }
+
+    #[test]
+    fn all_product_dynamic_fields_and_instances_are_allowlisted() {
+        for (prefix, fields) in super::PRODUCT_DYNAMIC_COMPATIBLE_FIELDS {
+            for field in *fields {
+                for suffix in [format!("{prefix}{field}"), format!("{prefix}{field}_PRIMARY_2")] {
+                    let product_key = product_key(&suffix);
+                    let report = build_external_env_compat_report_from_entries(vec![(product_key.clone(), "value".to_string())]);
+
+                    assert_eq!(report.mapped_pairs, vec![(product_key, format!("RUSTFS_{suffix}"))]);
+                    assert_eq!(report.unsupported_product_count(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_product_dynamic_instances_are_rejected() {
+        for suffix in [
+            "NOTIFY_WEBHOOK_AUTH_TOKEN_",
+            "NOTIFY_WEBHOOK_AUTH_TOKEN_PRIMARY-DASH",
+            "NOTIFY_WEBHOOK_UNKNOWN_PRIMARY",
+            "AUDIT_MQTT_PASSWORD_PRIMARY.DOT",
+        ] {
+            let product_key = product_key(suffix);
+            let report = build_external_env_compat_report_from_entries(vec![(product_key.clone(), "value".to_string())]);
+
+            assert_eq!(report.unsupported_product_keys, vec![product_key]);
+            assert_eq!(report.mapped_count(), 0);
+        }
+    }
+
+    #[test]
+    fn differing_product_and_canonical_values_are_fatal() {
+        let report = build_external_env_compat_report_from_entries(vec![
+            (product_key("ACCESS_KEY"), "zffs-user".to_string()),
+            ("RUSTFS_ACCESS_KEY".to_string(), "rustfs-user".to_string()),
+        ]);
+
+        assert_eq!(report.product_conflict_keys, vec!["RUSTFS_ACCESS_KEY".to_string()]);
+    }
+
+    #[test]
+    fn differing_product_and_external_values_are_fatal() {
+        let report = build_external_env_compat_report_from_entries(vec![
+            (product_key("VOLUMES"), "/zffs".to_string()),
+            (source_key("VOLUMES"), "/minio".to_string()),
+        ]);
+
+        assert_eq!(report.product_conflict_keys, vec!["RUSTFS_VOLUMES".to_string()]);
+    }
+
+    #[test]
+    fn matching_values_from_all_prefixes_are_accepted() {
+        let report = build_external_env_compat_report_from_entries(vec![
+            (product_key("REGION"), "us-east-1".to_string()),
+            ("RUSTFS_REGION".to_string(), "us-east-1".to_string()),
+            (source_key("REGION"), "us-east-1".to_string()),
+        ]);
+
+        assert_eq!(report.mapped_count(), 0);
+        assert_eq!(report.product_conflict_count(), 0);
     }
 
     #[test]
@@ -882,22 +1086,6 @@ mod tests {
         });
         temp_env::with_var("RUSTFS_TEST_OUTCOME", Some("42"), || {
             assert_eq!(get_env_parse_outcome::<u64>("RUSTFS_TEST_OUTCOME"), EnvParseOutcome::Parsed(42));
-        });
-    }
-
-    #[test]
-    fn apply_external_env_compat_copies_missing_rustfs_keys() {
-        temp_env::with_var("MINIO_ROOT_USER", Some("compat-admin"), || {
-            temp_env::with_var_unset("RUSTFS_ROOT_USER", || {
-                let report = apply_external_env_compat();
-                assert!(
-                    report
-                        .mapped_pairs
-                        .iter()
-                        .any(|(source_key, rustfs_key)| source_key == "MINIO_ROOT_USER" && rustfs_key == "RUSTFS_ROOT_USER")
-                );
-                assert_eq!(std::env::var("RUSTFS_ROOT_USER").as_deref(), Ok("compat-admin"));
-            });
         });
     }
 }
