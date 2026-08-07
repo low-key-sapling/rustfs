@@ -29,6 +29,7 @@ Two rules keep this directory healthy:
 
 ## Contracts & invariants
 
+- [zffs-branding-compatibility.md](zffs-branding-compatibility.md) — ZfFS product identity, configuration adapter, compatibility-core boundary, and release verification contract
 - [erasure-coding.md](erasure-coding.md) — normative erasure-coding algorithm and on-disk (`xl.meta`) compatibility contract; the frozen invariants for all user-data read/write, encode/decode, quorum, heal, and decode tolerance
 - [placement-repair-invariants.md](placement-repair-invariants.md)
 - [unified-object-generation.md](unified-object-generation.md) — single per-object generation authority (fencing epoch, transport/encoding/proto/mixed-version contracts)
