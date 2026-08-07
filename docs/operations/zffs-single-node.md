@@ -1,5 +1,7 @@
 # ZfFS Single-Node Binary Deployment
 
+[中文部署手册](zffs-single-node-zh.md)
+
 This runbook deploys the `zffs` ARM64 or AMD64 binary directly, without registering a system service. ZfFS uses the RustFS storage and S3 compatibility core; selecting the ZfFS product configuration does not rewrite the on-disk object format.
 
 ## Deployment Model
