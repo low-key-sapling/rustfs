@@ -24,7 +24,7 @@
 //!   * PUT / multipart-complete / DeleteObject / DeleteObjects each deliver one event with the correct
 //!     eventName, bucket, key, versionId and eTag.
 //!   * prefix/suffix filters drop non-matching keys (rule-engine gate).
-//!   * an event queued while the target endpoint is unreachable is redelivered
+//!   * an event queued while the target endpoint rejects delivery is redelivered
 //!     from the on-disk store once the endpoint recovers (store-and-forward).
 //!   * responseElements and the S3 response use the canonical request ID while
 //!     requestParameters preserve a conflicting client-supplied value.
@@ -38,16 +38,11 @@ use aws_sdk_s3::types::{
     NotificationConfiguration, NotificationConfigurationFilter, ObjectIdentifier, QueueConfiguration, S3KeyFilter,
     VersioningConfiguration,
 };
-use http::header::{CONTENT_TYPE, HOST};
 use local_ip_address::local_ip;
 use reqwest::StatusCode;
-use rustfs_signer::constants::UNSIGNED_PAYLOAD;
-use rustfs_signer::sign_v4;
 use rustfs_utils::egress::ENV_OUTBOUND_ALLOW_ORIGINS;
 use rustfs_utils::http::headers::{AMZ_REQUEST_ID, REQUEST_ID_HEADER};
-use s3s::Body;
 use serde_json::Value;
-use serial_test::serial;
 use std::error::Error;
 use std::io::Cursor;
 use std::path::Path;
@@ -416,42 +411,16 @@ async fn collect_until(
 // Admin target configuration (signed admin HTTP)
 // ---------------------------------------------------------------------------
 
+/// Thin wrapper over [`crate::common::signed_request`] with this suite's
+/// root credentials; a `Some` body is always JSON here.
 async fn signed_admin_request(
     env: &RustFSTestEnvironment,
     method: http::Method,
     url: &str,
     body: Option<Vec<u8>>,
 ) -> Result<reqwest::Response, BoxError> {
-    let uri = url.parse::<http::Uri>()?;
-    let authority = uri.authority().ok_or("admin URL missing authority")?.to_string();
-    let mut builder = http::Request::builder()
-        .method(method.clone())
-        .uri(uri)
-        .header(HOST, authority)
-        .header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
-    if body.is_some() {
-        builder = builder.header(CONTENT_TYPE, "application/json");
-    }
-
-    let content_len = body.as_ref().map(|b| b.len() as i64).unwrap_or_default();
-    let signed = sign_v4(
-        builder.body(Body::empty())?,
-        content_len,
-        &env.access_key,
-        &env.secret_key,
-        "",
-        "us-east-1",
-    );
-
-    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
-    let mut request = crate::common::local_http_client().request(reqwest_method, url);
-    for (name, value) in signed.headers() {
-        request = request.header(name, value);
-    }
-    if let Some(body) = body {
-        request = request.body(body);
-    }
-    Ok(request.send().await?)
+    let content_type = body.is_some().then_some("application/json");
+    crate::common::signed_request(method, url, &env.access_key, &env.secret_key, body, content_type).await
 }
 
 async fn enable_notify_module(env: &RustFSTestEnvironment) -> TestResult {
@@ -625,7 +594,6 @@ fn assert_generated_request_id_correlation(record: &Value, request_id: &str) {
 /// RUSTFS_NOTIFY_ENABLE, an HTTPS webhook using a configured CA must become
 /// online and receive a real S3 event POST.
 #[tokio::test]
-#[serial]
 async fn test_https_webhook_target_delivers_event_with_notify_env_enabled() -> TestResult {
     init_logging();
 
@@ -680,7 +648,6 @@ async fn test_https_webhook_target_delivers_event_with_notify_env_enabled() -> T
 /// PUT / multipart-complete / DELETE each deliver one event with correct fields,
 /// and the prefix/suffix filter drops non-matching keys.
 #[tokio::test]
-#[serial]
 async fn test_webhook_event_delivery_and_filtering() -> TestResult {
     init_logging();
 
@@ -897,11 +864,9 @@ async fn test_webhook_event_delivery_and_filtering() -> TestResult {
     Ok(())
 }
 
-/// An event queued while the target endpoint is unreachable survives on the
+/// An event queued while the target endpoint rejects delivery survives on the
 /// durable store and is redelivered once the endpoint comes back.
 #[tokio::test]
-#[serial]
-#[ignore = "FAILING deterministically on main since it landed (#4821): the target is created but never appears in /rustfs/admin/v3/target/arns, so wait_for_target_registered times out. Quarantined per the flake policy; remove with the fix for rustfs#4852"]
 async fn test_webhook_redelivers_event_after_target_recovers() -> TestResult {
     init_logging();
 
@@ -932,28 +897,55 @@ async fn test_webhook_redelivers_event_after_target_recovers() -> TestResult {
     wait_for_target_registered(&env, target).await?;
     put_notification_config(&client, bucket, target, "uploads/", ".dat").await?;
 
-    // Take the endpoint down (drops the listener, so connections are refused —
-    // a retryable NotConnected), then PUT: the event cannot be delivered and
-    // must survive on the durable queue store.
+    // Replace the healthy setup listener with one that rejects the first POST.
+    // Waiting for that response below proves the queued event reached a failed
+    // delivery attempt before the endpoint recovers.
     setup_handle.abort();
     let _ = setup_handle.await;
 
+    let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     let key = "uploads/redeliver.dat";
     client
         .put_object()
         .bucket(bucket)
         .key(key)
-        .body(ByteStream::from_static(b"queued while target down"))
+        .body(ByteStream::from_static(b"queued while target rejects"))
         .send()
         .await?;
 
-    // Hold the endpoint down long enough for at least one replay attempt to
-    // fail (the replay worker scans the store every 500ms), so recovery below
-    // exercises real redelivery rather than a first-attempt success.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    let mut failure_handle = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await?;
+            let (method, _) = timeout(Duration::from_secs(5), read_http_message(&mut stream)).await??;
+            if method == "HEAD" {
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await?;
+                stream.shutdown().await?;
+                continue;
+            }
+            if method == "POST" {
+                stream
+                    .write_all(b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await?;
+                stream.shutdown().await?;
+                return Ok::<(), BoxError>(());
+            }
+        }
+    });
 
-    // Bring the endpoint back on the same port; the replay worker retries with
-    // exponential backoff and delivers the queued event.
+    let rejected = match timeout(Duration::from_secs(20), &mut failure_handle).await {
+        Ok(rejected) => rejected,
+        Err(_) => {
+            failure_handle.abort();
+            let _ = failure_handle.await;
+            return Err("webhook replay did not reach the rejecting endpoint".into());
+        }
+    };
+    rejected??;
+
+    // Bring the endpoint back on the same port; the replay worker rescans the
+    // durable queue and delivers the retained event.
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     let (tx, mut rx) = mpsc::unbounded_channel();
     let handle = serve_event_collector(listener, tx);

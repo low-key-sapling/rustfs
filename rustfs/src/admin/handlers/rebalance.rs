@@ -24,10 +24,9 @@ use crate::admin::storage_api::runtime::{ECStore, NotificationSys};
 use crate::{
     admin::runtime_sources::current_notification_system,
     admin::{
-        auth::validate_admin_request,
+        auth::authorize_admin_request,
         router::{AdminOperation, Operation, S3Router},
     },
-    auth::{check_key_valid, get_session_token},
     server::{ADMIN_PREFIX, RemoteAddr},
 };
 use http::{HeaderMap, HeaderValue, StatusCode, Uri};
@@ -39,7 +38,7 @@ use rustfs_utils::{
     http::{AMZ_REQUEST_ID, REQUEST_ID_HEADER},
 };
 use s3s::{
-    Body, S3Request, S3Response, S3Result,
+    Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
     header::{CONTENT_LENGTH, CONTENT_TYPE},
     s3_error,
 };
@@ -102,6 +101,10 @@ fn rebalance_start_rollback_error(start_err: &str, rollback_result: &Result<(), 
     }
 }
 
+fn rebalance_internal_error(message: impl Into<String>) -> S3Error {
+    S3Error::with_message(S3ErrorCode::InternalError, message.into())
+}
+
 fn rebalance_rollback_stop_failure_message(rebalance_id: &str, failures: &[String]) -> String {
     format!("cluster stop_rebalance rollback for {rebalance_id} partial: {}", failures.join("; "))
 }
@@ -128,6 +131,28 @@ fn rebalance_rollback_failure_message(
     failures.join("; ")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RebalanceStartStep {
+    PropagateFence,
+    StartLocal,
+    PropagateWorkers,
+}
+
+const DISTRIBUTED_REBALANCE_START_STEPS: [RebalanceStartStep; 3] = [
+    RebalanceStartStep::PropagateFence,
+    RebalanceStartStep::StartLocal,
+    RebalanceStartStep::PropagateWorkers,
+];
+const LOCAL_REBALANCE_START_STEPS: [RebalanceStartStep; 1] = [RebalanceStartStep::StartLocal];
+
+fn rebalance_start_steps(has_notification_sys: bool) -> &'static [RebalanceStartStep] {
+    if has_notification_sys {
+        &DISTRIBUTED_REBALANCE_START_STEPS
+    } else {
+        &LOCAL_REBALANCE_START_STEPS
+    }
+}
+
 async fn rollback_cluster_rebalance_start(
     store: &Arc<ECStore>,
     notification_sys: Option<&NotificationSys>,
@@ -151,12 +176,15 @@ async fn rollback_cluster_rebalance_start(
                 terminal_reload_attempt_at: Some(terminal_reload_attempt_at),
                 terminal_reload_failures: terminal_reload_failures.clone(),
             };
-            store.record_rebalance_stop_propagation(record).await.map_err(|err| {
-                format!(
-                    "cluster rebalance rollback for {rebalance_id} partial; failed to persist stop propagation: {err}; {}",
-                    rebalance_rollback_failure_message(rebalance_id, &stop_failures, &terminal_reload_failures)
-                )
-            })?;
+            store
+                .record_rebalance_stop_propagation(rebalance_id, record)
+                .await
+                .map_err(|err| {
+                    format!(
+                        "cluster rebalance rollback for {rebalance_id} partial; failed to persist stop propagation: {err}; {}",
+                        rebalance_rollback_failure_message(rebalance_id, &stop_failures, &terminal_reload_failures)
+                    )
+                })?;
             return Err(rebalance_rollback_failure_message(
                 rebalance_id,
                 &stop_failures,
@@ -171,10 +199,54 @@ async fn rollback_cluster_rebalance_start(
         .await
         .map_err(|err| format!("local stop_rebalance rollback for {rebalance_id} failed: {err}"))?;
     store
-        .save_rebalance_stats(usize::MAX, RebalSaveOpt::StoppedAt)
+        .save_rebalance_stats_for_id(usize::MAX, RebalSaveOpt::StoppedAt, rebalance_id)
         .await
         .map_err(|err| format!("local rollback stop metadata save for {rebalance_id} failed: {err}"))?;
     Ok(())
+}
+
+async fn rollback_rebalance_start_for_admin(
+    store: &Arc<ECStore>,
+    notification_sys: Option<&NotificationSys>,
+    rebalance_id: &str,
+    start_err: &str,
+    request_id: &str,
+    actor: &str,
+    remote_addr: &str,
+) -> S3Result<()> {
+    let rollback_result = rollback_cluster_rebalance_start(store, notification_sys, rebalance_id).await;
+    let rollback_label = rollback_result_label(&rollback_result);
+    match &rollback_result {
+        Ok(_) => info!(
+            event = EVENT_ADMIN_REBALANCE_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            action = "start",
+            result = rollback_label,
+            request_id = %request_id,
+            actor = %actor,
+            remote_addr = %remote_addr,
+            rebalance_id = %rebalance_id,
+            propagation_error = %start_err,
+            "admin rebalance state"
+        ),
+        Err(rollback_err) => error!(
+            event = EVENT_ADMIN_REBALANCE_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            action = "start",
+            result = rollback_label,
+            request_id = %request_id,
+            actor = %actor,
+            remote_addr = %remote_addr,
+            rebalance_id = %rebalance_id,
+            propagation_error = %start_err,
+            rollback_error = %rollback_err,
+            "admin rebalance state"
+        ),
+    }
+
+    Err(rebalance_internal_error(rebalance_start_rollback_error(start_err, &rollback_result)))
 }
 
 pub fn register_rebalance_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
@@ -424,23 +496,12 @@ impl Operation for RebalanceStart {
             "admin rebalance state"
         );
 
-        let Some(input_cred) = req.credentials else {
+        let Some(input_cred) = req.credentials.as_ref() else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         };
-
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
         let actor = MaskedAccessKey(&input_cred.access_key).to_string();
 
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::RebalanceAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::RebalanceAdminAction)]).await?;
 
         if rebalance_query_present(&req.uri) {
             log_rebalance_request_rejected("start", "invalid_query_parameters", &request_id, &actor, &remote_addr);
@@ -473,7 +534,7 @@ impl Operation for RebalanceStart {
 
         let buckets: Vec<String> = bucket_infos.into_iter().map(|bucket| bucket.name).collect();
 
-        let id = match store.init_and_start_rebalance(buckets).await {
+        let id = match store.init_rebalance_start(buckets).await {
             Ok(id) => id,
             Err(StorageError::DecommissionAlreadyRunning) => {
                 log_rebalance_request_rejected("start", "decommission_in_progress", &request_id, &actor, &remote_addr);
@@ -484,7 +545,7 @@ impl Operation for RebalanceStart {
                 return Err(s3_error!(OperationAborted, "rebalance is already in progress"));
             }
             Err(e) => {
-                return Err(s3_error!(InternalError, "failed to start rebalance: {}", e));
+                return Err(s3_error!(InternalError, "failed to initialize rebalance: {}", e));
             }
         };
 
@@ -493,80 +554,186 @@ impl Operation for RebalanceStart {
             component = LOG_COMPONENT_ADMIN,
             subsystem = LOG_SUBSYSTEM_REBALANCE,
             action = "start",
-            state = "started",
+            state = "metadata_initialized",
             request_id = %request_id,
             actor = %actor,
             remote_addr = %remote_addr,
             rebalance_id = %id,
             "admin rebalance state"
         );
-        if let Some(notification_sys) = current_notification_system() {
-            info!(
-                event = EVENT_ADMIN_REBALANCE_STATE,
-                component = LOG_COMPONENT_ADMIN,
-                subsystem = LOG_SUBSYSTEM_REBALANCE,
-                action = "start",
-                state = "propagation_started",
-                request_id = %request_id,
-                actor = %actor,
-                remote_addr = %remote_addr,
-                rebalance_id = %id,
-                "admin rebalance state"
-            );
-            if let Err(err) = notification_sys.load_rebalance_meta(true).await {
-                error!(
-                    event = EVENT_ADMIN_REBALANCE_STATE,
-                    component = LOG_COMPONENT_ADMIN,
-                    subsystem = LOG_SUBSYSTEM_REBALANCE,
-                    action = "start",
-                    result = "propagation_failed",
-                    request_id = %request_id,
-                    actor = %actor,
-                    remote_addr = %remote_addr,
-                    rebalance_id = %id,
-                    error = %err,
-                    "admin rebalance state"
-                );
+        let notification_sys = current_notification_system();
+        for step in rebalance_start_steps(notification_sys.is_some()) {
+            match step {
+                RebalanceStartStep::PropagateFence => {
+                    if let Some(notification_sys) = notification_sys.as_ref() {
+                        info!(
+                            event = EVENT_ADMIN_REBALANCE_STATE,
+                            component = LOG_COMPONENT_ADMIN,
+                            subsystem = LOG_SUBSYSTEM_REBALANCE,
+                            action = "start",
+                            state = "fence_propagation_started",
+                            request_id = %request_id,
+                            actor = %actor,
+                            remote_addr = %remote_addr,
+                            rebalance_id = %id,
+                            "admin rebalance state"
+                        );
+                        if let Err(err) = notification_sys.load_rebalance_meta(false).await {
+                            error!(
+                                event = EVENT_ADMIN_REBALANCE_STATE,
+                                component = LOG_COMPONENT_ADMIN,
+                                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                                action = "start",
+                                result = "fence_propagation_failed",
+                                request_id = %request_id,
+                                actor = %actor,
+                                remote_addr = %remote_addr,
+                                rebalance_id = %id,
+                                error = %err,
+                                "admin rebalance state"
+                            );
 
-                let start_err = err.to_string();
-                let rollback_result = rollback_cluster_rebalance_start(&store, Some(&notification_sys), &id).await;
-                let rollback_label = rollback_result_label(&rollback_result);
-                match &rollback_result {
-                    Ok(_) => info!(
-                        event = EVENT_ADMIN_REBALANCE_STATE,
-                        component = LOG_COMPONENT_ADMIN,
-                        subsystem = LOG_SUBSYSTEM_REBALANCE,
-                        action = "start",
-                        result = rollback_label,
-                        request_id = %request_id,
-                        actor = %actor,
-                        remote_addr = %remote_addr,
-                        rebalance_id = %id,
-                        propagation_error = %start_err,
-                        "admin rebalance state"
-                    ),
-                    Err(rollback_err) => error!(
-                        event = EVENT_ADMIN_REBALANCE_STATE,
-                        component = LOG_COMPONENT_ADMIN,
-                        subsystem = LOG_SUBSYSTEM_REBALANCE,
-                        action = "start",
-                        result = rollback_label,
-                        request_id = %request_id,
-                        actor = %actor,
-                        remote_addr = %remote_addr,
-                        rebalance_id = %id,
-                        propagation_error = %start_err,
-                        rollback_error = %rollback_err,
-                        "admin rebalance state"
-                    ),
+                            let start_err = err.to_string();
+                            rollback_rebalance_start_for_admin(
+                                &store,
+                                Some(notification_sys),
+                                &id,
+                                &start_err,
+                                &request_id,
+                                &actor,
+                                &remote_addr,
+                            )
+                            .await?;
+                        }
+                    }
                 }
+                RebalanceStartStep::StartLocal => {
+                    if let Err(err) = store.start_rebalance_for_id(&id).await {
+                        error!(
+                            event = EVENT_ADMIN_REBALANCE_STATE,
+                            component = LOG_COMPONENT_ADMIN,
+                            subsystem = LOG_SUBSYSTEM_REBALANCE,
+                            action = "start",
+                            result = "local_start_failed",
+                            request_id = %request_id,
+                            actor = %actor,
+                            remote_addr = %remote_addr,
+                            rebalance_id = %id,
+                            error = %err,
+                            "admin rebalance state"
+                        );
 
-                return Err(s3_error!(
-                    InternalError,
-                    "{}",
-                    rebalance_start_rollback_error(&start_err, &rollback_result)
-                ));
+                        let start_err = err.to_string();
+                        if let Err(rollback_err) = store.rollback_rebalance_start_for_id(Some(&id), start_err.clone()).await {
+                            error!(
+                                event = EVENT_ADMIN_REBALANCE_STATE,
+                                component = LOG_COMPONENT_ADMIN,
+                                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                                action = "start",
+                                result = "local_start_rollback_failed",
+                                request_id = %request_id,
+                                actor = %actor,
+                                remote_addr = %remote_addr,
+                                rebalance_id = %id,
+                                start_error = %start_err,
+                                rollback_error = %rollback_err,
+                                "admin rebalance state"
+                            );
+                            return Err(rebalance_internal_error(format!(
+                                "failed to start rebalance after metadata initialized for {id}; rollback failed: {rollback_err}"
+                            )));
+                        }
+
+                        info!(
+                            event = EVENT_ADMIN_REBALANCE_STATE,
+                            component = LOG_COMPONENT_ADMIN,
+                            subsystem = LOG_SUBSYSTEM_REBALANCE,
+                            action = "start",
+                            result = "local_start_rollback_success",
+                            request_id = %request_id,
+                            actor = %actor,
+                            remote_addr = %remote_addr,
+                            rebalance_id = %id,
+                            start_error = %start_err,
+                            "admin rebalance state"
+                        );
+                        if let Some(notification_sys) = notification_sys.as_ref() {
+                            let terminal_reload_attempt_at = OffsetDateTime::now_utc();
+                            let terminal_reload_failures = match notification_sys.load_rebalance_meta_failures(false).await {
+                                Ok(failures) => failures,
+                                Err(err) => vec![format!("terminal rebalance reload rollback for {id} failed: {err}")],
+                            };
+                            if !terminal_reload_failures.is_empty() {
+                                let record = RebalanceStopPropagationRecord {
+                                    stop_attempt_at: None,
+                                    stop_failures: Vec::new(),
+                                    terminal_reload_attempt_at: Some(terminal_reload_attempt_at),
+                                    terminal_reload_failures: terminal_reload_failures.clone(),
+                                };
+                                store.record_rebalance_stop_propagation(&id, record).await.map_err(|err| {
+                                    rebalance_internal_error(format!(
+                                        "failed to persist rebalance local-start rollback propagation metadata: {err}"
+                                    ))
+                                })?;
+                                return Err(rebalance_internal_error(format!(
+                                    "failed to start rebalance after metadata initialized for {}; local metadata was finalized as failed, but terminal peer reload was incomplete: {}",
+                                    id,
+                                    rebalance_rollback_terminal_reload_failure_message(&id, &terminal_reload_failures)
+                                )));
+                            }
+                        }
+                        return Err(rebalance_internal_error(format!(
+                            "failed to start rebalance after metadata initialized for {id}; local metadata was finalized as failed: {start_err}"
+                        )));
+                    }
+                }
+                RebalanceStartStep::PropagateWorkers => {
+                    if let Some(notification_sys) = notification_sys.as_ref() {
+                        info!(
+                            event = EVENT_ADMIN_REBALANCE_STATE,
+                            component = LOG_COMPONENT_ADMIN,
+                            subsystem = LOG_SUBSYSTEM_REBALANCE,
+                            action = "start",
+                            state = "worker_propagation_started",
+                            request_id = %request_id,
+                            actor = %actor,
+                            remote_addr = %remote_addr,
+                            rebalance_id = %id,
+                            "admin rebalance state"
+                        );
+                        if let Err(err) = notification_sys.load_rebalance_meta(true).await {
+                            error!(
+                                event = EVENT_ADMIN_REBALANCE_STATE,
+                                component = LOG_COMPONENT_ADMIN,
+                                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                                action = "start",
+                                result = "worker_propagation_failed",
+                                request_id = %request_id,
+                                actor = %actor,
+                                remote_addr = %remote_addr,
+                                rebalance_id = %id,
+                                error = %err,
+                                "admin rebalance state"
+                            );
+
+                            let start_err = err.to_string();
+                            rollback_rebalance_start_for_admin(
+                                &store,
+                                Some(notification_sys),
+                                &id,
+                                &start_err,
+                                &request_id,
+                                &actor,
+                                &remote_addr,
+                            )
+                            .await?;
+                        }
+                    }
+                }
             }
+        }
+
+        if notification_sys.is_some() {
             info!(
                 event = EVENT_ADMIN_REBALANCE_STATE,
                 component = LOG_COMPONENT_ADMIN,
@@ -613,23 +780,12 @@ impl Operation for RebalanceStatus {
             "admin rebalance state"
         );
 
-        let Some(input_cred) = req.credentials else {
+        let Some(input_cred) = req.credentials.as_ref() else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         };
-
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
         let actor = MaskedAccessKey(&input_cred.access_key).to_string();
 
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::RebalanceAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::RebalanceAdminAction)]).await?;
 
         let Some(store) = object_store_from_extensions(&req.extensions) else {
             return Err(s3_error!(InternalError, "object layer is not initialized"));
@@ -693,6 +849,38 @@ impl Operation for RebalanceStatus {
     }
 }
 
+async fn rebalance_stop_target_id(store: &Arc<ECStore>) -> S3Result<Option<String>> {
+    store
+        .prepare_rebalance_stop()
+        .await
+        .map_err(|e| s3_error!(InternalError, "failed to prepare rebalance metadata for stop: {}", e))
+}
+
+async fn stop_rebalance_admission_first(
+    store: &Arc<ECStore>,
+    notification_sys: Option<&NotificationSys>,
+    expected_rebalance_id: &str,
+) -> S3Result<Vec<String>> {
+    // prepare_rebalance_stop already closed admission for this exact run.
+
+    if let Some(notification_sys) = notification_sys {
+        return notification_sys
+            .stop_rebalance_failures(Some(expected_rebalance_id))
+            .await
+            .map_err(|e| s3_error!(InternalError, "failed to stop rebalance via notification system: {}", e));
+    }
+
+    store
+        .stop_rebalance_for_id(Some(expected_rebalance_id))
+        .await
+        .map_err(|e| s3_error!(InternalError, "failed to stop rebalance: {}", e))?;
+    store
+        .save_rebalance_stats_for_id(usize::MAX, RebalSaveOpt::StoppedAt, expected_rebalance_id)
+        .await
+        .map_err(|e| s3_error!(InternalError, "failed to persist rebalance stop metadata: {}", e))?;
+    Ok(Vec::new())
+}
+
 // RebalanceStop
 pub struct RebalanceStop {}
 
@@ -713,23 +901,12 @@ impl Operation for RebalanceStop {
             "admin rebalance state"
         );
 
-        let Some(input_cred) = req.credentials else {
+        let Some(input_cred) = req.credentials.as_ref() else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         };
-
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
         let actor = MaskedAccessKey(&input_cred.access_key).to_string();
 
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::RebalanceAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::RebalanceAdminAction)]).await?;
 
         if rebalance_query_present(&req.uri) {
             log_rebalance_request_rejected("stop", "invalid_query_parameters", &request_id, &actor, &remote_addr);
@@ -740,36 +917,15 @@ impl Operation for RebalanceStop {
             return Err(s3_error!(InternalError, "object layer is not initialized"));
         };
 
-        store
-            .load_rebalance_meta()
-            .await
-            .map_err(|e| s3_error!(InternalError, "failed to load rebalance metadata before stop: {}", e))?;
-        let expected_rebalance_id = store.current_rebalance_id().await;
-
-        if !store.is_rebalance_conflicting_with_decommission().await {
+        let Some(expected_rebalance_id) = rebalance_stop_target_id(&store).await? else {
             log_rebalance_request_rejected("stop", "rebalance_not_started", &request_id, &actor, &remote_addr);
             return Err(s3_error!(NoSuchResource, "pool rebalance is not started"));
-        }
+        };
 
         let notification_sys = current_notification_system();
         let stop_attempt_at = OffsetDateTime::now_utc();
-        let mut stop_failures = Vec::new();
-        if let Some(notification_sys) = notification_sys.as_ref() {
-            stop_failures = notification_sys
-                .stop_rebalance_failures(expected_rebalance_id.as_deref())
-                .await
-                .map_err(|e| s3_error!(InternalError, "failed to stop rebalance via notification system: {}", e))?;
-        } else {
-            store
-                .stop_rebalance_for_id(expected_rebalance_id.as_deref())
-                .await
-                .map_err(|e| s3_error!(InternalError, "failed to stop rebalance: {}", e))?;
-
-            store
-                .save_rebalance_stats(usize::MAX, RebalSaveOpt::StoppedAt)
-                .await
-                .map_err(|e| s3_error!(InternalError, "failed to persist rebalance stop metadata: {}", e))?;
-        }
+        let stop_failures =
+            stop_rebalance_admission_first(&store, notification_sys.as_deref(), expected_rebalance_id.as_str()).await?;
 
         info!(
             event = EVENT_ADMIN_REBALANCE_STATE,
@@ -831,7 +987,7 @@ impl Operation for RebalanceStop {
                 terminal_reload_failures: terminal_reload_failures.clone(),
             };
             store
-                .record_rebalance_stop_propagation(record)
+                .record_rebalance_stop_propagation(expected_rebalance_id.as_str(), record)
                 .await
                 .map_err(|e| s3_error!(InternalError, "failed to persist rebalance stop propagation metadata: {}", e))?;
 
@@ -902,16 +1058,244 @@ mod rebalance_handler_tests {
     use super::build_rebalance_pool_progress;
     use super::calculate_rebalance_progress;
     use super::{
-        RebalPoolProgress, RebalanceAdminStatus, RebalancePoolStatus, RebalanceStopPropagationStatus,
+        Body, HeaderMap, Method, Operation, Params, RebalPoolProgress, RebalanceAdminStatus, RebalancePoolStatus, RebalanceStart,
+        RebalanceStartStep, RebalanceStatus, RebalanceStop, RebalanceStopPropagationStatus, S3ErrorCode, S3Request, Uri,
         build_rebalance_admin_status, build_rebalance_pool_statuses, build_rebalance_stop_propagation_status,
         rebalance_pool_used, rebalance_query_present, rebalance_remaining_buckets, rebalance_rollback_failure_message,
-        rebalance_rollback_stop_failure_message, rebalance_start_rollback_error, rebalance_used_pct, rollback_result_label,
+        rebalance_rollback_stop_failure_message, rebalance_start_rollback_error, rebalance_start_steps, rebalance_stop_target_id,
+        rebalance_used_pct, rollback_result_label, stop_rebalance_admission_first,
     };
     use crate::admin::storage_api::rebalance::{
-        DiskStat, RebalStatus, RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceInfo, RebalanceMeta,
-        RebalanceStats, RebalanceStopPropagationRecord, encode_rebalance_stop_propagation_record,
+        DiskStat, RebalSaveOpt, RebalStatus, RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceInfo,
+        RebalanceMeta, RebalanceStats, RebalanceStopPropagationRecord, encode_rebalance_stop_propagation_record,
     };
     use time::OffsetDateTime;
+
+    fn credential_less_request(method: Method, uri: &'static str) -> S3Request<Body> {
+        S3Request {
+            input: Body::empty(),
+            method,
+            uri: Uri::from_static(uri),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    async fn assert_missing_credentials(operation: &dyn Operation, method: Method, uri: &'static str) {
+        let err = operation
+            .call(credential_less_request(method, uri), Params::new())
+            .await
+            .expect_err("a rebalance admin request without credentials must fail");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("authentication required"));
+    }
+
+    fn started_rebalance_meta(id: &str) -> RebalanceMeta {
+        RebalanceMeta {
+            id: id.to_string(),
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    start_time: Some(OffsetDateTime::now_utc()),
+                    status: RebalStatus::Started,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn real_admin_stop_cancels_paused_entry_before_waiting_for_activation_gate() {
+        const REBALANCE_ID: &str = "admin-stop-paused-entry";
+        let mut fixture =
+            crate::admin::storage_api::ecstore_rebalance::test_util::PausedRebalanceEntryTestFixture::new(REBALANCE_ID).await;
+        fixture.wait_until_entry_paused().await;
+
+        let stop_store = fixture.store();
+        let mut stop_task = tokio::spawn(async move {
+            let expected_rebalance_id = rebalance_stop_target_id(&stop_store)
+                .await
+                .expect("admin stop target resolution should succeed")
+                .expect("the active rebalance should remain stoppable");
+            stop_rebalance_admission_first(&stop_store, None, expected_rebalance_id.as_str()).await
+        });
+        fixture.wait_until_admission_cancelled().await;
+        fixture.wait_until_stop_waiting_for_entry().await;
+        assert!(!stop_task.is_finished(), "admin stop must wait for the paused entry guard to drain");
+
+        fixture.release_entry();
+        fixture.assert_entry_cancelled().await;
+        let stop_failures = tokio::time::timeout(std::time::Duration::from_secs(5), &mut stop_task)
+            .await
+            .expect("admin stop should finish after the entry guard drains")
+            .expect("admin stop task should not panic")
+            .expect("admin stop should persist the terminal state");
+        assert!(stop_failures.is_empty());
+        assert!(!fixture.store().is_rebalance_conflicting_with_decommission().await);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn real_admin_stop_accepts_same_run_terminalization_after_prepare() {
+        const REBALANCE_ID: &str = "admin-stop-terminal-after-prepare";
+        const REPLACEMENT_ID: &str = "admin-stop-replacement";
+        let (_temp_dirs, store) =
+            crate::admin::storage_api::ecstore_rebalance::test_util::test_store_with_persisted_rebalance_meta(
+                started_rebalance_meta(REBALANCE_ID),
+            )
+            .await;
+        let terminal_barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let worker_barrier = std::sync::Arc::clone(&terminal_barrier);
+        let worker_store = std::sync::Arc::clone(&store);
+        let terminal_task = tokio::spawn(async move {
+            worker_barrier.wait().await;
+            {
+                let mut rebalance_meta = worker_store.rebalance_meta.write().await;
+                let meta = rebalance_meta
+                    .as_mut()
+                    .expect("the prepared rebalance metadata should remain installed");
+                assert_eq!(meta.id, REBALANCE_ID);
+                let pool = meta
+                    .pool_stats
+                    .first_mut()
+                    .expect("the prepared rebalance should have a pool");
+                pool.info.status = RebalStatus::Stopped;
+                pool.info.end_time = Some(OffsetDateTime::now_utc());
+            }
+            worker_store
+                .save_rebalance_stats_for_id(0, RebalSaveOpt::Stats, REBALANCE_ID)
+                .await
+        });
+
+        let expected_rebalance_id = rebalance_stop_target_id(&store)
+            .await
+            .expect("admin stop target resolution should succeed")
+            .expect("the active rebalance should remain stoppable");
+        assert_eq!(expected_rebalance_id, REBALANCE_ID);
+        let cancel = store
+            .rebalance_meta
+            .read()
+            .await
+            .as_ref()
+            .and_then(|meta| meta.cancel.clone())
+            .expect("prepare should install the admission cancellation token");
+        assert!(cancel.is_cancelled());
+
+        terminal_barrier.wait().await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), terminal_task)
+            .await
+            .expect("worker terminalization should finish after the barrier opens")
+            .expect("worker terminalization task should not panic")
+            .expect("worker terminalization should persist");
+        assert!(!store.is_rebalance_conflicting_with_decommission().await);
+
+        *store.rebalance_meta.write().await = None;
+        store
+            .load_rebalance_meta()
+            .await
+            .expect("the worker terminal state should reload before the final stop");
+        {
+            let terminal = store.rebalance_meta.read().await;
+            let terminal = terminal.as_ref().expect("the worker terminal state should remain persisted");
+            assert_eq!(terminal.id, REBALANCE_ID);
+            assert_eq!(terminal.pool_stats[0].info.status, RebalStatus::Stopped);
+        }
+
+        let stop_failures = stop_rebalance_admission_first(&store, None, expected_rebalance_id.as_str())
+            .await
+            .expect("same-run terminalization after prepare should be a successful stop");
+        assert!(stop_failures.is_empty());
+
+        *store.rebalance_meta.write().await = Some(started_rebalance_meta(REPLACEMENT_ID));
+        let error = stop_rebalance_admission_first(&store, None, expected_rebalance_id.as_str())
+            .await
+            .expect_err("the prepared stop must not mutate a replacement run");
+        assert!(error.to_string().contains(REBALANCE_ID));
+        let replacement = store.rebalance_meta.read().await;
+        let replacement = replacement.as_ref().expect("the replacement run should remain installed");
+        assert_eq!(replacement.id, REPLACEMENT_ID);
+        assert_eq!(replacement.pool_stats[0].info.status, RebalStatus::Started);
+        assert!(replacement.cancel.is_none());
+        assert!(replacement.stopped_at.is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn real_admin_stop_loads_persisted_active_rebalance_from_cold_memory() {
+        const REBALANCE_ID: &str = "admin-stop-cold-memory";
+        let (_temp_dirs, store) =
+            crate::admin::storage_api::ecstore_rebalance::test_util::test_store_with_persisted_rebalance_meta(
+                started_rebalance_meta(REBALANCE_ID),
+            )
+            .await;
+        *store.rebalance_meta.write().await = None;
+        assert!(store.current_rebalance_id().await.is_none());
+
+        let expected_rebalance_id = rebalance_stop_target_id(&store)
+            .await
+            .expect("admin stop should load persisted rebalance metadata")
+            .expect("persisted active rebalance should be stoppable");
+        assert_eq!(expected_rebalance_id, REBALANCE_ID);
+
+        let stop_failures = stop_rebalance_admission_first(&store, None, expected_rebalance_id.as_str())
+            .await
+            .expect("admin stop should persist the terminal state after a cold load");
+        assert!(stop_failures.is_empty());
+        assert!(!store.is_rebalance_conflicting_with_decommission().await);
+
+        *store.rebalance_meta.write().await = None;
+        store
+            .load_rebalance_meta()
+            .await
+            .expect("the persisted terminal rebalance metadata should remain readable");
+        assert_eq!(store.current_rebalance_id().await.as_deref(), Some(REBALANCE_ID));
+        assert!(!store.is_rebalance_conflicting_with_decommission().await);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn real_admin_stop_refreshes_persisted_active_over_stale_inactive_memory() {
+        const PERSISTED_REBALANCE_ID: &str = "admin-stop-persisted-active";
+        const STALE_REBALANCE_ID: &str = "admin-stop-stale-terminal";
+        let (_temp_dirs, store) =
+            crate::admin::storage_api::ecstore_rebalance::test_util::test_store_with_persisted_rebalance_meta(
+                started_rebalance_meta(PERSISTED_REBALANCE_ID),
+            )
+            .await;
+        *store.rebalance_meta.write().await = Some(RebalanceMeta {
+            id: STALE_REBALANCE_ID.to_string(),
+            stopped_at: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        });
+        assert_eq!(store.current_rebalance_id().await.as_deref(), Some(STALE_REBALANCE_ID));
+        assert!(!store.is_rebalance_conflicting_with_decommission().await);
+
+        let expected_rebalance_id = rebalance_stop_target_id(&store)
+            .await
+            .expect("admin stop should refresh stale inactive local metadata")
+            .expect("persisted active rebalance should replace the stale local terminal state");
+        assert_eq!(expected_rebalance_id, PERSISTED_REBALANCE_ID);
+
+        let stop_failures = stop_rebalance_admission_first(&store, None, expected_rebalance_id.as_str())
+            .await
+            .expect("admin stop should persist the refreshed run's terminal state");
+        assert!(stop_failures.is_empty());
+
+        *store.rebalance_meta.write().await = None;
+        store
+            .load_rebalance_meta()
+            .await
+            .expect("the refreshed run's persisted terminal metadata should remain readable");
+        assert_eq!(store.current_rebalance_id().await.as_deref(), Some(PERSISTED_REBALANCE_ID));
+        assert!(!store.is_rebalance_conflicting_with_decommission().await);
+    }
 
     #[test]
     fn test_calculate_rebalance_progress_running() {
@@ -992,6 +1376,23 @@ mod rebalance_handler_tests {
         let rollback_result = Err("local stop_rebalance failed: disk error".to_string());
 
         assert_eq!(rollback_result_label(&rollback_result), "rollback_failed");
+    }
+
+    #[test]
+    fn test_distributed_rebalance_start_fences_peers_before_workers() {
+        assert_eq!(
+            rebalance_start_steps(true),
+            &[
+                RebalanceStartStep::PropagateFence,
+                RebalanceStartStep::StartLocal,
+                RebalanceStartStep::PropagateWorkers
+            ]
+        );
+    }
+
+    #[test]
+    fn test_local_rebalance_start_has_no_peer_propagation_steps() {
+        assert_eq!(rebalance_start_steps(false), &[RebalanceStartStep::StartLocal]);
     }
 
     #[test]
@@ -1516,5 +1917,75 @@ mod rebalance_handler_tests {
             status.terminal_reload_failed_peers,
             vec!["peer node-b load_rebalance_meta(start=false) failed: timeout"]
         );
+    }
+
+    /// The rebalance handlers pre-check credentials before delegating to the
+    /// shared admin gate, so a credential-less request keeps returning
+    /// `InvalidRequest: authentication required` rather than the gate's own
+    /// "get cred failed" wording (rustfs/backlog#1829).
+    #[tokio::test]
+    async fn rebalance_handlers_keep_their_missing_credentials_response() {
+        assert_missing_credentials(&RebalanceStart {}, Method::POST, "/rustfs/admin/v3/rebalance/start").await;
+        assert_missing_credentials(&RebalanceStatus {}, Method::GET, "/rustfs/admin/v3/rebalance/status").await;
+        assert_missing_credentials(&RebalanceStop {}, Method::POST, "/rustfs/admin/v3/rebalance/stop").await;
+    }
+
+    fn source_block<'a>(production: &'a str, marker: &str) -> &'a str {
+        let block = production
+            .split_once(marker)
+            .unwrap_or_else(|| panic!("{marker} should exist"))
+            .1;
+        let end = [
+            "\npub struct ",
+            "\nasync fn ",
+            "\npub(crate) async fn ",
+            "\nmod ",
+            "\n#[cfg(test)]",
+        ]
+        .into_iter()
+        .filter_map(|boundary| block.find(boundary))
+        .min()
+        .unwrap_or(block.len());
+        &block[..end]
+    }
+
+    /// All three rebalance handlers authorize through the single shared gate with
+    /// the same `RebalanceAdminAction` vector they used before the deduplication,
+    /// and none of them binds the returned credentials (rustfs/backlog#1829).
+    #[test]
+    fn rebalance_handlers_use_the_shared_admin_gate_with_their_actions() {
+        let production = include_str!("rebalance.rs")
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .expect("production source must precede the test module");
+
+        for handler in ["RebalanceStart", "RebalanceStatus", "RebalanceStop"] {
+            let block = source_block(production, &format!("impl Operation for {handler}"));
+            assert_eq!(
+                block.matches("authorize_admin_request(").count(),
+                1,
+                "{handler} must use exactly one shared gate"
+            );
+            assert_eq!(
+                block.matches("Action::AdminAction(").count(),
+                1,
+                "{handler} must preserve its exact action-vector length"
+            );
+            assert!(
+                block.contains("AdminAction::RebalanceAdminAction"),
+                "{handler} must authorize with RebalanceAdminAction"
+            );
+            assert!(
+                !block.contains("let cred = authorize_admin_request("),
+                "{handler} does not consume the authenticated credentials"
+            );
+            assert!(
+                block.contains("let actor = MaskedAccessKey(&input_cred.access_key).to_string();"),
+                "{handler} must keep masking the caller access key for its audit trail"
+            );
+        }
+
+        assert!(!production.contains("check_key_valid(get_session_token"));
+        assert!(!production.contains("validate_admin_request("));
     }
 }

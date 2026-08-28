@@ -21,12 +21,13 @@ pub(crate) fn is_object_locked_by_metadata(user_defined: &HashMap<String, String
     rustfs_lifecycle::object_lock::is_object_locked_by_metadata(user_defined, is_delete_marker)
 }
 
-pub(crate) async fn check_object_lock_for_deletion(
-    bucket: &str,
+pub(crate) fn check_object_lock_for_deletion_with_config(
+    config: Option<&s3s::dto::ObjectLockConfiguration>,
     obj_info: &ObjectInfo,
     bypass_governance: bool,
-) -> Option<ObjectLockBlockReason> {
-    objectlock_sys::check_object_lock_for_deletion(bucket, obj_info, bypass_governance).await
+) -> crate::error::Result<Option<ObjectLockBlockReason>> {
+    let default_retention = config.and_then(crate::bucket::metadata_sys::default_retention_from_object_lock_config);
+    objectlock_sys::check_object_lock_for_deletion_with_default_retention(default_retention.as_ref(), obj_info, bypass_governance)
 }
 
 #[cfg(test)]

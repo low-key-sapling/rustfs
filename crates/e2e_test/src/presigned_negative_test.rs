@@ -43,7 +43,6 @@ use aws_sdk_s3::presigning::{PresignedRequest, PresigningConfig};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::{Client, Config};
 use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
-use serial_test::serial;
 use std::time::{Duration, SystemTime};
 use tracing::info;
 
@@ -88,7 +87,9 @@ fn valid_config() -> PresigningConfig {
 }
 
 /// Flip bytes inside the `X-Amz-Signature=` query value without changing its
-/// length, producing a structurally valid but incorrect signature.
+/// length, producing a structurally valid but incorrect signature. Every hex
+/// digit is replaced by its complement (15 - v), which has no fixed point, so
+/// the tamper changes the value no matter which digits the signature contains.
 fn tamper_signature(uri: &str) -> String {
     let marker = "X-Amz-Signature=";
     let idx = uri.find(marker).expect("presigned uri must carry X-Amz-Signature") + marker.len();
@@ -97,10 +98,9 @@ fn tamper_signature(uri: &str) -> String {
     let (sig, tail) = rest.split_at(end);
     let tampered: String = sig
         .chars()
-        .map(|c| match c {
-            '0' => 'f',
-            'a' => '0',
-            other => other,
+        .map(|c| {
+            let v = c.to_digit(16).expect("X-Amz-Signature value must be hex");
+            char::from_digit(15 - v, 16).expect("complement of a hex digit is a hex digit")
         })
         .collect();
     assert_ne!(sig, tampered, "tamper must actually change the signature hex");
@@ -157,7 +157,6 @@ async fn setup(env: &mut RustFSTestEnvironment) -> Result<(), Box<dyn std::error
 /// stored bytes. Without this, every negative assertion could pass for the
 /// wrong reason (a server that rejects all presigned URLs).
 #[tokio::test]
-#[serial]
 async fn valid_presigned_get_succeeds() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;
@@ -182,7 +181,6 @@ async fn valid_presigned_get_succeeds() -> Result<(), Box<dyn std::error::Error 
 /// Positive control (PUT): a valid presigned PUT must store the object, which we
 /// verify with a follow-up authenticated HEAD.
 #[tokio::test]
-#[serial]
 async fn valid_presigned_put_succeeds() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;
@@ -211,7 +209,6 @@ async fn valid_presigned_put_succeeds() -> Result<(), Box<dyn std::error::Error 
 /// ("Request has expired"). s3s checks expiry BEFORE the signature, so the
 /// signature here is otherwise valid — only the elapsed window is at fault.
 #[tokio::test]
-#[serial]
 async fn expired_presigned_get_is_rejected() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;
@@ -236,7 +233,6 @@ async fn expired_presigned_get_is_rejected() -> Result<(), Box<dyn std::error::E
 /// (b) Tampering the `X-Amz-Signature` query value must be rejected with 403 /
 /// SignatureDoesNotMatch.
 #[tokio::test]
-#[serial]
 async fn tampered_signature_returns_signature_does_not_match() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;
@@ -262,7 +258,6 @@ async fn tampered_signature_returns_signature_does_not_match() -> Result<(), Box
 /// (c) A presigned URL generated with the WRONG secret (but the real access key
 /// id) must be rejected with 403 / SignatureDoesNotMatch.
 #[tokio::test]
-#[serial]
 async fn wrong_secret_key_returns_signature_does_not_match() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;
@@ -290,7 +285,6 @@ async fn wrong_secret_key_returns_signature_does_not_match() -> Result<(), Box<d
 /// check runs during auth, before any object lookup, so the swapped key need
 /// not even exist.
 #[tokio::test]
-#[serial]
 async fn tampered_target_key_returns_signature_does_not_match() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;
@@ -325,7 +319,6 @@ async fn tampered_target_key_returns_signature_does_not_match() -> Result<(), Bo
 /// (e / acceptance 4 negative half) Tampering the signature of a presigned PUT
 /// must be rejected with 403 / SignatureDoesNotMatch — the write must not land.
 #[tokio::test]
-#[serial]
 async fn tampered_presigned_put_returns_signature_does_not_match() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;
@@ -348,7 +341,18 @@ async fn tampered_presigned_put_returns_signature_does_not_match() -> Result<(),
     assert_error_code(&body, "SignatureDoesNotMatch");
 
     // The rejected write must not have created the object.
-    let head = env.create_s3_client().head_object().bucket(BUCKET).key(key).send().await;
-    assert!(head.is_err(), "tampered presigned PUT must not store the object");
+    let error = env
+        .create_s3_client()
+        .head_object()
+        .bucket(BUCKET)
+        .key(key)
+        .send()
+        .await
+        .expect_err("tampered presigned PUT must not store the object");
+    assert_eq!(
+        error.raw_response().map(|response| response.status().as_u16()),
+        Some(404),
+        "tampered presigned PUT absence probe must return HTTP 404, got {error:?}"
+    );
     Ok(())
 }

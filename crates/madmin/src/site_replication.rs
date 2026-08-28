@@ -21,6 +21,15 @@ use time::OffsetDateTime;
 
 pub const SITE_REPL_API_VERSION: &str = "1";
 
+/// `SRIAMItem` type for replicated STS credentials, matching MinIO madmin-go
+/// `SRIAMItemSTSAcc`. MinIO peers reject any other value as an invalid request.
+pub const SR_IAM_ITEM_STS_ACC: &str = "sts-account";
+
+/// STS item type emitted by RustFS releases prior to the MinIO alignment.
+/// Never emitted anymore, but accepted inbound permanently so mixed-version
+/// RustFS sites keep replicating STS credentials during rolling upgrades.
+pub const SR_IAM_ITEM_STS_ACC_LEGACY: &str = "sts-credential";
+
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct PeerSite {
     #[serde(default)]
@@ -74,6 +83,16 @@ pub struct SiteReplicationInfo {
     pub service_account_access_key: String,
     #[serde(rename = "apiVersion", skip_serializing_if = "Option::is_none")]
     pub api_version: Option<String>,
+    /// Outstanding peer deliveries. Absent when the retry queue is empty, so a
+    /// healthy site serializes exactly as it did before this field existed.
+    /// Present means peer operations are failing even if `enabled` is true.
+    #[serde(rename = "retryStats", default, skip_serializing_if = "Option::is_none")]
+    pub retry_stats: Option<SRRetryStats>,
+    /// A multi-step lifecycle operation this site has not finished — most
+    /// importantly a removal that could not reach its peers, which makes the
+    /// site reject peer operations while `enabled` may still read true.
+    #[serde(rename = "pendingOperation", default, skip_serializing_if = "Option::is_none")]
+    pub pending_operation: Option<SRPendingOperation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -162,8 +181,12 @@ impl fmt::Debug for PeerInfo {
 pub struct SRPolicyMapping {
     #[serde(rename = "userOrGroup", default)]
     pub user_or_group: String,
+    /// MinIO IAMUserType wire value (cmd/iam.go): unknown = -1, regUser = 0,
+    /// stsUser = 1, svcUser = 2. Signed because MinIO sends -1 for group
+    /// mappings. This is NOT the RustFS-internal `UserType` encoding; translate
+    /// at the boundary with `rustfs_iam::store::{sr_wire_user_type, user_type_from_sr_wire}`.
     #[serde(rename = "userType", default)]
-    pub user_type: u64,
+    pub user_type: i64,
     #[serde(rename = "isGroup", default)]
     pub is_group: bool,
     #[serde(default)]
@@ -245,7 +268,7 @@ pub struct SRLDAPUser {
     pub api_version: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SRIAMUser {
     #[serde(rename = "accessKey", default)]
     pub access_key: String,
@@ -257,7 +280,7 @@ pub struct SRIAMUser {
     pub api_version: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SRGroupInfo {
     #[serde(rename = "updateReq", default)]
     pub update_req: GroupAddRemove,
@@ -321,8 +344,10 @@ pub struct SRSvcAccChange {
 pub struct SRCredInfo {
     #[serde(rename = "accessKey", default)]
     pub access_key: String,
+    /// MinIO IAMUserType wire value (same table as `SRPolicyMapping::user_type`);
+    /// signed because MinIO's unknown is -1.
     #[serde(rename = "iamUserType", default)]
-    pub iam_user_type: u64,
+    pub iam_user_type: i64,
     #[serde(rename = "isDeleteReq", default)]
     pub is_delete_req: bool,
     #[serde(rename = "userIdentityJSON", default, skip_serializing_if = "Option::is_none")]
@@ -331,7 +356,7 @@ pub struct SRCredInfo {
     pub api_version: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SRIAMItem {
     #[serde(default)]
     pub r#type: String,
@@ -406,6 +431,12 @@ pub struct SRBucketMeta {
     pub cors: Option<String>,
     #[serde(rename = "apiVersion", skip_serializing_if = "Option::is_none")]
     pub api_version: Option<String>,
+    /// Set by a sender that merges replication configs under the derived
+    /// site-rule contract (operator rule priorities verbatim, `site-repl-*`
+    /// ids classified by id/ARN). A receiver merges a payload without it the
+    /// pre-contract way; a pre-contract receiver ignores the field.
+    #[serde(rename = "derivedRuleContract", default, skip_serializing_if = "std::ops::Not::not")]
+    pub derived_rule_contract: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -626,7 +657,11 @@ pub struct ILMExpiryRule {
 pub struct SRStateInfo {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_default",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub peers: BTreeMap<String, PeerInfo>,
     #[serde(
         rename = "updatedAt",
@@ -639,31 +674,87 @@ pub struct SRStateInfo {
     pub api_version: Option<String>,
 }
 
+// madmin-go's SRInfo top-level fields carry no json tags (except APIVersion),
+// so MinIO emits them in PascalCase; the aliases below accept that on
+// deserialization while serialization stays camelCase. Nested structs
+// (SRBucketInfo, SRStateInfo, ...) do have lowercase tags in madmin-go —
+// do not spread aliases to them.
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct SRInfo {
-    #[serde(default)]
+    #[serde(alias = "Enabled", default)]
     pub enabled: bool,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(alias = "Name", default, skip_serializing_if = "String::is_empty")]
     pub name: String,
-    #[serde(rename = "deploymentID", default, skip_serializing_if = "String::is_empty")]
+    #[serde(
+        rename = "deploymentID",
+        alias = "DeploymentID",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
     pub deployment_id: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        alias = "Buckets",
+        default,
+        deserialize_with = "deserialize_null_default",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub buckets: BTreeMap<String, SRBucketInfo>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        alias = "Policies",
+        default,
+        deserialize_with = "deserialize_null_default",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub policies: BTreeMap<String, SRIAMPolicy>,
-    #[serde(rename = "userPolicies", default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        rename = "userPolicies",
+        alias = "UserPolicies",
+        default,
+        deserialize_with = "deserialize_null_default",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub user_policies: BTreeMap<String, SRPolicyMapping>,
-    #[serde(rename = "userInfoMap", default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        rename = "userInfoMap",
+        alias = "UserInfoMap",
+        default,
+        deserialize_with = "deserialize_null_default",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub user_info_map: BTreeMap<String, UserInfo>,
-    #[serde(rename = "groupDescMap", default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        rename = "groupDescMap",
+        alias = "GroupDescMap",
+        default,
+        deserialize_with = "deserialize_null_default",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub group_desc_map: BTreeMap<String, GroupDesc>,
-    #[serde(rename = "groupPolicies", default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        rename = "groupPolicies",
+        alias = "GroupPolicies",
+        default,
+        deserialize_with = "deserialize_null_default",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub group_policies: BTreeMap<String, SRPolicyMapping>,
-    #[serde(rename = "replicationCfg", default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        rename = "replicationCfg",
+        alias = "ReplicationCfg",
+        default,
+        deserialize_with = "deserialize_null_default",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub replication_cfg: BTreeMap<String, Value>,
-    #[serde(rename = "ilmExpiryRules", default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        rename = "ilmExpiryRules",
+        alias = "ILMExpiryRules",
+        default,
+        deserialize_with = "deserialize_null_default",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub ilm_expiry_rules: BTreeMap<String, ILMExpiryRule>,
-    #[serde(default)]
+    #[serde(alias = "State", default, deserialize_with = "deserialize_null_default")]
     pub state: SRStateInfo,
     #[serde(rename = "apiVersion", skip_serializing_if = "Option::is_none")]
     pub api_version: Option<String>,
@@ -1153,6 +1244,16 @@ where
     Ok(Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+// Go json.Marshal emits nil maps (and nil struct pointers) as null; treat
+// explicit null like a missing field so MinIO SRInfo payloads parse.
+fn deserialize_null_default<'de, T, D>(deserializer: D) -> Result<T, D::Error>
+where
+    T: Deserialize<'de> + Default,
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SRStateEditReq {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -1320,7 +1421,7 @@ pub struct SiteNetPerfResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{PeerInfo, PeerSite, SRResyncOpStatus};
+    use super::{PeerInfo, PeerSite, SRCredInfo, SRInfo, SRPolicyMapping, SRResyncOpStatus};
     use serde_json::{Value, json};
 
     const TEST_CA_CERT: &str = "-----BEGIN CERTIFICATE-----\ntest-ca\n-----END CERTIFICATE-----";
@@ -1421,6 +1522,35 @@ mod tests {
         assert!(peer_debug.contains("has_custom_ca: true"));
     }
 
+    /// MinIO IAMUserType wire semantics (cmd/iam.go): unknown = -1,
+    /// regUser = 0, stsUser = 1, svcUser = 2. MinIO group policy mappings
+    /// arrive with `userType: -1`; the wire field must accept negatives.
+    #[test]
+    fn sr_policy_mapping_accepts_minio_negative_user_type() {
+        let mapping: SRPolicyMapping = serde_json::from_value(json!({
+            "userOrGroup": "devs",
+            "userType": -1,
+            "isGroup": true,
+            "policy": "readwrite"
+        }))
+        .expect("MinIO group mapping with userType -1 must deserialize");
+        assert_eq!(mapping.user_type, -1);
+        assert!(mapping.is_group);
+        assert_eq!(mapping.policy, "readwrite");
+    }
+
+    /// Same IAMUserType family as SRPolicyMapping: MinIO may send -1 (unknown).
+    #[test]
+    fn sr_cred_info_accepts_minio_negative_iam_user_type() {
+        let cred: SRCredInfo = serde_json::from_value(json!({
+            "accessKey": "replicated-user",
+            "iamUserType": -1
+        }))
+        .expect("SRCredInfo with iamUserType -1 must deserialize");
+        assert_eq!(cred.iam_user_type, -1);
+        assert_eq!(cred.access_key, "replicated-user");
+    }
+
     #[test]
     fn resync_status_legacy_json_defaults_new_lifecycle_fields() {
         let legacy_json = json!({
@@ -1509,5 +1639,186 @@ mod tests {
             serde_json::to_value(status).expect("expanded resync status should serialize"),
             status_json
         );
+    }
+
+    /// Mirrors `json.Marshal(madmin.SRInfo{...})` output from MinIO: the
+    /// madmin-go SRInfo top-level fields carry no json tags (except
+    /// APIVersion), so Go emits them in PascalCase, while every nested
+    /// struct has lowercase tags.
+    fn minio_pascal_case_sr_info_json() -> Value {
+        json!({
+            "Enabled": true,
+            "Name": "site-minio",
+            "DeploymentID": "minio-deploy-1",
+            "Buckets": {
+                "photos": {
+                    "bucket": "photos",
+                    "versioningConfig": "PHZlcnNpb25pbmcvPg=="
+                }
+            },
+            "Policies": {
+                "readonly": {
+                    "policy": { "Version": "2012-10-17" },
+                    "updatedAt": "2026-07-22T01:00:00Z"
+                }
+            },
+            "UserPolicies": {
+                "alice": {
+                    "userOrGroup": "alice",
+                    "userType": 1,
+                    "isGroup": false,
+                    "policy": "readonly"
+                }
+            },
+            "UserInfoMap": {
+                "alice": {
+                    "status": "enabled",
+                    "updatedAt": "2026-07-22T01:00:00Z"
+                }
+            },
+            "GroupDescMap": {
+                "devs": {
+                    "name": "devs",
+                    "status": "enabled",
+                    "members": ["alice"],
+                    "policy": "readonly",
+                    "updatedAt": "2026-07-22T01:00:00Z"
+                }
+            },
+            "GroupPolicies": {
+                "devs": {
+                    "userOrGroup": "devs",
+                    "userType": 0,
+                    "isGroup": true,
+                    "policy": "readonly"
+                }
+            },
+            "ReplicationCfg": {
+                "photos": { "role": "arn:minio:replication::minio-deploy-1:photos" }
+            },
+            "ILMExpiryRules": {
+                "rule-1": {
+                    "ilm-rule": "PFJ1bGUvPg==",
+                    "bucket": "photos"
+                }
+            },
+            "State": {
+                "name": "site-minio",
+                "peers": {
+                    "minio-deploy-1": {
+                        "endpoint": "https://minio.example.com",
+                        "name": "site-minio",
+                        "deploymentID": "minio-deploy-1"
+                    }
+                },
+                "updatedAt": "2026-07-22T01:00:00Z"
+            },
+            "apiVersion": "1"
+        })
+    }
+
+    #[test]
+    fn sr_info_deserializes_minio_pascal_case_top_level_fields() {
+        let info: SRInfo =
+            serde_json::from_value(minio_pascal_case_sr_info_json()).expect("MinIO PascalCase SRInfo JSON should deserialize");
+
+        assert!(info.enabled, "Enabled must map to enabled");
+        assert_eq!(info.name, "site-minio");
+        assert_eq!(info.deployment_id, "minio-deploy-1", "DeploymentID must map to deployment_id");
+        assert!(info.buckets.contains_key("photos"), "Buckets must map to buckets");
+        assert!(info.policies.contains_key("readonly"), "Policies must map to policies");
+        assert!(info.user_policies.contains_key("alice"), "UserPolicies must map to user_policies");
+        assert!(info.user_info_map.contains_key("alice"), "UserInfoMap must map to user_info_map");
+        assert!(info.group_desc_map.contains_key("devs"), "GroupDescMap must map to group_desc_map");
+        assert!(info.group_policies.contains_key("devs"), "GroupPolicies must map to group_policies");
+        assert!(info.replication_cfg.contains_key("photos"), "ReplicationCfg must map to replication_cfg");
+        assert!(
+            info.ilm_expiry_rules.contains_key("rule-1"),
+            "ILMExpiryRules must map to ilm_expiry_rules"
+        );
+        assert!(
+            info.state.peers.contains_key("minio-deploy-1"),
+            "State must map to state with populated peers"
+        );
+    }
+
+    #[test]
+    fn sr_info_deserializes_minio_nil_maps_as_empty() {
+        // Go json.Marshal emits nil maps as null; an SR-unconfigured MinIO
+        // site reports SRInfo with every map nil.
+        let nil_map_json = json!({
+            "Enabled": false,
+            "Name": "site-minio",
+            "DeploymentID": "minio-deploy-1",
+            "Buckets": null,
+            "Policies": null,
+            "UserPolicies": null,
+            "UserInfoMap": null,
+            "GroupDescMap": null,
+            "GroupPolicies": null,
+            "ReplicationCfg": null,
+            "ILMExpiryRules": null,
+            "State": null,
+            "apiVersion": "1"
+        });
+
+        let info: SRInfo = serde_json::from_value(nil_map_json).expect("MinIO nil-map SRInfo JSON should deserialize");
+
+        assert!(!info.enabled);
+        assert_eq!(info.deployment_id, "minio-deploy-1");
+        assert!(info.buckets.is_empty());
+        assert!(info.policies.is_empty());
+        assert!(info.user_policies.is_empty());
+        assert!(info.user_info_map.is_empty());
+        assert!(info.group_desc_map.is_empty());
+        assert!(info.group_policies.is_empty());
+        assert!(info.replication_cfg.is_empty());
+        assert!(info.ilm_expiry_rules.is_empty());
+        assert!(info.state.peers.is_empty());
+
+        // Go's zero-value SRStateInfo serializes as an object whose nil
+        // peers map is null, not as a null State.
+        let nil_peers_json = json!({
+            "Enabled": false,
+            "DeploymentID": "minio-deploy-1",
+            "State": { "name": "", "peers": null }
+        });
+
+        let info: SRInfo = serde_json::from_value(nil_peers_json).expect("MinIO nil-peers SRInfo JSON should deserialize");
+
+        assert_eq!(info.deployment_id, "minio-deploy-1");
+        assert!(info.state.peers.is_empty());
+    }
+
+    #[test]
+    fn sr_info_serialization_stays_camel_case() {
+        let info: SRInfo =
+            serde_json::from_value(minio_pascal_case_sr_info_json()).expect("MinIO PascalCase SRInfo JSON should deserialize");
+
+        let value = serde_json::to_value(info).expect("SRInfo should serialize");
+        let object = value.as_object().expect("SRInfo JSON should be an object");
+
+        for camel_key in [
+            "enabled",
+            "name",
+            "deploymentID",
+            "buckets",
+            "policies",
+            "userPolicies",
+            "userInfoMap",
+            "groupDescMap",
+            "groupPolicies",
+            "replicationCfg",
+            "ilmExpiryRules",
+            "state",
+        ] {
+            assert!(object.contains_key(camel_key), "serialized SRInfo must keep camelCase key {camel_key}");
+        }
+        for pascal_key in ["Enabled", "Name", "DeploymentID", "Buckets", "State", "ILMExpiryRules"] {
+            assert!(
+                !object.contains_key(pascal_key),
+                "serialized SRInfo must not emit PascalCase key {pascal_key}"
+            );
+        }
     }
 }

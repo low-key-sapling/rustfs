@@ -45,6 +45,11 @@ logging-guardrails-check: ## Check logging guardrails for redaction and noise re
 	@echo "🪵 Checking logging guardrails..."
 	./scripts/check_logging_guardrails.sh
 
+.PHONY: error-other-ratchet-check
+error-other-ratchet-check: ## Check the ecstore ::other(format!) quorum-bucketing ratchet stays shrink-only
+	@echo "🪣 Checking error other(format!) ratchet..."
+	./scripts/check_error_other_format_ratchet.sh
+
 .PHONY: tokio-io-uring-check
 tokio-io-uring-check: ## Check tokio io-uring runtime feature stays removed
 	@echo "🚫 Checking tokio io-uring feature guard..."
@@ -60,10 +65,30 @@ body-cache-whitelist-check: ## Check the body-cache eligibility gate stays a fai
 	@echo "🧱 Checking body-cache whitelist guard..."
 	./scripts/check_body_cache_whitelist.sh
 
+.PHONY: s3s-footprint-check
+s3s-footprint-check: ## Check the s3s dependency footprint ratchet stays frozen
+	@echo "📦 Checking s3s footprint ratchet..."
+	./scripts/check_s3s_footprint.sh
+
 .PHONY: fips-wording-check
-fips-wording-check: ## Check outward docs do not make unsupported FIPS claims
-	@echo "📣 Checking FIPS wording guard..."
+fips-wording-check: ## Check docs and crates/kms do not over-claim crypto capabilities
+	@echo "📣 Checking cryptographic capability wording guard..."
 	./scripts/check_fips_wording.sh
+
+.PHONY: embedded-secrets-check
+embedded-secrets-check: ## Check no private key material or credential literal is committed
+	@echo "🔑 Checking embedded secret material guard..."
+	./scripts/check_embedded_secrets.sh
+
+.PHONY: offline-enrollment-e2e-check
+offline-enrollment-e2e-check: core-deps ## Build and exercise the dedicated offline enrollment E2E root
+	@echo "🔐 Checking the offline enrollment E2E root boundary..."
+	./scripts/check_offline_enrollment_e2e.sh
+
+.PHONY: test-wiring-check
+test-wiring-check: ## Check tests stay registered and selected by their intended runners
+	@echo "🧪 Checking test wiring..."
+	python3 ./scripts/check_test_wiring.py
 
 .PHONY: log-analyzer-rules-check
 log-analyzer-rules-check: core-deps ## Check log-analyzer rule anchors still exist verbatim in source

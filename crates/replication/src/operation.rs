@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use crate::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_TAGGING, SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER,
-    SUFFIX_REPLICATION_RESET_STATUS, get_header_metadata,
+    SUFFIX_REPLICATION_RESET_STATUS, SUFFIX_REPLICATION_STATUS, get_header_metadata, get_internal_metadata,
 };
 use s3s::dto::ReplicationConfiguration;
 use time::OffsetDateTime;
@@ -81,6 +81,33 @@ impl MustReplicateOptions {
 
     pub fn user_tags(&self) -> &str {
         self.meta.get(AMZ_OBJECT_TAGGING).map(String::as_str).unwrap_or_default()
+    }
+
+    pub fn metadata_target_is_eligible(&self, arn: &str) -> bool {
+        if !self.is_metadata_replication() {
+            return true;
+        }
+
+        // A REPLICA version was delivered by a peer and carries no per-target
+        // internal status of its own; whether its local metadata edits flow
+        // back is the replication rule's ReplicaModifications decision
+        // (`ReplicationConfig::replicate` with `replica = true`, MinIO
+        // mustReplicate parity). Gating it on a COMPLETED target state would
+        // silently drop every replica-side tag / retention / legal-hold edit in
+        // an active-active topology (rustfs/backlog#1953).
+        if self.replication_status() == ReplicationStatusType::Replica {
+            return true;
+        }
+
+        get_internal_metadata(&self.meta, SUFFIX_REPLICATION_STATUS)
+            .as_deref()
+            .and_then(|statuses| {
+                statuses.split(';').find_map(|entry| {
+                    let (target_arn, status) = entry.split_once('=')?;
+                    (target_arn == arn).then(|| ReplicationStatusType::from(status))
+                })
+            })
+            == Some(ReplicationStatusType::Completed)
     }
 }
 
@@ -308,7 +335,9 @@ mod tests {
         is_ssec_encrypted, resync_target_for_object, should_schedule_delete_replication,
         should_use_existing_delete_replication_info, should_use_existing_delete_replication_source,
     };
-    use crate::http::{AMZ_BUCKET_REPLICATION_STATUS, SSEC_ALGORITHM_HEADER};
+    use crate::http::{
+        AMZ_BUCKET_REPLICATION_STATUS, SSEC_ALGORITHM_HEADER, SUFFIX_REPLICATION_STATUS, insert_internal_metadata,
+    };
     use crate::storage_api::ObjectToDelete;
     use crate::{ReplicationStatusType, ReplicationType, VersionPurgeStatusType, target_reset_header};
     use s3s::dto::{
@@ -344,6 +373,36 @@ mod tests {
             .with_replication_status(ReplicationStatusType::Replica);
 
         assert_eq!(options.replication_status(), ReplicationStatusType::Replica);
+    }
+
+    #[test]
+    fn metadata_replication_requires_completed_target_state() {
+        let arn = "arn:rustfs:replication:target";
+        for status in ["PENDING", "FAILED"] {
+            let mut meta = HashMap::new();
+            insert_internal_metadata(&mut meta, SUFFIX_REPLICATION_STATUS, format!("{arn}={status};"));
+            let options = MustReplicateOptions::new(&meta, String::new(), ReplicationType::Metadata, false);
+
+            assert!(!options.metadata_target_is_eligible(arn));
+        }
+
+        let mut meta = HashMap::new();
+        insert_internal_metadata(&mut meta, SUFFIX_REPLICATION_STATUS, format!("{arn}=COMPLETED;"));
+        let options = MustReplicateOptions::new(&meta, String::new(), ReplicationType::Metadata, false);
+
+        assert!(options.metadata_target_is_eligible(arn));
+        assert!(!options.metadata_target_is_eligible("arn:rustfs:replication:missing"));
+
+        // A replica-side metadata edit (active-active) has no per-target
+        // internal status; eligibility is left to the ReplicaModifications rule.
+        let replica = MustReplicateOptions::new(&HashMap::new(), String::new(), ReplicationType::Metadata, false)
+            .with_replication_status(ReplicationStatusType::Replica);
+        assert!(replica.metadata_target_is_eligible(arn));
+        assert!(replica.metadata_target_is_eligible("arn:rustfs:replication:missing"));
+        assert!(
+            MustReplicateOptions::new(&HashMap::new(), String::new(), ReplicationType::Object, false)
+                .metadata_target_is_eligible(arn)
+        );
     }
 
     #[test]
@@ -592,6 +651,38 @@ mod tests {
         assert!(should_use_existing_delete_replication_info(true, false));
         assert!(!should_use_existing_delete_replication_info(true, true));
         assert!(!should_use_existing_delete_replication_info(false, false));
+    }
+
+    /// P1-20 truth-table pin (rustfs/backlog#1675): without any reset in play
+    /// (no per-target reset header on the object, empty reset id on the
+    /// target) the existing-object resync decision compensates exactly the
+    /// never-replicated objects — Empty replicates, any recorded status does
+    /// not.
+    #[test]
+    fn resync_target_without_reset_replicates_only_empty_status() {
+        let user_defined = HashMap::new();
+        let object = ReplicationResyncTargetObject {
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH + Duration::seconds(10)),
+            user_defined: &user_defined,
+        };
+
+        for (status, expected) in [
+            (ReplicationStatusType::Empty, true),
+            (ReplicationStatusType::Completed, false),
+            // "COMPLETE" on disk parses to this legacy variant, so objects
+            // written by older versions reach the decision through it.
+            (ReplicationStatusType::CompletedLegacy, false),
+            (ReplicationStatusType::Pending, false),
+            (ReplicationStatusType::Failed, false),
+            (ReplicationStatusType::Replica, false),
+        ] {
+            let label = format!("{status:?}");
+            let decision = resync_target_for_object(&object, "arn:target", "", None, status);
+            assert_eq!(
+                decision.replicate, expected,
+                "existing-object resync without a reset must replicate only never-replicated objects (status {label})"
+            );
+        }
     }
 
     #[test]

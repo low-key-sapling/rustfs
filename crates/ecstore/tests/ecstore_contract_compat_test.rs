@@ -14,8 +14,8 @@
 
 mod storage_api;
 
-use rustfs_common::heal_channel::HealOpts;
 use rustfs_filemeta::FileInfo;
+use rustfs_heal_contracts::heal_channel::HealOpts;
 use rustfs_lock::NamespaceLockWrapper;
 use rustfs_madmin::heal_commands::HealResultItem;
 use storage_api::contract_compat::{
@@ -155,6 +155,18 @@ fn ecstore_implements_storage_object_operations_contract() {
 #[test]
 fn ecstore_implements_storage_list_operations_contract() {
     assert!(storage_list_operations_type_name::<ECStore>().ends_with("::ECStore"));
+}
+
+#[test]
+fn ecstore_pools_expose_storage_list_operations_contract() {
+    fn assert_contract(store: &ECStore) {
+        let future = store.pools[0]
+            .clone()
+            .list_objects_v2("bucket", "", None, None, 1, false, None, false);
+        drop(future);
+    }
+
+    let _ = assert_contract;
 }
 
 #[test]

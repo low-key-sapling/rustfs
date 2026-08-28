@@ -55,10 +55,10 @@ hotpath.workspace = true
 rustfs-targets = { workspace = true }
 rustfs-config = { workspace = true, features = ["audit", "server-config-model"] }
 rustfs-s3-types = { workspace = true }
-chrono = { workspace = true, features = ["serde"] }
 const-str = { workspace = true, features = ["std", "proc"] }
 futures = { workspace = true }
 hashbrown = { workspace = true, features = ["serde", "rayon"] }
+jiff = { workspace = true, features = ["serde"] }
 metrics = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["raw_value"] }
@@ -67,7 +67,7 @@ tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread", "time",
 tracing = { workspace = true, features = ["std", "attributes"] }
 
 [dev-dependencies]
-async-trait = { workspace = true }
+rustfs-targets = { workspace = true, features = ["test-support"] }
 temp-env = { workspace = true }
 url = { workspace = true }
 

@@ -15,10 +15,9 @@
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
 use rustfs_data_usage::DataUsageInfo;
-use serial_test::serial;
 use tokio::time::{Duration, sleep};
 
-use crate::common::{RustFSTestEnvironment, TEST_BUCKET, awscurl_get, init_logging};
+use crate::common::{FAST_DATA_USAGE_SCANNER_ENV, RustFSTestEnvironment, TEST_BUCKET, awscurl_get, init_logging};
 
 async fn get_data_usage_info(env: &RustFSTestEnvironment) -> Result<DataUsageInfo, Box<dyn std::error::Error + Send + Sync>> {
     let url = format!("{}/rustfs/admin/v3/datausageinfo", env.url);
@@ -35,28 +34,36 @@ where
     F: FnMut(&DataUsageInfo) -> bool,
 {
     let mut last_usage = DataUsageInfo::default();
+    let mut last_query_error = None;
     for _ in 0..45 {
-        let usage = get_data_usage_info(env).await?;
-        if usage.buckets_usage.contains_key(bucket) && predicate(&usage) {
-            return Ok(usage);
+        match get_data_usage_info(env).await {
+            Ok(usage) => {
+                last_query_error = None;
+                if usage.buckets_usage.contains_key(bucket) && predicate(&usage) {
+                    return Ok(usage);
+                }
+                last_usage = usage;
+            }
+            Err(err) => last_query_error = Some(err.to_string()),
         }
-        last_usage = usage;
         sleep(Duration::from_secs(2)).await;
     }
 
-    Err(format!("bucket usage did not converge for {bucket}; last usage: {last_usage:?}").into())
+    Err(format!(
+        "bucket usage did not converge for {bucket}; last usage: {last_usage:?}; last query error: {}",
+        last_query_error.as_deref().unwrap_or("none")
+    )
+    .into())
 }
 
 /// Regression test for data usage accuracy (issue #1012).
 /// Launches rustfs, writes 1000 objects, then asserts admin data usage reports the full count.
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
-#[ignore = "Starts a rustfs server and requires awscurl; enable when running full E2E"]
 async fn data_usage_reports_all_objects() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    env.start_rustfs_server_with_env(vec![], FAST_DATA_USAGE_SCANNER_ENV).await?;
 
     let client = env.create_s3_client();
 
@@ -74,26 +81,24 @@ async fn data_usage_reports_all_objects() -> Result<(), Box<dyn std::error::Erro
             .await?;
     }
 
-    // Query admin data usage API
-    let usage = get_data_usage_info(&env).await?;
+    let usage = wait_for_bucket_usage(&env, TEST_BUCKET, |usage| {
+        usage
+            .buckets_usage
+            .get(TEST_BUCKET)
+            .map(|bucket_usage| usage.objects_total_count == 1000 && bucket_usage.objects_count == 1000)
+            .unwrap_or(false)
+    })
+    .await?;
 
-    // Assert total object count and per-bucket count are not truncated
+    // Assert total object count and per-bucket count are exact.
     let bucket_usage = usage
         .buckets_usage
         .get(TEST_BUCKET)
         .cloned()
         .expect("bucket usage should exist");
 
-    assert!(
-        usage.objects_total_count >= 1000,
-        "total object count should be at least 1000, got {}",
-        usage.objects_total_count
-    );
-    assert!(
-        bucket_usage.objects_count >= 1000,
-        "bucket object count should be at least 1000, got {}",
-        bucket_usage.objects_count
-    );
+    assert_eq!(usage.objects_total_count, 1000, "total object count should be exact");
+    assert_eq!(bucket_usage.objects_count, 1000, "bucket object count should be exact");
 
     env.stop_server();
     Ok(())
@@ -102,13 +107,11 @@ async fn data_usage_reports_all_objects() -> Result<(), Box<dyn std::error::Erro
 /// Regression test for issue #3898.
 /// Versioned buckets should expose versions and delete markers through admin data usage.
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
-#[ignore = "Starts a rustfs server and requires awscurl; enable when running full E2E"]
 async fn data_usage_reports_versioned_objects_and_delete_markers() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    env.start_rustfs_server_with_env(vec![], FAST_DATA_USAGE_SCANNER_ENV).await?;
 
     let client = env.create_s3_client();
     let bucket = "data-usage-versioned";
@@ -184,8 +187,8 @@ async fn data_usage_reports_versioned_objects_and_delete_markers() -> Result<(),
     assert_eq!(usage.versions_total_count, 3, "total version count should match bucket usage");
     assert_eq!(usage.delete_markers_total_count, 1, "total delete marker count should match bucket usage");
 
-    env.stop_server();
-    env.start_rustfs_server(vec![]).await?;
+    env.restart_server_preserving_data(vec![], FAST_DATA_USAGE_SCANNER_ENV)
+        .await?;
 
     let restarted_usage = wait_for_bucket_usage(&env, bucket, |usage| {
         usage

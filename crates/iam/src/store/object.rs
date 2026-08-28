@@ -28,7 +28,10 @@ use crate::{
 use futures::future::join_all;
 use rustfs_io_metrics::record_system_path_failure;
 use rustfs_policy::{auth::UserIdentity, policy::PolicyDoc};
-use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
+use rustfs_utils::{
+    MaskedAccessKey,
+    path::{SLASH_SEPARATOR, path_join_buf},
+};
 use serde::{Serialize, de::DeserializeOwned};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -194,6 +197,21 @@ fn split_path(s: &str, last_index: bool) -> (&str, &str) {
 /// and re-persisting them under the RustFS system bucket.
 pub fn try_decrypt_iam_blob(data: &[u8]) -> Option<Vec<u8>> {
     ObjectStore::decrypt_data_with_source(data).ok().map(|outcome| outcome.plain)
+}
+
+/// Encrypt a blob for at-rest storage using the IAM master key.
+///
+/// Shared with [`crate::mfa`], which stores TOTP secrets under the same key so
+/// there is one at-rest scheme for every credential-equivalent secret the IAM
+/// domain owns, and one key to rotate.
+pub(crate) fn encrypt_iam_blob(plain: &[u8]) -> Result<Vec<u8>> {
+    ObjectStore::encrypt_data_with_master_key(plain)
+}
+
+/// Decrypt a blob written by [`encrypt_iam_blob`], or read a legacy plaintext
+/// one, using the same key sources as the IAM load path.
+pub(crate) fn decrypt_iam_blob(data: &[u8]) -> Result<Vec<u8>> {
+    ObjectStore::decrypt_data_with_source(data).map(|outcome| outcome.plain)
 }
 
 #[derive(Clone)]
@@ -600,10 +618,10 @@ impl ObjectStore {
             .await
             .map_err(|err| {
                 if is_err_config_not_found(&err) {
-                    warn!(name, user_type = ?user_type, "IAM user identity missing");
+                    debug!(name = %MaskedAccessKey(name), user_type = ?user_type, "IAM user identity missing");
                     Error::NoSuchUser(name.to_owned())
                 } else {
-                    warn!(name, user_type = ?user_type, error = ?err, "IAM user identity load failed");
+                    warn!(name = %MaskedAccessKey(name), user_type = ?user_type, error = ?err, "IAM user identity load failed");
                     err
                 }
             })?;
@@ -611,7 +629,7 @@ impl ObjectStore {
         if u.credentials.is_expired() {
             let _ = self.delete_iam_config(get_user_identity_path(name, user_type)).await;
             let _ = self.delete_iam_config(get_mapped_policy_path(name, user_type, false)).await;
-            warn!(name, user_type = ?user_type, "IAM user identity expired and was removed");
+            warn!(name = %MaskedAccessKey(name), user_type = ?user_type, "IAM user identity expired and was removed");
             return Err(Error::NoSuchUser(name.to_owned()));
         }
 
@@ -635,7 +653,7 @@ impl ObjectStore {
                         let _ = self.delete_iam_config(get_user_identity_path(name, user_type)).await;
                         let _ = self.delete_iam_config(get_mapped_policy_path(name, user_type, false)).await;
                     }
-                    warn!(name, user_type = ?user_type, error = ?err, "IAM JWT claim extraction failed");
+                    warn!(name = %MaskedAccessKey(name), user_type = ?user_type, error = ?err, "IAM JWT claim extraction failed");
                     return Err(Error::NoSuchUser(name.to_owned()));
                 }
             }
@@ -873,13 +891,7 @@ impl Store for ObjectStore {
     async fn delete_user_identity(&self, name: &str, user_type: UserType) -> Result<()> {
         self.delete_iam_config(get_user_identity_path(name, user_type))
             .await
-            .map_err(|err| {
-                if is_err_config_not_found(&err) {
-                    Error::NoSuchPolicy
-                } else {
-                    err
-                }
-            })?;
+            .map_err(|err| map_delete_user_identity_error(name, err))?;
         Ok(())
     }
     async fn load_user_identity(&self, name: &str, user_type: UserType) -> Result<UserIdentity> {
@@ -1327,9 +1339,18 @@ impl Store for ObjectStore {
     }
 }
 
+fn map_delete_user_identity_error(name: &str, err: Error) -> Error {
+    if is_err_config_not_found(&err) {
+        Error::NoSuchUser(name.to_owned())
+    } else {
+        err
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DecryptSource, LoadMode, ObjectStore};
+    use super::{DecryptSource, LoadMode, ObjectStore, map_delete_user_identity_error};
+    use crate::error::Error;
     use crate::keyring;
     use rustfs_credentials::{Credentials, init_global_action_credentials};
     use serial_test::serial;
@@ -1350,6 +1371,12 @@ mod tests {
     fn test_locked_load_mode_keeps_namespace_locks() {
         assert!(!LoadMode::Locked.no_lock());
         assert!(!LoadMode::Locked.read_opts().no_lock);
+    }
+
+    #[test]
+    fn missing_user_identity_delete_maps_to_no_such_user() {
+        let err = map_delete_user_identity_error("missing-sts", Error::ConfigNotFound);
+        assert!(matches!(err, Error::NoSuchUser(name) if name == "missing-sts"));
     }
 
     fn test_cred() -> Credentials {

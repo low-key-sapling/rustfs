@@ -18,7 +18,7 @@ use crate::admin::runtime_sources::{current_action_credentials, object_store_fro
 use crate::admin::storage_api::bucket::versioning_sys::BucketVersioningSys;
 use crate::admin::storage_api::contract::admin::StorageAdminApi;
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
-use crate::admin::storage_api::data_usage::{apply_bucket_usage_memory_overlay, load_data_usage_from_backend_cached};
+use crate::admin::storage_api::data_usage::{apply_bucket_usage_memory_overlay, load_admin_data_usage_from_backend_cached};
 use crate::admin::storage_api::metadata_sys;
 use crate::auth::get_condition_values;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
@@ -42,7 +42,6 @@ fn map_data_usage_result<E>(result: Result<DataUsageInfo, E>) -> S3Result<DataUs
     result.map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, DATA_USAGE_LOAD_ERROR_MESSAGE))
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, Default)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct AccountInfo {
@@ -264,8 +263,9 @@ impl Operation for AccountInfoHandler {
         // process-local absolute counters to cluster-wide bucket totals.
         // This path never triggers a live full-version listing
         // (rustfs/backlog#1306); freshness is owned by the scanner.
-        let mut data_usage_info = map_data_usage_result(load_data_usage_from_backend_cached(store.clone()).await)?;
+        let mut data_usage_info = map_data_usage_result(load_admin_data_usage_from_backend_cached(store.clone()).await)?;
         apply_bucket_usage_memory_overlay(&mut data_usage_info).await;
+        account_info.usage_snapshot_converged = data_usage_info.usage_snapshot_converged;
 
         for bucket in buckets.iter() {
             let (rd, wr) = is_allow(bucket.name.clone()).await;

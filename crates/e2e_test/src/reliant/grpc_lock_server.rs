@@ -23,8 +23,9 @@ use rustfs_protos::{
     proto_gen::node_service::{
         BatchGenerallyLockRequest, BatchGenerallyLockResponse, BatchReadVersionRequest, BatchReadVersionResponse,
         GenerallyLockRequest, GenerallyLockResponse, GenerallyLockResult, PingRequest, PingResponse,
-        SnapshotLeaseMutationResponse, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest,
-        SnapshotLeaseResponse, node_service_server::NodeService,
+        ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseReleaseResponse, ScannerPublicationLeaseRequest,
+        ScannerPublicationLeaseResponse, SnapshotLeaseMutationResponse, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest,
+        SnapshotLeaseRequest, SnapshotLeaseResponse, node_service_server::NodeService,
     },
 };
 use std::pin::Pin;
@@ -123,6 +124,20 @@ impl NodeService for MinimalLockNodeService {
         &self,
         _request: Request<SnapshotLeaseReleaseRequest>,
     ) -> Result<Response<SnapshotLeaseMutationResponse>, Status> {
+        Err(Status::unimplemented("MinimalLockNodeService only supports lock RPCs"))
+    }
+
+    async fn acquire_scanner_publication_lease(
+        &self,
+        _request: Request<ScannerPublicationLeaseRequest>,
+    ) -> Result<Response<ScannerPublicationLeaseResponse>, Status> {
+        Err(Status::unimplemented("MinimalLockNodeService only supports lock RPCs"))
+    }
+
+    async fn release_scanner_publication_lease(
+        &self,
+        _request: Request<ScannerPublicationLeaseReleaseRequest>,
+    ) -> Result<Response<ScannerPublicationLeaseReleaseResponse>, Status> {
         Err(Status::unimplemented("MinimalLockNodeService only supports lock RPCs"))
     }
 
@@ -845,6 +860,13 @@ impl NodeService for MinimalLockNodeService {
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::BackgroundHealStatusRequest>,
     ) -> Result<Response<rustfs_protos::proto_gen::node_service::BackgroundHealStatusResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
+    async fn replacement_recovery_status(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::ReplacementRecoveryStatusRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::ReplacementRecoveryStatusResponse>, Status> {
         Err(Status::unimplemented("lock-only test server"))
     }
 

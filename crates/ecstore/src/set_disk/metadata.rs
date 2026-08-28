@@ -12,8 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::*;
+use super::{
+    Bytes, DATA_MOVEMENT_MULTIPART_PREFIX, DiskError, DiskStore, FileInfo, HashMap, HashSet, OBJECT_OP_IGNORED_ERRS, ObjProps,
+    OffsetDateTime, SetDisks, Sha256, TRANSITION_COMPLETE, Uuid, debug, disk, error, file_info_is_valid_for_metadata, hex,
+    reduce_read_quorum_errs, warn,
+};
+#[cfg(test)]
+use crate::disk::DiskOption;
+#[cfg(test)]
+use crate::disk::endpoint::Endpoint;
+#[cfg(test)]
+use crate::disk::new_disk;
 use rustfs_utils::http;
+use sha2::Digest;
 
 #[derive(Clone, Copy)]
 struct FileInfoIdentityGroup {
@@ -83,6 +94,15 @@ impl SetDisks {
             .unwrap_or_default();
 
         format!("{}/{}", Self::get_multipart_sha_dir(bucket, object), upload_uuid)
+    }
+
+    pub(super) fn get_multipart_upload_dir(bucket: &str, object: &str, upload_id: &str, data_movement: bool) -> String {
+        let upload_dir = Self::get_upload_id_dir(bucket, object, upload_id);
+        if data_movement {
+            format!("{DATA_MOVEMENT_MULTIPART_PREFIX}/{upload_dir}")
+        } else {
+            upload_dir
+        }
     }
 
     pub(super) fn get_multipart_sha_dir(bucket: &str, object: &str) -> String {
@@ -250,14 +270,26 @@ impl SetDisks {
                 continue;
             }
 
+            // A parity count outside [0, total_shards] cannot describe a real
+            // layout on this set: it comes from corrupt or foreign metadata
+            // (e.g. stray leftovers, rustfs#5801). Treat the entry as invalid
+            // instead of clamping to i32::MAX, which would poison
+            // `common_parity`'s occurrence counting.
+            let erasure_parity = i32::try_from(metadata.erasure.parity_blocks).unwrap_or(-1);
+            let erasure_parity = if (0..=total_shards_i32).contains(&erasure_parity) {
+                erasure_parity
+            } else {
+                -1
+            };
             if metadata.is_canonical_delete_marker() || metadata.size == 0 {
                 parities[index] = half;
+            } else if erasure_parity < 0 {
+                parities[index] = -1;
             } else if metadata.transition_status == TRANSITION_COMPLETE {
                 let majority_metadata_parity = total_shards_i32 - (half + 1);
-                let erasure_parity = i32::try_from(metadata.erasure.parity_blocks).unwrap_or(i32::MAX);
                 parities[index] = majority_metadata_parity.max(erasure_parity);
             } else {
-                parities[index] = i32::try_from(metadata.erasure.parity_blocks).unwrap_or(i32::MAX);
+                parities[index] = erasure_parity;
             }
         }
         parities
@@ -294,6 +326,19 @@ impl SetDisks {
         let parity_blocks = Self::common_parity(&parities, default_parity_count as i32);
 
         if parity_blocks < 0 {
+            // No parity value reached read quorum. Distinguish two cases:
+            // enough disks answered with valid-looking metadata that simply
+            // cannot be reconciled (corrupt/foreign entries — retrying cannot
+            // help, and heal should see Corrupt, rustfs#5801) versus too few
+            // healthy answers (a genuine quorum condition where retry may
+            // succeed once disks recover).
+            let healthy_replies = errs.iter().filter(|err| err.is_none()).count();
+            if healthy_replies >= expected_rquorum {
+                error!(
+                    "object_quorum_from_meta: irreconcilable parity across {healthy_replies} healthy replies (corrupt metadata), errs={errs:?}"
+                );
+                return Err(DiskError::FileCorrupt);
+            }
             error!("object_quorum_from_meta: parity_blocks < 0, errs={:?}", errs);
             return Err(DiskError::ErasureReadQuorum);
         }
@@ -441,6 +486,28 @@ impl SetDisks {
         Self::find_file_info_in_quorum(metas, &mod_time, &etag, quorum)
     }
 
+    pub(crate) fn hydrate_selected_fileinfo_part_checksums(fi: &mut FileInfo) -> disk::error::Result<()> {
+        fi.hydrate_data_movement_part_checksums().map_err(DiskError::from)?;
+        for part in &fi.parts {
+            let Some(checksums) = part.checksums.as_ref() else {
+                continue;
+            };
+            let mut algorithms = HashSet::with_capacity(checksums.len());
+            for (name, value) in checksums {
+                let Some(checksum) = rustfs_rio::Checksum::new_from_string(name, value) else {
+                    return Err(DiskError::FileCorrupt);
+                };
+                if checksum.checksum_type.is(rustfs_rio::ChecksumType::MULTIPART) {
+                    return Err(DiskError::FileCorrupt);
+                }
+                if !algorithms.insert(checksum.checksum_type.base().0) {
+                    return Err(DiskError::FileCorrupt);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn update_hash_bytes(hasher: &mut Sha256, value: &[u8]) {
         hasher.update(value.len().to_le_bytes());
         hasher.update(value);
@@ -508,18 +575,12 @@ impl SetDisks {
         meta.metadata.keys().any(|name| http::is_object_encryption_marker(name))
     }
 
-    fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
-        value
-            .get(..prefix.len())
-            .is_some_and(|value_prefix| value_prefix.eq_ignore_ascii_case(prefix))
-    }
-
     fn internal_metadata_suffix(name: &str) -> Option<&str> {
         name.get(http::RUSTFS_INTERNAL_PREFIX.len()..)
-            .filter(|_| Self::starts_with_ignore_ascii_case(name, http::RUSTFS_INTERNAL_PREFIX))
+            .filter(|_| http::starts_with_ignore_ascii_case(name, http::RUSTFS_INTERNAL_PREFIX))
             .or_else(|| {
                 name.get(http::MINIO_INTERNAL_PREFIX.len()..)
-                    .filter(|_| Self::starts_with_ignore_ascii_case(name, http::MINIO_INTERNAL_PREFIX))
+                    .filter(|_| http::starts_with_ignore_ascii_case(name, http::MINIO_INTERNAL_PREFIX))
             })
     }
 
@@ -537,7 +598,9 @@ impl SetDisks {
             || suffix.eq_ignore_ascii_case(http::SUFFIX_REPLICATION_STATUS)
             || suffix.eq_ignore_ascii_case(http::SUFFIX_REPLICATION_TIMESTAMP)
             || suffix.eq_ignore_ascii_case(http::SUFFIX_PURGESTATUS)
-            || Self::starts_with_ignore_ascii_case(suffix, http::SUFFIX_REPLICATION_RESET_ARN_PREFIX)
+            || http::starts_with_ignore_ascii_case(suffix, http::SUFFIX_REPLICATION_RESET_ARN_PREFIX)
+            // Raw compatibility keys are normalized and hashed separately below.
+            || http::starts_with_ignore_ascii_case(suffix, http::SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX)
     }
 
     fn update_hash_quorum_metadata_map(hasher: &mut Sha256, entries: &HashMap<String, String>) {
@@ -553,13 +616,29 @@ impl SetDisks {
         }
     }
 
-    pub(super) fn file_info_quorum_hash(meta: &FileInfo) -> [u8; 32] {
+    pub(crate) fn file_info_quorum_hash(meta: &FileInfo) -> [u8; 32] {
         let mut hasher = Sha256::new();
         Self::update_file_info_quorum_hash(&mut hasher, meta);
         let digest = hasher.finalize();
         let mut key = [0u8; 32];
         key.copy_from_slice(digest.as_slice());
         key
+    }
+
+    /// Hash the per-target delete-marker versions through their normalized form
+    /// so the dual internal prefixes carrying the same mapping share one
+    /// identity, while a genuine disagreement between disks still changes the
+    /// hash and surfaces as a quorum difference.
+    fn update_hash_target_delete_marker_versions(hasher: &mut Sha256, metadata: &HashMap<String, String>) {
+        let (versions, corrupt) = http::target_delete_marker_versions(metadata);
+        hasher.update([u8::from(corrupt)]);
+        let mut versions = versions.iter().collect::<Vec<_>>();
+        versions.sort_by(|left, right| left.0.cmp(right.0));
+        hasher.update(versions.len().to_le_bytes());
+        for (arn, version_id) in versions {
+            Self::update_hash_str(hasher, arn);
+            Self::update_hash_str(hasher, version_id);
+        }
     }
 
     fn update_file_info_quorum_hash(hasher: &mut Sha256, meta: &FileInfo) {
@@ -592,6 +671,7 @@ impl SetDisks {
         Self::update_hash_optional_bytes(hasher, meta.checksum.as_ref());
 
         Self::update_hash_quorum_metadata_map(hasher, &meta.metadata);
+        Self::update_hash_target_delete_marker_versions(hasher, &meta.metadata);
 
         hasher.update(meta.parts.len().to_le_bytes());
         for part in meta.parts.iter() {
@@ -1035,6 +1115,25 @@ impl SetDisks {
         shuffled_disks
     }
 
+    pub(super) fn shuffle_disks_owned(mut disks: Vec<Option<DiskStore>>, distribution: &[usize]) -> Vec<Option<DiskStore>> {
+        if distribution.is_empty() {
+            return disks;
+        }
+
+        let mut shuffled_disks = vec![None; disks.len()];
+        for (index, disk) in disks.iter_mut().enumerate() {
+            let Some(slot) = distribution
+                .get(index)
+                .and_then(|block_index| block_index.checked_sub(1))
+                .filter(|slot| *slot < shuffled_disks.len())
+            else {
+                continue;
+            };
+            shuffled_disks[slot] = disk.take();
+        }
+        shuffled_disks
+    }
+
     pub(super) fn shuffle_check_parts(parts_errs: &[usize], distribution: &[usize]) -> Vec<usize> {
         if distribution.is_empty() {
             return parts_errs.to_vec();
@@ -1117,7 +1216,9 @@ mod tests {
         let invalid = vec![FileInfo::default(); 4];
         let err = SetDisks::object_quorum_from_meta(&invalid, &vec![None; 4], 2)
             .expect_err("invalid metadata without a common parity must fail closed");
-        assert_eq!(err, DiskError::ErasureReadQuorum);
+        // A full set of healthy replies whose metadata cannot be reconciled is
+        // corrupt (heal-actionable), not a retryable quorum outage (rustfs#5801).
+        assert_eq!(err, DiskError::FileCorrupt);
     }
 
     #[test]
@@ -1344,6 +1445,23 @@ mod tests {
         assert_eq!(owned_slots, expected_slots, "fallback disk slots must match the borrowing variant");
     }
 
+    #[tokio::test]
+    async fn owned_shuffle_preserves_fresh_put_metadata() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let fi = FileInfo::new("bucket/object", 2, 1);
+        let parts = vec![fi.clone(); fi.erasure.distribution.len()];
+        let disks = shuffle_test_disks(&tempdir, parts.len()).await;
+
+        let (owned_disks, owned_parts) = SetDisks::shuffle_disks_and_parts_metadata_by_index_owned(disks, parts, &fi);
+
+        assert!(owned_disks.iter().all(Option::is_some), "fresh PUT must retain every online disk");
+        assert_eq!(
+            owned_parts,
+            vec![fi; owned_disks.len()],
+            "fresh PUT metadata with pending shard indexes must survive init fallback"
+        );
+    }
+
     // backlog#949: corrupt/adversarial distribution values (0 or > N) must not
     // trigger a `usize` underflow / out-of-bounds panic in the shuffle helpers.
     #[test]
@@ -1371,6 +1489,22 @@ mod tests {
         // distribution[0] = 0 underflows; distribution[1] = 9 is out of range.
         let result = SetDisks::shuffle_disks(&disks, &[0, 9, 3, 4]);
         assert_eq!(result.len(), disks.len(), "output length must be preserved");
+    }
+
+    #[tokio::test]
+    async fn owned_disk_shuffle_matches_borrowing_variant() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let mut disks = shuffle_test_disks(&tempdir, 4).await;
+        disks[1] = None;
+        disks[3] = None;
+        let distribution = [3, 1, 4, 2];
+
+        let expected = SetDisks::shuffle_disks(&disks, &distribution);
+        let actual = SetDisks::shuffle_disks_owned(disks, &distribution);
+
+        let expected_slots = expected.iter().map(Option::is_some).collect::<Vec<_>>();
+        let actual_slots = actual.iter().map(Option::is_some).collect::<Vec<_>>();
+        assert_eq!(actual_slots, expected_slots, "owned shuffle must preserve disk placement");
     }
 
     #[tokio::test]
@@ -1413,5 +1547,126 @@ mod tests {
         let (fallback_disks, fallback_parts) = SetDisks::shuffle_disks_and_parts_metadata(&disks, &parts, &fi);
         assert!(fallback_disks.iter().any(Option::is_none));
         assert!(fallback_parts.iter().any(|part| !part.is_valid()));
+    }
+
+    #[test]
+    fn target_delete_marker_version_metadata_is_included_in_quorum_hash() {
+        let suffix = "replication-delete-marker-version-arn:rustfs:replication::target:bucket";
+        assert!(SetDisks::is_replication_quorum_metadata_key(&format!(
+            "{}{}",
+            http::RUSTFS_INTERNAL_PREFIX,
+            suffix
+        )));
+        assert!(SetDisks::is_replication_quorum_metadata_key(&format!(
+            "{}{}",
+            http::MINIO_INTERNAL_PREFIX,
+            suffix
+        )));
+        assert!(!SetDisks::is_replication_quorum_metadata_key("x-rustfs-internal-unrelated"));
+
+        let mut left = metadata_quorum_test_fileinfo(OffsetDateTime::now_utc(), 1);
+        let mut right = left.clone();
+        left.metadata
+            .insert(format!("{}{}", http::RUSTFS_INTERNAL_PREFIX, suffix), "target-version-a".to_string());
+        right
+            .metadata
+            .insert(format!("{}{}", http::MINIO_INTERNAL_PREFIX, suffix), "target-version-b".to_string());
+        assert_ne!(SetDisks::file_info_quorum_hash(&left), SetDisks::file_info_quorum_hash(&right));
+
+        let mut dual_prefixed = left.clone();
+        dual_prefixed
+            .metadata
+            .insert(format!("{}{}", http::MINIO_INTERNAL_PREFIX, suffix), "target-version-a".to_string());
+        assert_eq!(
+            SetDisks::file_info_quorum_hash(&left),
+            SetDisks::file_info_quorum_hash(&dual_prefixed),
+            "compatible prefixes carrying the same mapping must share one identity"
+        );
+    }
+
+    /// Guards the switch to `rustfs_utils::http::starts_with_ignore_ascii_case`:
+    /// internal prefixes must keep matching case-insensitively, and keys shorter
+    /// than the prefix must keep being rejected. Misclassifying either way leaks
+    /// internal metadata into the quorum hash (or drops it out of it).
+    #[test]
+    fn internal_metadata_suffix_is_prefix_case_insensitive_and_rejects_short_keys() {
+        assert_eq!(
+            SetDisks::internal_metadata_suffix("X-RustFS-Internal-Replica-Status"),
+            Some("Replica-Status"),
+            "mixed-case RustFS prefix must match and preserve the suffix casing"
+        );
+        assert_eq!(
+            SetDisks::internal_metadata_suffix("X-MINIO-INTERNAL-replica-status"),
+            Some("replica-status"),
+            "mixed-case MinIO prefix must match"
+        );
+        assert_eq!(SetDisks::internal_metadata_suffix(http::RUSTFS_INTERNAL_PREFIX), Some(""));
+
+        // Keys shorter than either prefix, and non-internal keys, stay unmatched.
+        assert_eq!(SetDisks::internal_metadata_suffix(""), None);
+        assert_eq!(SetDisks::internal_metadata_suffix("x-rustfs-interna"), None);
+        assert_eq!(SetDisks::internal_metadata_suffix("x-minio-interna"), None);
+        assert_eq!(SetDisks::internal_metadata_suffix("x-amz-meta-custom"), None);
+
+        // The suffix-prefix comparisons behind the classifier follow the same rules.
+        assert!(SetDisks::is_replication_quorum_metadata_key(
+            "X-RustFS-Internal-Replication-Reset-arn:rustfs:replication::target:bucket"
+        ));
+        assert!(SetDisks::is_replication_quorum_metadata_key(
+            "X-Minio-Internal-Replication-Delete-Marker-Version-arn:rustfs:replication::target:bucket"
+        ));
+        assert!(!SetDisks::is_replication_quorum_metadata_key("x-rustfs-interna"));
+        assert!(!SetDisks::is_replication_quorum_metadata_key("x-rustfs-internal-replication-res"));
+    }
+
+    /// rustfs#5801: parity counts outside [0, total_shards] come from corrupt
+    /// or foreign metadata and must be treated as invalid entries instead of
+    /// clamped values that poison `common_parity`'s occurrence counting.
+    #[test]
+    fn out_of_range_parity_is_treated_as_invalid_entry() {
+        let mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let mut metas: Vec<FileInfo> = (0..4).map(|i| metadata_quorum_test_fileinfo(mod_time, i)).collect();
+        for fi in &mut metas {
+            fi.erasure.parity_blocks = usize::MAX;
+        }
+        let errs: Vec<Option<DiskError>> = vec![None; 4];
+
+        let parities = SetDisks::list_object_parities(&metas, &errs);
+        assert_eq!(parities, vec![-1; 4], "garbage parity must not survive as a candidate");
+    }
+
+    /// rustfs#5801: when a read quorum of healthy disks answers but their
+    /// parity values are irreconcilable, the object metadata is corrupt —
+    /// return `FileCorrupt` (heal-actionable, non-retryable) instead of the
+    /// retryable-looking `ErasureReadQuorum`.
+    #[test]
+    fn irreconcilable_parity_with_healthy_quorum_is_file_corrupt() {
+        let mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let mut metas: Vec<FileInfo> = (0..4).map(|i| metadata_quorum_test_fileinfo(mod_time, i)).collect();
+        for fi in &mut metas {
+            fi.erasure.parity_blocks = usize::MAX;
+        }
+        let errs: Vec<Option<DiskError>> = vec![None; 4];
+
+        let err = SetDisks::object_quorum_from_meta(&metas, &errs, 2).expect_err("garbage parity cannot form a quorum");
+        assert_eq!(err, DiskError::FileCorrupt);
+    }
+
+    /// Too few healthy replies remains a genuine quorum condition where a
+    /// retry may succeed once disks recover.
+    #[test]
+    fn insufficient_healthy_replies_stays_erasure_read_quorum() {
+        let mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let mut metas: Vec<FileInfo> = (0..4).map(|i| metadata_quorum_test_fileinfo(mod_time, i)).collect();
+        metas[0].erasure.parity_blocks = usize::MAX;
+        let errs: Vec<Option<DiskError>> = vec![
+            None,
+            Some(DiskError::DiskNotFound),
+            Some(DiskError::DiskNotFound),
+            Some(DiskError::DiskNotFound),
+        ];
+
+        let err = SetDisks::object_quorum_from_meta(&metas, &errs, 2).expect_err("one healthy reply is below quorum");
+        assert_eq!(err, DiskError::ErasureReadQuorum);
     }
 }

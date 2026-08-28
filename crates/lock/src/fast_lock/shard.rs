@@ -24,7 +24,20 @@ use crate::fast_lock::{
     state::ObjectLockState,
     types::{LockMode, LockResult, ObjectKey, ObjectLockRequest},
 };
-use std::collections::HashSet;
+
+#[derive(Debug)]
+struct ActiveGuardInfo {
+    key: ObjectKey,
+    mode: LockMode,
+    owner: Arc<str>,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct GuardHolderKey {
+    key: ObjectKey,
+    mode: LockMode,
+    owner: Arc<str>,
+}
 
 /// Lock shard to reduce global contention
 #[derive(Debug)]
@@ -38,7 +51,7 @@ pub struct LockShard {
     /// Shard ID for debugging
     _shard_id: usize,
     /// Active guard IDs to prevent cleanup of locks with live guards
-    active_guards: parking_lot::Mutex<HashSet<u64>>,
+    active_guards: parking_lot::Mutex<HashMap<u64, Option<ActiveGuardInfo>>>,
 }
 
 /// Cancellation-safe waiter counter ticket.
@@ -84,7 +97,7 @@ impl LockShard {
             object_pool: ObjectStatePool::new(),
             metrics: ShardMetrics::new(),
             _shard_id: shard_id,
-            active_guards: parking_lot::Mutex::new(HashSet::new()),
+            active_guards: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -215,12 +228,30 @@ impl LockShard {
             let remaining = deadline - Instant::now();
 
             if retry_count < MAX_RETRIES && remaining > Duration::from_millis(10) {
-                // For early retries, use a brief exponential backoff instead of full notification wait
+                // For early retries, wait for a release notification bounded by
+                // an exponential backoff. The bound (not a bare sleep) matters:
+                // a plain `sleep` subscribes to nothing, so a release during
+                // the backoff wakes nobody — `notify_writer`/`notify_readers`
+                // are gated on the waiter counters, which a sleeper never
+                // increments. Under N-writer same-key contention the lock sits
+                // free while every loser sleeps out its full backoff, and the
+                // ladder compounds superlinearly with N. The backoff cap still
+                // protects against lost/stolen wakeups, exactly as
+                // NOTIFY_WAIT_CAP does for the post-retry wait below.
                 let backoff_ms = std::cmp::min(10 << retry_count, 100); // 10ms, 20ms, 40ms, 80ms, 100ms max
                 let backoff_duration = Duration::from_millis(backoff_ms);
 
                 if backoff_duration < remaining {
-                    tokio::time::sleep(backoff_duration).await;
+                    match request.mode {
+                        LockMode::Shared => {
+                            let _waiter_guard = WaiterCounterGuard::new(state.clone(), LockMode::Shared);
+                            let _ = timeout(backoff_duration, state.optimized_notify.wait_for_read()).await;
+                        }
+                        LockMode::Exclusive => {
+                            let _waiter_guard = WaiterCounterGuard::new(state.clone(), LockMode::Exclusive);
+                            let _ = timeout(backoff_duration, state.optimized_notify.wait_for_write()).await;
+                        }
+                    }
                     retry_count += 1;
                     continue;
                 }
@@ -309,7 +340,7 @@ impl LockShard {
         // First, try to remove the guard from active set
         let guard_was_active = {
             let mut guards = self.active_guards.lock();
-            guards.remove(&guard_id)
+            guards.remove(&guard_id).is_some()
         };
 
         // If guard was not active, this is a double-release attempt
@@ -357,8 +388,19 @@ impl LockShard {
 
     /// Register a guard to prevent premature cleanup
     pub fn register_guard(&self, guard_id: u64) {
+        self.active_guards.lock().insert(guard_id, None);
+    }
+
+    pub(crate) fn register_guard_with_info(&self, guard_id: u64, key: &ObjectKey, mode: LockMode, owner: &Arc<str>) {
         let mut guards = self.active_guards.lock();
-        guards.insert(guard_id);
+        guards.insert(
+            guard_id,
+            Some(ActiveGuardInfo {
+                key: key.clone(),
+                mode,
+                owner: owner.clone(),
+            }),
+        );
     }
 
     /// Unregister a guard (called when guard is dropped)
@@ -378,7 +420,7 @@ impl LockShard {
     #[cfg(test)]
     pub fn is_guard_active(&self, guard_id: u64) -> bool {
         let guards = self.active_guards.lock();
-        guards.contains(&guard_id)
+        guards.contains_key(&guard_id)
     }
 
     /// Calculate adaptive timeout based on current system load and request priority
@@ -526,6 +568,13 @@ impl LockShard {
     /// holder. Entries for objects that are tracked but not currently locked
     /// (e.g. pooled-but-idle state) are skipped.
     pub fn list_locks(&self) -> Vec<crate::fast_lock::types::ObjectLockInfo> {
+        self.list_locks_with_holder_counts()
+            .into_iter()
+            .map(|(info, _)| info)
+            .collect()
+    }
+
+    pub(crate) fn list_locks_with_holder_counts(&self) -> Vec<(crate::fast_lock::types::ObjectLockInfo, u32)> {
         let objects = self.objects.read();
         let mut infos = Vec::new();
         for (key, state) in objects.iter() {
@@ -540,14 +589,17 @@ impl LockShard {
                             .acquired_at
                             .checked_add(info.lock_timeout)
                             .unwrap_or_else(|| info.acquired_at + crate::fast_lock::DEFAULT_LOCK_TIMEOUT);
-                        infos.push(crate::fast_lock::types::ObjectLockInfo {
-                            key: key.clone(),
-                            mode,
-                            owner: info.owner,
-                            acquired_at: info.acquired_at,
-                            expires_at,
-                            priority,
-                        });
+                        infos.push((
+                            crate::fast_lock::types::ObjectLockInfo {
+                                key: key.clone(),
+                                mode,
+                                owner: info.owner,
+                                acquired_at: info.acquired_at,
+                                expires_at,
+                                priority,
+                            },
+                            1,
+                        ));
                     }
                 }
                 LockMode::Shared => {
@@ -556,19 +608,66 @@ impl LockShard {
                             .acquired_at
                             .checked_add(entry.lock_timeout)
                             .unwrap_or_else(|| entry.acquired_at + crate::fast_lock::DEFAULT_LOCK_TIMEOUT);
-                        infos.push(crate::fast_lock::types::ObjectLockInfo {
-                            key: key.clone(),
-                            mode,
-                            owner: entry.owner.clone(),
-                            acquired_at: entry.acquired_at,
-                            expires_at,
-                            priority,
-                        });
+                        infos.push((
+                            crate::fast_lock::types::ObjectLockInfo {
+                                key: key.clone(),
+                                mode,
+                                owner: entry.owner.clone(),
+                                acquired_at: entry.acquired_at,
+                                expires_at,
+                                priority,
+                            },
+                            entry.count,
+                        ));
                     }
                 }
             }
         }
         infos
+    }
+
+    pub(crate) fn list_locks_with_holder_generations(
+        &self,
+    ) -> Vec<(crate::fast_lock::types::ObjectLockInfo, u32, Option<Vec<u64>>)> {
+        // Snapshot lock state before guard registrations. Acquires register after
+        // mutating state, while releases unregister before mutating state, so a
+        // concurrent transition can only make the cohort mismatch and fall back.
+        let infos = self.list_locks_with_holder_counts();
+        let guards = self.active_guards.lock();
+        let mut guard_ids_by_holder: HashMap<GuardHolderKey, Vec<u64>> = HashMap::with_capacity(guards.len());
+        for (&guard_id, guard) in guards
+            .iter()
+            .filter_map(|(guard_id, guard)| guard.as_ref().map(|guard| (guard_id, guard)))
+        {
+            let key = GuardHolderKey {
+                key: guard.key.clone(),
+                mode: guard.mode,
+                owner: guard.owner.clone(),
+            };
+            guard_ids_by_holder
+                .entry(key)
+                .and_modify(|guard_ids| guard_ids.push(guard_id))
+                .or_insert_with(|| vec![guard_id]);
+        }
+        drop(guards);
+        for guard_ids in guard_ids_by_holder.values_mut() {
+            guard_ids.sort_unstable();
+        }
+
+        infos
+            .into_iter()
+            .map(|(info, holder_count)| {
+                let key = GuardHolderKey {
+                    key: info.key.clone(),
+                    mode: info.mode,
+                    owner: info.owner.clone(),
+                };
+                let generation = guard_ids_by_holder
+                    .remove(&key)
+                    .filter(|guard_ids| u32::try_from(guard_ids.len()).ok() == Some(holder_count));
+                (info, holder_count, generation)
+            })
+            .collect()
     }
 
     /// Force-release every holder of a lock on `key`, regardless of owner.
@@ -851,6 +950,70 @@ mod tests {
 
         // Release first lock
         assert!(shard.release_lock(&key, &owner1, LockMode::Exclusive));
+    }
+
+    // Regression for the waiter-preserving early retry (rustfs#5657).
+    //
+    // The early retries used a bare `sleep`, which subscribes to nothing.
+    // `notify_writer`/`notify_readers` are gated on the waiter counters, so a
+    // sleeping waiter is invisible to every release: the lock sits free while
+    // each loser sleeps out its full 10/20/40/80/100ms rung, and under N-writer
+    // same-key contention that ladder — not the hold — is what the wait costs.
+    // Registration is what lets a release reach the waiter at all; the wakeup
+    // itself is covered by `write_lock_waiter_is_not_stranded_by_missed_wakeup`.
+    //
+    // MAX_RETRIES rungs total ~750ms, so the window sampled here sits entirely
+    // inside the early-retry phase, where a sleeping waiter registers nowhere.
+    //
+    // Wakeup *latency* is deliberately not asserted: NOTIFY_POOL is a global of
+    // 128 `Notify`s shared by every lock in the process, so a waiter in another
+    // concurrently-running test can consume this one's `notify_one` and push it
+    // out to the end of its rung. That is the same stolen wakeup NOTIFY_WAIT_CAP
+    // exists to bound, and it makes any latency budget flaky in-suite.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn early_retry_registers_as_waiter() {
+        let shard = Arc::new(LockShard::new(0));
+        let key = ObjectKey::new("bucket", "object");
+        let holder: Arc<str> = Arc::from("holder");
+        let waiter: Arc<str> = Arc::from("waiter");
+
+        let request = |owner: Arc<str>| ObjectLockRequest {
+            key: key.clone(),
+            mode: LockMode::Exclusive,
+            owner,
+            acquire_timeout: Duration::from_secs(5),
+            lock_timeout: Duration::from_secs(30),
+            priority: LockPriority::Normal,
+        };
+
+        assert!(shard.acquire_lock(&request(holder.clone())).await.is_ok());
+
+        let waiter_shard = shard.clone();
+        let waiter_request = request(waiter.clone());
+        let waiter_task = tokio::spawn(async move { waiter_shard.acquire_lock(&waiter_request).await });
+
+        let sample_until = Instant::now() + Duration::from_millis(200);
+        let mut registered = false;
+        while !registered && Instant::now() < sample_until {
+            registered = shard
+                .objects
+                .read()
+                .get(&key)
+                .is_some_and(|state| state.atomic_state.writers_waiting_count() > 0);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        assert!(
+            registered,
+            "a waiter in the early-retry backoff must be registered in the writer waiter count, \
+             otherwise releases cannot reach it"
+        );
+
+        assert!(shard.release_lock(&key, &holder, LockMode::Exclusive));
+        waiter_task
+            .await
+            .expect("waiter task should not panic")
+            .expect("waiter must acquire once the holder releases");
     }
 
     #[test]

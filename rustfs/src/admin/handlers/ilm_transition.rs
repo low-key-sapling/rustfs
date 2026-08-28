@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::auth::validate_admin_request;
+use crate::admin::auth::authorize_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::object_store_from_extensions;
 use crate::admin::storage_api::bucket::is_reserved_or_invalid_bucket;
@@ -24,15 +24,15 @@ use crate::admin::storage_api::lifecycle::{
     claim_manual_transition_scope_admission, delete_manual_transition_scope_admission_if_current,
     delete_transition_candidate_for_operator, enqueue_transition_for_existing_objects_scoped,
     finalize_missing_transition_transaction_for_operator, inspect_transition_transaction_for_operator,
-    load_manual_transition_job_record, load_manual_transition_job_record_with_etag, load_manual_transition_scope_admission,
-    manual_transition_job_lease_expired, manual_transition_queue_snapshot, manual_transition_scope_admission_lease_expired,
-    persist_manual_transition_job_progress, renew_manual_transition_job_lease, request_manual_transition_job_cancel,
-    save_manual_transition_job_record, save_manual_transition_job_record_if_current,
+    load_manual_transition_job_record, load_manual_transition_scope_admission, manual_transition_job_lease_expired,
+    manual_transition_queue_snapshot, manual_transition_scope_admission_lease_expired,
+    persist_manual_transition_job_progress_if_owned, renew_manual_transition_job_lease_if_owned,
+    request_manual_transition_job_cancel, save_manual_transition_job_record, update_manual_transition_job_record,
 };
 use crate::admin::storage_api::runtime::ECStore;
-use crate::auth::{check_key_valid, get_session_token};
+use crate::admin::utils::json_response;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
-use http::{HeaderMap, HeaderValue};
+use http::HeaderMap;
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
@@ -41,7 +41,6 @@ use rustfs_utils::{
     MaskedAccessKey,
     http::{AMZ_REQUEST_ID, REQUEST_ID_HEADER},
 };
-use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -52,7 +51,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-const JSON_CONTENT_TYPE: &str = "application/json";
 const DEFAULT_MANUAL_TRANSITION_MAX_OBJECTS: u64 = 10_000;
 const MAX_MANUAL_TRANSITION_OBJECTS: u64 = 100_000;
 const MAX_MANUAL_TRANSITION_DURATION_SECONDS: u64 = 3600;
@@ -406,20 +404,16 @@ async fn authorize_manual_transition_request(req: &S3Request<Body>) -> S3Result<
     authorize_transition_admin_request(req, AdminAction::SetTierAction).await
 }
 
+/// The credential pre-check keeps this endpoint family's historical
+/// missing-credentials message (the shared gate reports "get cred failed") and
+/// still yields the masked actor every transition audit log records.
 async fn authorize_transition_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<String> {
     let Some(input_cred) = req.credentials.as_ref() else {
         return Err(s3_error!(InvalidRequest, "authentication required"));
     };
     let actor = MaskedAccessKey(&input_cred.access_key).to_string();
 
-    let (cred, owner) =
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-    let remote_addr = req
-        .extensions
-        .get::<Option<RemoteAddr>>()
-        .and_then(|opt| opt.map(|addr| addr.0));
-
-    validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(action)], remote_addr).await?;
+    authorize_admin_request(req, vec![Action::AdminAction(action)]).await?;
 
     Ok(actor)
 }
@@ -634,42 +628,15 @@ fn map_manual_transition_job_load_error(err: StorageError, job_id: Uuid) -> S3Er
     }
 }
 
-fn json_response<T: Serialize>(response: &T, status: StatusCode) -> S3Result<S3Response<(StatusCode, Body)>> {
-    let body = serde_json::to_vec(response).map_err(|err| {
-        S3Error::with_message(S3ErrorCode::InternalError, format!("failed to encode manual transition response: {err}"))
-    })?;
-    let content_type = HeaderValue::from_str(JSON_CONTENT_TYPE)
-        .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("invalid content type: {err}")))?;
-    let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, content_type);
-    Ok(S3Response::with_headers((status, Body::from(body)), headers))
-}
-
-async fn update_manual_transition_job_record_cas(
+async fn update_manual_transition_job_record_if_owned(
     store: Arc<ECStore>,
     job_id: Uuid,
-    mut update: impl FnMut(&mut ManualTransitionJobRecord),
+    expected_lease_id: Uuid,
+    mut update: impl FnMut(&mut ManualTransitionJobRecord) -> bool,
 ) -> S3Result<ManualTransitionJobRecord> {
-    for _ in 0..4 {
-        let (mut record, etag) = load_manual_transition_job_record_with_etag(store.clone(), job_id)
-            .await
-            .map_err(|err| map_manual_transition_job_load_error(err, job_id))?;
-        update(&mut record);
-        match save_manual_transition_job_record_if_current(store.clone(), &record, &etag).await {
-            Ok(()) => return Ok(record),
-            Err(StorageError::PreconditionFailed) => continue,
-            Err(err) => {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::InternalError,
-                    format!("manual transition job store failed: {err}"),
-                ));
-            }
-        }
-    }
-    Err(s3_error!(
-        OperationAborted,
-        "manual transition job record changed concurrently; retry the request"
-    ))
+    update_manual_transition_job_record(store, job_id, Some(expected_lease_id), |record| update(record))
+        .await
+        .map_err(|err| map_manual_transition_job_load_error(err, job_id))
 }
 
 fn manual_transition_durable_cancel_check(store: Arc<ECStore>, job_id: Uuid) -> ManualTransitionCancelCheck {
@@ -707,11 +674,11 @@ fn manual_transition_durable_cancel_check(store: Arc<ECStore>, job_id: Uuid) -> 
     })
 }
 
-fn manual_transition_progress_sink(store: Arc<ECStore>, job_id: Uuid) -> ManualTransitionProgressSink {
+fn manual_transition_progress_sink(store: Arc<ECStore>, job_id: Uuid, lease_id: Uuid) -> ManualTransitionProgressSink {
     Arc::new(move |report| {
         let store = store.clone();
         Box::pin(async move {
-            persist_manual_transition_job_progress(store, job_id, &report, manual_transition_queue_snapshot())
+            persist_manual_transition_job_progress_if_owned(store, job_id, lease_id, &report, manual_transition_queue_snapshot())
                 .await
                 .map(|_| ())
         })
@@ -741,9 +708,13 @@ fn release_manual_transition_admission(store: Arc<ECStore>, record: &ManualTrans
 async fn finalize_manual_transition_job(
     store: Arc<ECStore>,
     job_id: Uuid,
+    lease_id: Uuid,
     result: Result<ManualTransitionRunReport, StorageError>,
 ) -> Option<ManualTransitionJobRecord> {
-    let updated = update_manual_transition_job_record_cas(store.clone(), job_id, |record| {
+    let updated = update_manual_transition_job_record_if_owned(store.clone(), job_id, lease_id, |record| {
+        if record.is_terminal() {
+            return false;
+        }
         let cancel_requested = record.cancel_requested;
         match &result {
             Ok(report) => {
@@ -763,10 +734,12 @@ async fn finalize_manual_transition_job(
                 }
             }
         }
+        true
     })
     .await;
     match updated {
         Ok(record) => Some(record),
+        Err(err) if err.code() == &S3ErrorCode::OperationAborted => None,
         Err(err) => {
             error!(
                 event = EVENT_ADMIN_ILM_TRANSITION_STATE,
@@ -786,6 +759,7 @@ async fn finalize_manual_transition_job(
 fn spawn_manual_transition_job_heartbeat(
     store: Arc<ECStore>,
     job_id: Uuid,
+    lease_id: Uuid,
     scan_cancel_token: CancellationToken,
     shutdown_token: CancellationToken,
 ) {
@@ -795,7 +769,7 @@ fn spawn_manual_transition_job_heartbeat(
             tokio::select! {
                 _ = shutdown_token.cancelled() => return,
                 _ = interval.tick() => {
-                    match renew_manual_transition_job_lease(store.clone(), job_id, manual_transition_queue_snapshot()).await {
+                    match renew_manual_transition_job_lease_if_owned(store.clone(), job_id, lease_id, manual_transition_queue_snapshot()).await {
                         Ok(record) if record.is_terminal() => {
                             remove_active_manual_transition_job(job_id);
                             scan_cancel_token.cancel();
@@ -803,6 +777,11 @@ fn spawn_manual_transition_job_heartbeat(
                         }
                         Ok(record) if record.cancel_requested => scan_cancel_token.cancel(),
                         Ok(_) => {}
+                        Err(StorageError::PreconditionFailed) => {
+                            remove_active_manual_transition_job(job_id);
+                            scan_cancel_token.cancel();
+                            return;
+                        }
                         Err(err) => {
                         warn!(
                             event = EVENT_ADMIN_ILM_TRANSITION_STATE,
@@ -840,15 +819,23 @@ async fn start_manual_transition_job(
     match claim_manual_transition_scope_admission(store.clone(), &ManualTransitionScopeAdmission::from_job(&record)).await {
         Ok(ManualTransitionScopeAdmissionClaim::Claimed) => {}
         Ok(ManualTransitionScopeAdmissionClaim::Conflict(active)) => {
-            let _ = update_manual_transition_job_record_cas(store.clone(), job_id, |record| {
+            let _ = update_manual_transition_job_record_if_owned(store.clone(), job_id, record.lease_id, |record| {
+                if record.is_terminal() {
+                    return false;
+                }
                 record.fail("manual transition admission conflict");
+                true
             })
             .await;
             return Ok(StartManualTransitionJobResult::Conflict(manual_transition_job_conflict_response(*active)));
         }
         Err(err) => {
-            let _ = update_manual_transition_job_record_cas(store.clone(), job_id, |record| {
+            let _ = update_manual_transition_job_record_if_owned(store.clone(), job_id, record.lease_id, |record| {
+                if record.is_terminal() {
+                    return false;
+                }
                 record.fail(format!("manual transition admission failed: {err}"));
+                true
             })
             .await;
             return Err(S3Error::with_message(
@@ -862,21 +849,22 @@ async fn start_manual_transition_job(
     let heartbeat_shutdown_token = CancellationToken::new();
     insert_active_manual_transition_job(job_id, scan_cancel_token.clone());
     let mut run_options = options;
+    let lease_id = record.lease_id;
     run_options.job_id = Some(job_id);
     run_options.cancel_token = Some(scan_cancel_token.clone());
     run_options.cancel_check = Some(manual_transition_durable_cancel_check(store.clone(), job_id));
-    run_options.progress_sink = Some(manual_transition_progress_sink(store.clone(), job_id));
+    run_options.progress_sink = Some(manual_transition_progress_sink(store.clone(), job_id, lease_id));
     let run_store = store.clone();
     let job_scan_cancel_token = scan_cancel_token.clone();
     let job_heartbeat_shutdown_token = heartbeat_shutdown_token.clone();
-    spawn_manual_transition_job_heartbeat(store, job_id, scan_cancel_token, heartbeat_shutdown_token);
+    spawn_manual_transition_job_heartbeat(store, job_id, lease_id, scan_cancel_token, heartbeat_shutdown_token);
     tokio::spawn(async move {
         #[cfg(feature = "e2e-test-hooks")]
         if std::env::var_os(E2E_MANUAL_TRANSITION_CANCEL_BARRIER_ENV).is_some() {
             job_scan_cancel_token.cancelled().await;
         }
         let result = enqueue_transition_for_existing_objects_scoped(run_store.clone(), &bucket, run_options).await;
-        if let Some(final_record) = finalize_manual_transition_job(run_store.clone(), job_id, result).await
+        if let Some(final_record) = finalize_manual_transition_job(run_store.clone(), job_id, lease_id, result).await
             && final_record.is_terminal()
         {
             release_manual_transition_admission(run_store, &final_record);
@@ -921,10 +909,10 @@ impl Operation for ManualTransitionRunHandler {
                         cancel_endpoint: Some(status_endpoint),
                         report: record.report,
                     };
-                    return json_response(&response, StatusCode::ACCEPTED);
+                    return json_response(StatusCode::ACCEPTED, &response);
                 }
                 StartManualTransitionJobResult::Conflict(response) => {
-                    return json_response(&response, StatusCode::CONFLICT);
+                    return json_response(StatusCode::CONFLICT, &response);
                 }
             }
         }
@@ -960,7 +948,7 @@ impl Operation for ManualTransitionRunHandler {
             report,
         };
 
-        json_response(&response, StatusCode::OK)
+        json_response(StatusCode::OK, &response)
     }
 }
 
@@ -988,16 +976,19 @@ impl Operation for ManualTransitionJobStatusHandler {
                         && !manual_transition_scope_admission_lease_expired(&admission)
                 });
             if !local_active && !leased_elsewhere && manual_transition_job_lease_expired(&record) {
-                record = update_manual_transition_job_record_cas(store.clone(), job_id, |record| {
+                record = update_manual_transition_job_record_if_owned(store.clone(), job_id, record.lease_id, |record| {
                     if record.state == ManualTransitionJobState::Running && manual_transition_job_lease_expired(record) {
                         record.mark_unknown_if_unowned();
+                        true
+                    } else {
+                        false
                     }
                 })
                 .await?;
                 release_manual_transition_admission(store, &record);
             }
         }
-        json_response(&manual_transition_job_response(record), StatusCode::OK)
+        json_response(StatusCode::OK, &manual_transition_job_response(record))
     }
 }
 
@@ -1019,7 +1010,7 @@ impl Operation for ManualTransitionJobCancelHandler {
         {
             cancel_token.cancel();
         }
-        json_response(&manual_transition_job_response(record), StatusCode::OK)
+        json_response(StatusCode::OK, &manual_transition_job_response(record))
     }
 }
 
@@ -1036,7 +1027,7 @@ impl Operation for TransitionReconcileInspectHandler {
         let status = inspect_transition_transaction_for_operator(store, transaction_id)
             .await
             .map_err(map_transition_operator_error)?;
-        json_response(&status, StatusCode::OK)
+        json_response(StatusCode::OK, &status)
     }
 }
 
@@ -1071,7 +1062,7 @@ impl Operation for TransitionReconcileApplyHandler {
                     "exact_delete_completed_journal_already_finalized"
                 };
                 log_transition_reconcile_applied(transaction_id, "delete_candidate", outcome, &request_id, &actor, &remote_addr);
-                json_response(&TransitionCandidateDeleteResponse { outcome, result }, StatusCode::OK)
+                json_response(StatusCode::OK, &TransitionCandidateDeleteResponse { outcome, result })
             }
             ValidatedTransitionReconcileAction::FinalizeMissing => {
                 finalize_missing_transition_transaction_for_operator(store, transaction_id)
@@ -1086,12 +1077,12 @@ impl Operation for TransitionReconcileApplyHandler {
                     &remote_addr,
                 );
                 json_response(
+                    StatusCode::OK,
                     &TransitionFinalizeMissingResponse {
                         outcome: "journal_finalized",
                         journal_retained: false,
                         transaction_id,
                     },
-                    StatusCode::OK,
                 )
             }
         }
@@ -1481,6 +1472,50 @@ mod tests {
 
         assert!(auth_block.contains("AdminAction::SetTierAction"));
         assert!(!auth_block.contains("AdminAction::ServerInfoAdminAction"));
+    }
+
+    /// The transition wrapper now delegates to the shared admin gate, which reports
+    /// "get cred failed"; its own pre-check keeps the message these endpoints have
+    /// always returned (rustfs/backlog#1829).
+    #[tokio::test]
+    async fn transition_admin_gate_keeps_its_missing_credentials_response() {
+        let err = authorize_transition_admin_request(
+            &manual_transition_job_request(Method::GET, "/rustfs/admin/v3/ilm/transition/jobs/job-123"),
+            AdminAction::ListTierAction,
+        )
+        .await
+        .expect_err("a transition admin request without credentials must fail");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("authentication required"));
+    }
+
+    #[test]
+    fn transition_admin_gate_routes_through_the_shared_gate() {
+        let production = include_str!("ilm_transition.rs")
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("production source must precede tests");
+        let wrapper = extract_block_between_markers(
+            production,
+            "async fn authorize_transition_admin_request",
+            "fn transition_transaction_id_from_params",
+        );
+
+        assert_eq!(
+            wrapper.matches("authorize_admin_request(").count(),
+            1,
+            "the transition wrapper must use exactly one shared gate"
+        );
+        assert!(
+            wrapper.contains("authorize_admin_request(req, vec![Action::AdminAction(action)])"),
+            "the transition wrapper must forward its parameterized action unchanged"
+        );
+        assert!(
+            wrapper.contains("MaskedAccessKey(&input_cred.access_key)"),
+            "the transition wrapper must keep returning the masked actor"
+        );
+        assert!(!production.contains("check_key_valid(get_session_token"));
     }
 
     #[test]

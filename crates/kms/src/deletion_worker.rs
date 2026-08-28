@@ -62,8 +62,14 @@ const METRIC_TOMBSTONE_KEYS: &str = "rustfs_kms_deletion_tombstone_keys";
 /// Gauge: seconds since the least recently rotated usable key was rotated
 /// (its creation time when it was never rotated); `0` when there are none.
 const METRIC_OLDEST_ROTATION_AGE_SECONDS: &str = "rustfs_kms_oldest_key_rotation_age_seconds";
+/// Gauge: the largest persisted wrap-operation reservation across usable keys,
+/// as of the end of the last sweep that saw the whole key set. Published only
+/// when the backend counts wraps (the Vault KV2 backend today); an aggregate
+/// that by design overestimates actual wraps. The value to alert on against
+/// the AES-256-GCM bound of 2^32 wraps per key material.
+const METRIC_MAX_KEY_WRAP_OPERATIONS: &str = "rustfs_kms_max_key_wrap_operations";
 /// Counter: keys the sweep acted on, by `outcome` (`removed`, `blocked`,
-/// `skipped`, `failed`).
+/// `skipped`, `failed`, `unreadable`).
 const METRIC_SWEEP_KEYS_TOTAL: &str = "rustfs_kms_deletion_sweep_keys_total";
 
 /// Register metric descriptions once per process.
@@ -82,6 +88,10 @@ fn describe_metrics() {
             METRIC_OLDEST_ROTATION_AGE_SECONDS,
             "Seconds since the least recently rotated usable KMS key was last rotated, counting from creation for keys that were never rotated"
         );
+        metrics::describe_gauge!(
+            METRIC_MAX_KEY_WRAP_OPERATIONS,
+            "Largest reserved wrap-operation count across usable KMS keys; overestimates actual wraps and is only reported by backends that count them"
+        );
         metrics::describe_counter!(METRIC_SWEEP_KEYS_TOTAL, "Total keys acted on by the KMS deletion sweep, by outcome");
     });
 }
@@ -99,6 +109,11 @@ struct KeyCensus {
     /// way out are excluded: they will never be rotated again, and would
     /// otherwise pin the gauge high until the sweep finishes removing them.
     oldest_rotation_age_seconds: f64,
+    /// Largest reserved wrap count across usable keys, `None` when no key
+    /// reported one — either the backend does not count wraps, or no usable
+    /// key was seen. Excluding departing keys mirrors the rotation age: their
+    /// material will never wrap again, so its consumed nonce budget is moot.
+    max_wrap_operations: Option<u64>,
 }
 
 impl KeyCensus {
@@ -107,6 +122,9 @@ impl KeyCensus {
             KeyStatus::PendingDeletion => self.pending_deletion += 1,
             KeyStatus::Deleted => self.tombstones += 1,
             KeyStatus::Active | KeyStatus::Disabled => {
+                if let Some(reserved) = key.wrap_budget_reserved {
+                    self.max_wrap_operations = Some(self.max_wrap_operations.unwrap_or(0).max(reserved));
+                }
                 // A missing rotation time means either "never rotated" or "the
                 // build that rotated it did not record when". Both fall back to
                 // creation, and the two are not worth separate series: for the
@@ -140,6 +158,7 @@ fn record_sweep(report: &SweepReport, census: Option<KeyCensus>) {
         ("blocked", report.blocked.len()),
         ("skipped", report.skipped),
         ("failed", report.failed),
+        ("unreadable", report.unreadable),
     ] {
         // Emitted even at zero so every outcome series exists from the first
         // sweep on and a rate over it is defined.
@@ -153,6 +172,11 @@ fn record_sweep(report: &SweepReport, census: Option<KeyCensus>) {
     metrics::gauge!(METRIC_PENDING_DELETION_KEYS).set(census.pending_deletion as f64);
     metrics::gauge!(METRIC_TOMBSTONE_KEYS).set(census.tombstones as f64);
     metrics::gauge!(METRIC_OLDEST_ROTATION_AGE_SECONDS).set(census.oldest_rotation_age_seconds);
+    // Only emitted when a usable key reported a count: backends that do not
+    // count wraps must not publish a `0` that reads as "no wraps consumed".
+    if let Some(max_wrap_operations) = census.max_wrap_operations {
+        metrics::gauge!(METRIC_MAX_KEY_WRAP_OPERATIONS).set(max_wrap_operations as f64);
+    }
 }
 
 /// Reports configuration that still references a KMS key.
@@ -193,6 +217,13 @@ pub struct SweepReport {
     pub skipped: usize,
     /// Keys whose removal attempt failed; retried on the next sweep.
     pub failed: usize,
+    /// Keys the backend listed but could not describe.
+    ///
+    /// The sweep keeps going past them — one damaged record must not stop every
+    /// other expired key from being destroyed — but their existence means the
+    /// key set was only partially observed, so the lifecycle gauges are
+    /// withheld for this round rather than published over an incomplete census.
+    pub unreadable: usize,
 }
 
 pub(crate) struct DeletionWorker {
@@ -243,12 +274,13 @@ impl DeletionWorker {
                 _ = ticker.tick() => {}
             }
             let report = self.sweep(&Zoned::now()).await;
-            if !report.removed.is_empty() || !report.blocked.is_empty() || report.failed > 0 {
+            if !report.removed.is_empty() || !report.blocked.is_empty() || report.failed > 0 || report.unreadable > 0 {
                 info!(
                     removed = ?report.removed,
                     blocked = ?report.blocked,
                     skipped = report.skipped,
                     failed = report.failed,
+                    unreadable = report.unreadable,
                     "KMS deletion sweep completed"
                 );
             }
@@ -280,6 +312,13 @@ impl DeletionWorker {
                     break false;
                 }
             };
+            if !response.unreadable_key_ids.is_empty() {
+                warn!(
+                    key_ids = ?response.unreadable_key_ids,
+                    "KMS deletion sweep listed key records it cannot describe; census withheld this round"
+                );
+                report.unreadable += response.unreadable_key_ids.len();
+            }
             for key in &response.keys {
                 // Keys this sweep destroys are left out of the census: the
                 // gauges describe the key set as it stands once the sweep is
@@ -310,7 +349,12 @@ impl DeletionWorker {
                 None => break false,
             }
         };
-        record_sweep(&report, listed_everything.then_some(census));
+        // A census taken over a key set with unreadable members would report an
+        // oldest-rotation age and a pending-deletion count computed from the
+        // keys that happened to be readable, which is exactly the kind of quiet
+        // undercount the gauges exist to catch.
+        let observed_every_key = listed_everything && report.unreadable == 0;
+        record_sweep(&report, observed_every_key.then_some(census));
         report
     }
 
@@ -749,6 +793,9 @@ mod tests {
             created_at,
             rotated_at,
             created_by: None,
+            rotation_due: false,
+            rotation_due_reason: None,
+            wrap_budget_reserved: None,
         }
     }
 
@@ -778,6 +825,63 @@ mod tests {
             "expected the never-rotated key to set the age, got {}",
             census.oldest_rotation_age_seconds
         );
+    }
+
+    /// The wrap census is the max over usable keys that report a counter.
+    /// Keys without one (backends that do not count wraps) leave it `None`
+    /// rather than dragging in a zero, and departing keys are excluded — their
+    /// material never wraps again, so its consumed nonce budget is moot.
+    #[test]
+    fn census_takes_the_max_wrap_reservation_of_usable_keys_only() {
+        let now = Zoned::now();
+        let mut census = KeyCensus::default();
+
+        census.observe(&key_info("uncounted", KeyStatus::Active, now.clone(), None), &now);
+        assert_eq!(census.max_wrap_operations, None, "a key without a counter must not report zero");
+
+        let mut low = key_info("low", KeyStatus::Active, now.clone(), None);
+        low.wrap_budget_reserved = Some(1_000_000);
+        let mut high = key_info("high", KeyStatus::Disabled, now.clone(), None);
+        high.wrap_budget_reserved = Some(3_000_000);
+        let mut departing = key_info("departing", KeyStatus::PendingDeletion, now.clone(), None);
+        departing.wrap_budget_reserved = Some(9_000_000);
+        census.observe(&low, &now);
+        census.observe(&high, &now);
+        census.observe(&departing, &now);
+
+        assert_eq!(census.max_wrap_operations, Some(3_000_000));
+    }
+
+    /// The wrap gauge is a single aggregate: one value, no labels at all — a
+    /// per-key label would carry key identifiers into the metric stream and
+    /// grow the series count with the key set.
+    #[test]
+    fn wrap_budget_gauge_is_aggregate_and_carries_no_key_label() {
+        let (snapshot, ()) = record_metrics(|| {
+            Box::pin(async {
+                let now = Zoned::now();
+                let mut census = KeyCensus::default();
+                let mut wrapped = key_info("wrapped-key-id", KeyStatus::Active, now.clone(), None);
+                wrapped.wrap_budget_reserved = Some(2_000_000);
+                census.observe(&wrapped, &now);
+                record_sweep(&SweepReport::default(), Some(census));
+            })
+        });
+
+        assert_eq!(gauge_value(&snapshot, METRIC_MAX_KEY_WRAP_OPERATIONS), Some(2_000_000.0));
+        for (composite, ..) in &snapshot {
+            if composite.key().name() == METRIC_MAX_KEY_WRAP_OPERATIONS {
+                assert_eq!(composite.key().labels().count(), 0, "the wrap gauge must stay label-less");
+            }
+            for label in composite.key().labels() {
+                assert!(
+                    !label.value().contains("wrapped-key-id"),
+                    "metric {} leaked a key identifier through label {}",
+                    composite.key().name(),
+                    label.key()
+                );
+            }
+        }
     }
 
     #[test]
@@ -812,6 +916,11 @@ mod tests {
         );
         assert_eq!(counter_value(&snapshot, METRIC_SWEEP_KEYS_TOTAL, "skipped"), 1);
         assert_eq!(counter_value(&snapshot, METRIC_SWEEP_KEYS_TOTAL, "removed"), 0);
+        assert_eq!(
+            gauge_value(&snapshot, METRIC_MAX_KEY_WRAP_OPERATIONS),
+            None,
+            "a backend that does not count wraps must not publish a wrap gauge that reads as zero consumption"
+        );
 
         for (composite, ..) in &snapshot {
             for label in composite.key().labels() {
@@ -848,5 +957,53 @@ mod tests {
         });
 
         assert_eq!(gauge_value(&snapshot, METRIC_PENDING_DELETION_KEYS), Some(total as f64));
+    }
+
+    /// One key record this build cannot read must not stop the sweep.
+    ///
+    /// Before the listing reported unreadable identifiers, the damaged record
+    /// either vanished from the page — so the census counted a key set it had
+    /// not fully seen — or failed the listing outright, which aborted the sweep
+    /// and left every expired key on the node undeleted for as long as the
+    /// damage lasted. Now the expired key is still destroyed, and the gauges are
+    /// withheld for the round instead of being published over a partial census.
+    #[test]
+    fn sweep_destroys_expired_keys_past_a_record_it_cannot_read() {
+        let (snapshot, ()) = record_metrics(|| {
+            Box::pin(async move {
+                let temp_dir = tempfile::tempdir().expect("temp dir");
+                let backend = local_backend(&temp_dir).await;
+                let expired = create_key(&backend, "zz-expired").await;
+                schedule(&backend, &expired).await;
+                let damaged = create_key(&backend, "aa-damaged").await;
+
+                // Stamp a protection marker no build understands, exactly as a
+                // record written by a newer node would look here.
+                let key_path = temp_dir.path().join(format!("{damaged}.key"));
+                assert!(key_path.exists(), "the key record must exist before it is damaged");
+                let mut record: serde_json::Value =
+                    serde_json::from_slice(&tokio::fs::read(&key_path).await.expect("read record")).expect("decode record");
+                record["at_rest_protection"] = serde_json::json!({ "future_mode": ["opaque"] });
+                tokio::fs::write(&key_path, serde_json::to_vec_pretty(&record).expect("encode record"))
+                    .await
+                    .expect("write record");
+
+                let report = worker(backend.clone()).sweep(&after_window()).await;
+                assert_eq!(report.unreadable, 1, "the damaged record must be reported, not hidden");
+                assert_eq!(report.removed, vec![expired.clone()], "the expired key must still be destroyed");
+                assert_eq!(report.failed, 0, "an unreadable record is not a removal failure");
+                assert_key_gone(&backend, &expired).await;
+            })
+        });
+
+        assert_eq!(
+            gauge_value(&snapshot, METRIC_PENDING_DELETION_KEYS),
+            None,
+            "a census taken over a partially readable key set must not be published"
+        );
+        // The runbook points operators at this series as the signal that the
+        // gauges above have gone quiet on purpose, so it has to be emitted.
+        assert_eq!(counter_value(&snapshot, METRIC_SWEEP_KEYS_TOTAL, "unreadable"), 1);
+        assert_eq!(counter_value(&snapshot, METRIC_SWEEP_KEYS_TOTAL, "removed"), 1);
     }
 }

@@ -48,6 +48,25 @@ use time::OffsetDateTime;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
+#[cfg(not(test))]
+const STS_INVALIDATION_RETRY_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(test)]
+const STS_INVALIDATION_RETRY_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_millis(1);
+const STS_INVALIDATION_MAX_ATTEMPTS: usize = 3;
+#[cfg(not(test))]
+const STS_INVALIDATION_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(test)]
+const STS_INVALIDATION_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Concurrent STS deletions inside a single revocation batch.
+const STS_REVOCATION_BATCH_CONCURRENCY: usize = 16;
+/// Process-wide ceiling on in-flight STS deletions across all batches, so
+/// concurrent revocations cannot exhaust the runtime the peer notifications
+/// each deletion waits on.
+const STS_REVOCATION_GLOBAL_LIMIT: usize = 64;
+static STS_REVOCATION_PERMITS: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(STS_REVOCATION_GLOBAL_LIMIT));
+
 pub const MAX_SVCSESSION_POLICY_SIZE: usize = 4096;
 pub const SITE_REPLICATOR_SERVICE_ACCOUNT: &str = "site-replicator-0";
 
@@ -69,6 +88,42 @@ enum PolicyPluginState {
     Failed,
 }
 
+impl PolicyPluginState {
+    fn prepared_iam_auth(&self) -> Option<PreparedIamAuth> {
+        match self {
+            Self::Ready(_) => Some(PreparedIamAuth {
+                needs_existing_object_tag: true,
+                mode: PreparedIamMode::Opa,
+            }),
+            Self::Initializing | Self::Failed => Some(PreparedIamAuth {
+                needs_existing_object_tag: false,
+                mode: PreparedIamMode::Deny,
+            }),
+            Self::Disabled => None,
+        }
+    }
+}
+
+async fn resolve_policy_plugin_state() -> PolicyPluginState {
+    match opa::lookup_config().await {
+        Ok(conf) if conf.enable() => {
+            info!("OPA plugin enabled");
+            PolicyPluginState::Ready(opa::AuthZPlugin::new(conf))
+        }
+        Ok(_) => PolicyPluginState::Failed,
+        Err(e) => {
+            error!(
+                component = "iam",
+                subsystem = "policy_plugin",
+                result = "configuration_load_failed",
+                error_kind = e.kind(),
+                "OPA plugin configuration load failed"
+            );
+            PolicyPluginState::Failed
+        }
+    }
+}
+
 static POLICY_PLUGIN_STATE: OnceLock<Arc<RwLock<PolicyPluginState>>> = OnceLock::new();
 
 fn get_policy_plugin_state() -> Arc<RwLock<PolicyPluginState>> {
@@ -83,23 +138,7 @@ fn get_policy_plugin_state() -> Arc<RwLock<PolicyPluginState>> {
             if configured {
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
-                    let next_state = match opa::lookup_config().await {
-                        Ok(conf) if conf.enable() => {
-                            info!("OPA plugin enabled");
-                            PolicyPluginState::Ready(opa::AuthZPlugin::new(conf))
-                        }
-                        Ok(_) => PolicyPluginState::Failed,
-                        Err(e) => {
-                            error!(
-                                component = "iam",
-                                subsystem = "policy_plugin",
-                                result = "configuration_load_failed",
-                                error_kind = e.kind(),
-                                "OPA plugin configuration load failed"
-                            );
-                            PolicyPluginState::Failed
-                        }
-                    };
+                    let next_state = resolve_policy_plugin_state().await;
                     *state.write().await = next_state;
                 });
             }
@@ -161,7 +200,8 @@ impl PreparedIamAuth {
     /// conditions for the provided request args.
     pub async fn needs_existing_object_tag_for_args(&self, args: &Args<'_>) -> bool {
         match &self.mode {
-            PreparedIamMode::Opa | PreparedIamMode::Owner | PreparedIamMode::Deny => false,
+            PreparedIamMode::Opa => true,
+            PreparedIamMode::Owner | PreparedIamMode::Deny => false,
             PreparedIamMode::Regular { combined_policy } => {
                 policy_needs_existing_object_tag_for_args(combined_policy, args).await
             }
@@ -392,17 +432,135 @@ impl<T: Store> IamSys<T> {
     /// associated session token. This is the primitive used by the admin
     /// `revoke-tokens` endpoint to revoke STS credentials for a parent user.
     pub async fn delete_temp_account(&self, access_key: &str, notify: bool) -> Result<()> {
-        self.store.delete_user(access_key, UserType::Sts).await?;
+        if !notify || self.has_watcher() {
+            return self.store.delete_user(access_key, UserType::Sts).await;
+        }
 
-        if notify && !self.has_watcher() {
-            for r in notify_iam_delete_user(access_key).await {
-                if let Some(err) = r.err {
-                    warn!("notify delete_temp_account failed: {}", err);
+        let runtime = tokio::runtime::Handle::try_current().map_err(Error::other)?;
+        #[cfg(test)]
+        let notification_probe = crate::LOAD_USER_NOTIFICATION_PROBE.try_with(Arc::clone).ok();
+        #[cfg(test)]
+        let notification_available = notification_probe.is_some() || crate::runtime_sources::notification_sys().is_some();
+        #[cfg(not(test))]
+        let notification_available = crate::runtime_sources::notification_sys().is_some();
+        if !notification_available {
+            return Err(Error::other("IAM peer notification system is unavailable"));
+        }
+
+        let store = Arc::clone(&self.store);
+        let access_key = access_key.to_string();
+
+        let operation = async move {
+            store.delete_user(&access_key, UserType::Sts).await?;
+
+            let mut delay = STS_INVALIDATION_RETRY_INITIAL_DELAY;
+            for attempt in 1..=STS_INVALIDATION_MAX_ATTEMPTS {
+                let attempt_error =
+                    match tokio::time::timeout(STS_INVALIDATION_ATTEMPT_TIMEOUT, notify_iam_load_user(&access_key, true)).await {
+                        Ok(results) => results.into_iter().find_map(|result| result.err).map(Error::other),
+                        Err(_) => Some(Error::other("peer STS invalidation timed out")),
+                    };
+                let Some(err) = attempt_error else {
+                    return Ok(());
+                };
+                if attempt == STS_INVALIDATION_MAX_ATTEMPTS {
+                    return Err(Error::other(err));
+                }
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2);
+            }
+            unreachable!("STS invalidation retry loop always returns")
+        };
+
+        #[cfg(test)]
+        let task = runtime.spawn(async move {
+            if let Some(probe) = notification_probe {
+                return crate::LOAD_USER_NOTIFICATION_PROBE.scope(probe, operation).await;
+            }
+            operation.await
+        });
+        #[cfg(not(test))]
+        let task = runtime.spawn(operation);
+
+        task.await.map_err(Error::other)?
+    }
+
+    /// Revoke a set of STS access keys, returning how many were deleted.
+    ///
+    /// An STS credential *is* the session in RustFS, so deleting it invalidates
+    /// the session token immediately. Deletions run concurrently under both a
+    /// per-batch and a process-wide cap, so a large fan-out cannot starve the
+    /// peer-notification path that each individual deletion depends on.
+    ///
+    /// Every key is attempted even when one fails; the first error is returned
+    /// afterwards so a single unreachable peer cannot silently skip the
+    /// remaining revocations.
+    ///
+    /// The MinIO-compatible `revoke-tokens` endpoint keeps its own
+    /// provider-filtered variant (`admin/handlers/idp_compat.rs`) because it
+    /// injects the revoke closure for testing; both funnel into
+    /// [`Self::delete_temp_account`].
+    pub async fn revoke_sts_accounts(&self, access_keys: Vec<String>) -> Result<usize> {
+        use futures::StreamExt as _;
+
+        let results = futures::stream::iter(access_keys)
+            .map(|access_key| async move {
+                let _permit = STS_REVOCATION_PERMITS.acquire().await.map_err(Error::other)?;
+                self.delete_temp_account(&access_key, true).await
+            })
+            .buffer_unordered(STS_REVOCATION_BATCH_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+
+        let mut revoked = 0usize;
+        let mut first_error = None;
+        for result in results {
+            match result {
+                Ok(()) => revoked += 1,
+                Err(err) => {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
                 }
             }
         }
 
-        Ok(())
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(revoked),
+        }
+    }
+
+    /// Revoke every STS session minted from `parent_access_key`.
+    ///
+    /// Called after that identity's secret key changes: a session issued under
+    /// the old secret must not outlive it. Returns the number of sessions
+    /// revoked; zero is a normal result for an identity with no live sessions.
+    pub async fn revoke_sts_sessions_for_parent(&self, parent_access_key: &str) -> Result<usize> {
+        let sessions = self.list_sts_accounts(parent_access_key).await?;
+        if sessions.is_empty() {
+            return Ok(0);
+        }
+
+        let access_keys = sessions.into_iter().map(|cred| cred.access_key).collect();
+        self.revoke_sts_accounts(access_keys).await
+    }
+
+    #[cfg(test)]
+    fn load_user_notification_probe(
+        failures_before_success: usize,
+        block: bool,
+        panic: bool,
+    ) -> Arc<crate::LoadUserNotificationProbe> {
+        Arc::new(crate::LoadUserNotificationProbe {
+            observed: std::sync::Mutex::new(None),
+            remaining_failures: std::sync::atomic::AtomicUsize::new(failures_before_success),
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+            panic,
+            started: tokio::sync::Notify::new(),
+            release: block.then(tokio::sync::Notify::new),
+            completed: tokio::sync::Notify::new(),
+        })
     }
 
     async fn notify_for_user(&self, name: &str, is_temp: bool) {
@@ -1096,20 +1254,8 @@ impl<T: Store> IamSys<T> {
             };
         }
 
-        match Self::policy_plugin_state().await {
-            PolicyPluginState::Ready(_) => {
-                return PreparedIamAuth {
-                    needs_existing_object_tag: false,
-                    mode: PreparedIamMode::Opa,
-                };
-            }
-            PolicyPluginState::Initializing | PolicyPluginState::Failed => {
-                return PreparedIamAuth {
-                    needs_existing_object_tag: false,
-                    mode: PreparedIamMode::Deny,
-                };
-            }
-            PolicyPluginState::Disabled => {}
+        if let Some(prepared) = Self::policy_plugin_state().await.prepared_iam_auth() {
+            return prepared;
         }
 
         let Ok((is_svc, parent_user)) = self.is_service_account(args.account).await else {
@@ -1766,11 +1912,14 @@ mod tests {
     use rustfs_policy::policy::action::{Action, AdminAction, S3Action, StsAction};
     use rustfs_policy::policy::policy_uses_existing_object_tag_conditions;
     use serde_json::Value;
+    use serial_test::serial;
     use std::{
         collections::{HashMap, HashSet},
         sync::{Arc, Mutex},
     };
     use time::OffsetDateTime;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn test_combined_policy_for_view_returns_regular_policy() {
@@ -1797,6 +1946,110 @@ mod tests {
         assert!(prepared.combined_policy_for_view().is_none());
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn test_prepare_auth_requests_existing_object_tags_in_opa_mode() {
+        let store = StsTestMockStore::new(false);
+        let iam_sys = IamSys::new(IamCache::new(store).await.expect("initialize IAM cache"));
+        let previous_state = IamSys::<StsTestMockStore>::policy_plugin_state().await;
+        IamSys::<StsTestMockStore>::set_policy_plugin_client(opa::AuthZPlugin::new(opa::Args {
+            url: "http://127.0.0.1:8181/v1/data/rustfs/authz/allow".to_string(),
+            auth_token: String::new(),
+        }))
+        .await;
+
+        let claims = HashMap::new();
+        let groups = None;
+        let conditions = HashMap::new();
+        let args = Args {
+            account: "opa-tag-test-user",
+            groups: &groups,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: "bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "tagged-object",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        let prepared = iam_sys.prepare_auth(&args).await;
+        let needs_initial_tags = prepared.needs_existing_object_tag;
+        let needs_secondary_tags = prepared.needs_existing_object_tag_for_args(&args).await;
+        *get_policy_plugin_state().write().await = previous_state;
+
+        assert!(needs_initial_tags, "OPA mode must request existing object tags before evaluation");
+        assert!(needs_secondary_tags, "OPA mode must request existing object tags for secondary actions");
+    }
+
+    #[tokio::test]
+    async fn test_prepare_auth_denies_while_policy_plugin_is_unavailable() {
+        let store = StsTestMockStore::new(false);
+        let iam_sys = IamSys::new(IamCache::new(store).await.expect("initialize IAM cache"));
+        let claims = HashMap::new();
+        let groups = None;
+        let conditions = HashMap::new();
+        let args = Args {
+            account: "opa-unavailable-test-user",
+            groups: &groups,
+            action: Action::S3Action(S3Action::ListAllMyBucketsAction),
+            bucket: "",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        let mut outcomes = Vec::new();
+        for state in [PolicyPluginState::Initializing, PolicyPluginState::Failed] {
+            let prepared = state
+                .prepared_iam_auth()
+                .expect("unavailable policy plugin must prepare fail-closed IAM auth");
+            outcomes.push((
+                matches!(&prepared.mode, PreparedIamMode::Deny),
+                iam_sys.eval_prepared(&prepared, &args).await,
+            ));
+        }
+
+        assert_eq!(outcomes, [(true, false), (true, false)]);
+        assert!(PolicyPluginState::Disabled.prepared_iam_auth().is_none());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_policy_plugin_state_fails_after_opa_validation_returns_503() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind OPA validation test listener");
+        let url = format!(
+            "http://{}/v1/data/rustfs/authz/allow",
+            listener.local_addr().expect("read listener address")
+        );
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept OPA validation connection");
+            let mut request = [0_u8; 1024];
+            let bytes = stream.read(&mut request).await.expect("read OPA validation request");
+            assert!(bytes > 0, "OPA validation should send an HTTP request");
+            stream
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("write OPA unavailable response");
+        });
+
+        let state = temp_env::async_with_vars(
+            [
+                ("RUSTFS_POLICY_PLUGIN_URL", Some(url.as_str())),
+                ("RUSTFS_POLICY_PLUGIN_AUTH_TOKEN", None),
+            ],
+            resolve_policy_plugin_state(),
+        )
+        .await;
+        server.await.expect("join OPA validation test server");
+
+        assert!(matches!(state, PolicyPluginState::Failed));
+    }
+
     const CUSTOM_STS_CLAIM_POLICY: &str = "custom-sts-claim-getobject";
     const CUSTOM_STS_CLAIM_BUCKET: &str = "claim-bucket";
     const CUSTOM_STS_CLAIM_POLICY_JSON: &str = r#"{
@@ -1817,6 +2070,11 @@ mod tests {
         empty_policies: bool,
         saved_sts_users: Arc<Mutex<HashMap<String, UserIdentity>>>,
         saved_service_account_count: Arc<Mutex<usize>>,
+        fail_delete: Arc<std::sync::atomic::AtomicBool>,
+        deleted_mapped_policies: Arc<Mutex<Vec<(String, UserType)>>>,
+        block_delete: Arc<std::sync::atomic::AtomicBool>,
+        delete_started: Arc<tokio::sync::Notify>,
+        release_delete: Arc<tokio::sync::Notify>,
     }
 
     impl StsTestMockStore {
@@ -1825,6 +2083,11 @@ mod tests {
                 empty_policies,
                 saved_sts_users: Arc::new(Mutex::new(HashMap::new())),
                 saved_service_account_count: Arc::new(Mutex::new(0)),
+                fail_delete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                deleted_mapped_policies: Arc::new(Mutex::new(Vec::new())),
+                block_delete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                delete_started: Arc::new(tokio::sync::Notify::new()),
+                release_delete: Arc::new(tokio::sync::Notify::new()),
             }
         }
 
@@ -1875,6 +2138,13 @@ mod tests {
         }
 
         async fn delete_user_identity(&self, name: &str, _user_type: UserType) -> Result<()> {
+            if self.block_delete.load(std::sync::atomic::Ordering::SeqCst) {
+                self.delete_started.notify_one();
+                self.release_delete.notified().await;
+            }
+            if self.fail_delete.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(Error::Io(std::io::Error::other("delete temporary account failed")));
+            }
             self.saved_sts_users
                 .lock()
                 .expect("saved_sts_users mutex poisoned")
@@ -1892,7 +2162,7 @@ mod tests {
         }
 
         async fn load_user(&self, name: &str, user_type: UserType, m: &mut HashMap<String, UserIdentity>) -> Result<()> {
-            if name == "deleted-notify-user" {
+            if matches!(name, "deleted-notify-user" | "deleted-notify-sts") {
                 return Err(Error::NoSuchUser(name.to_string()));
             }
 
@@ -1970,7 +2240,11 @@ mod tests {
             Err(Error::InvalidArgument)
         }
 
-        async fn delete_mapped_policy(&self, _name: &str, _user_type: UserType, _is_group: bool) -> Result<()> {
+        async fn delete_mapped_policy(&self, name: &str, user_type: UserType, _is_group: bool) -> Result<()> {
+            self.deleted_mapped_policies
+                .lock()
+                .expect("deleted_mapped_policies mutex poisoned")
+                .push((name.to_string(), user_type));
             Err(Error::InvalidArgument)
         }
 
@@ -3827,6 +4101,363 @@ mod tests {
 
         assert_eq!(policies, vec!["readwrite"]);
         assert!(iam_sys.store.cache.snapshot().sts_policies.contains_key("notify-sts-parent"));
+    }
+
+    #[tokio::test]
+    async fn delete_temp_account_notifies_peers_as_sts_user() {
+        let store = StsTestMockStore::new(false);
+        let cache_manager = IamCache::new(store).await.expect("initialize IAM cache");
+        let iam_sys = IamSys::new(cache_manager);
+        let probe = IamSys::<StsTestMockStore>::load_user_notification_probe(0, false, false);
+
+        crate::LOAD_USER_NOTIFICATION_PROBE
+            .scope(Arc::clone(&probe), async {
+                iam_sys
+                    .delete_temp_account("deleted-notify-sts", true)
+                    .await
+                    .expect("delete temporary account");
+            })
+            .await;
+        assert_eq!(
+            probe
+                .observed
+                .lock()
+                .expect("notification probe mutex poisoned")
+                .as_ref()
+                .map(|(access_key, temp)| (access_key.as_str(), *temp)),
+            Some(("deleted-notify-sts", true)),
+            "peer notification must retain the STS access key and user type"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_temp_account_reports_peer_invalidation_failure() {
+        let store = StsTestMockStore::new(false);
+        let cache_manager = IamCache::new(store).await.expect("initialize IAM cache");
+        let iam_sys = IamSys::new(cache_manager);
+        let probe = IamSys::<StsTestMockStore>::load_user_notification_probe(STS_INVALIDATION_MAX_ATTEMPTS, false, false);
+
+        crate::LOAD_USER_NOTIFICATION_PROBE
+            .scope(Arc::clone(&probe), async {
+                let result = iam_sys.delete_temp_account("deleted-notify-sts", true).await;
+                let err = result.expect_err("failed peer invalidation must fail STS revocation");
+                assert!(err.to_string().contains("peer notification failed"));
+            })
+            .await;
+        assert_eq!(
+            probe
+                .observed
+                .lock()
+                .expect("notification probe mutex poisoned")
+                .as_ref()
+                .map(|(access_key, temp)| (access_key.as_str(), *temp)),
+            Some(("deleted-notify-sts", true)),
+            "failed notification must retain the STS access key and user type"
+        );
+        assert_eq!(probe.attempts.load(std::sync::atomic::Ordering::SeqCst), STS_INVALIDATION_MAX_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn transient_peer_invalidation_retries_after_local_delete() {
+        const ACCESS_KEY: &str = "retryable-revoked-sts";
+
+        let store = StsTestMockStore::new(false);
+        let cache_manager = IamCache::new(store).await.expect("initialize IAM cache");
+        let iam_sys = IamSys::new(cache_manager);
+
+        let probe = IamSys::<StsTestMockStore>::load_user_notification_probe(2, false, false);
+        crate::LOAD_USER_NOTIFICATION_PROBE
+            .scope(Arc::clone(&probe), iam_sys.delete_temp_account(ACCESS_KEY, true))
+            .await
+            .expect("transient peer invalidation should converge within the retry budget");
+
+        assert_eq!(
+            probe.attempts.load(std::sync::atomic::Ordering::SeqCst),
+            STS_INVALIDATION_MAX_ATTEMPTS,
+            "peer invalidation must retry until it succeeds"
+        );
+        assert_eq!(
+            probe
+                .observed
+                .lock()
+                .expect("notification probe mutex poisoned")
+                .as_ref()
+                .map(|(access_key, temp)| (access_key.as_str(), *temp)),
+            Some((ACCESS_KEY, true))
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_peer_invalidation_is_bounded_by_attempt_timeouts() {
+        let store = StsTestMockStore::new(false);
+        let cache_manager = IamCache::new(store).await.expect("initialize IAM cache");
+        let iam_sys = IamSys::new(cache_manager);
+        let probe = IamSys::<StsTestMockStore>::load_user_notification_probe(0, true, false);
+
+        let err = crate::LOAD_USER_NOTIFICATION_PROBE
+            .scope(Arc::clone(&probe), async {
+                iam_sys
+                    .delete_temp_account("stalled-peer-sts", true)
+                    .await
+                    .expect_err("stalled peer invalidation must fail after bounded attempts")
+            })
+            .await;
+
+        assert!(err.to_string().contains("peer STS invalidation timed out"));
+        assert_eq!(probe.attempts.load(std::sync::atomic::Ordering::SeqCst), STS_INVALIDATION_MAX_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn delete_temp_account_reports_local_deletion_failure_without_notifying() {
+        let store = StsTestMockStore::new(false);
+        store.fail_delete.store(true, std::sync::atomic::Ordering::SeqCst);
+        let cache_manager = IamCache::new(store).await.expect("initialize IAM cache");
+        let iam_sys = IamSys::new(cache_manager);
+        let probe = IamSys::<StsTestMockStore>::load_user_notification_probe(0, false, false);
+
+        let err = crate::LOAD_USER_NOTIFICATION_PROBE
+            .scope(Arc::clone(&probe), async {
+                iam_sys
+                    .delete_temp_account("deleted-notify-sts", true)
+                    .await
+                    .expect_err("local deletion failure must fail STS revocation")
+            })
+            .await;
+
+        assert!(err.to_string().contains("delete temporary account failed"));
+        assert!(
+            probe.observed.lock().expect("notification probe mutex poisoned").is_none(),
+            "peer invalidation must not run after local deletion fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_temp_account_reports_notification_task_panic() {
+        let store = StsTestMockStore::new(false);
+        let cache_manager = IamCache::new(store).await.expect("initialize IAM cache");
+        let iam_sys = IamSys::new(cache_manager);
+        let probe = IamSys::<StsTestMockStore>::load_user_notification_probe(0, false, true);
+
+        let err = crate::LOAD_USER_NOTIFICATION_PROBE
+            .scope(Arc::clone(&probe), async {
+                iam_sys
+                    .delete_temp_account("deleted-notify-sts", true)
+                    .await
+                    .expect_err("notification task panic must fail STS revocation")
+            })
+            .await;
+
+        assert!(err.to_string().contains("panicked"));
+    }
+
+    #[tokio::test]
+    async fn delete_temp_account_notification_survives_caller_cancellation() {
+        let store = StsTestMockStore::new(false);
+        let cache_manager = IamCache::new(store).await.expect("initialize IAM cache");
+        let iam_sys = Arc::new(IamSys::new(cache_manager));
+        let probe = IamSys::<StsTestMockStore>::load_user_notification_probe(0, true, false);
+        let call = {
+            let iam_sys = Arc::clone(&iam_sys);
+            crate::LOAD_USER_NOTIFICATION_PROBE.scope(Arc::clone(&probe), async move {
+                iam_sys.delete_temp_account("deleted-notify-sts", true).await
+            })
+        };
+        let call = tokio::spawn(call);
+        probe.started.notified().await;
+
+        call.abort();
+        assert!(call.await.expect_err("caller task should be cancelled").is_cancelled());
+        probe
+            .release
+            .as_ref()
+            .expect("blocking probe must have a release signal")
+            .notify_one();
+        probe.completed.notified().await;
+
+        assert_eq!(
+            probe
+                .observed
+                .lock()
+                .expect("notification probe mutex poisoned")
+                .as_ref()
+                .map(|(access_key, temp)| (access_key.as_str(), *temp)),
+            Some(("deleted-notify-sts", true)),
+            "background peer invalidation must complete with the STS access key and user type"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_temp_account_local_delete_survives_caller_cancellation() {
+        const ACCESS_KEY: &str = "cancelled-during-local-delete";
+
+        let store = StsTestMockStore::new(false);
+        store.saved_sts_users.lock().expect("saved_sts_users mutex poisoned").insert(
+            ACCESS_KEY.to_string(),
+            UserIdentity::from(Credentials {
+                access_key: ACCESS_KEY.to_string(),
+                secret_key: "temporary-user-secret".to_string(),
+                session_token: "session-token".to_string(),
+                status: ACCOUNT_ON.to_string(),
+                ..Default::default()
+            }),
+        );
+        store.block_delete.store(true, std::sync::atomic::Ordering::SeqCst);
+        let store_probe = store.clone();
+        let cache_manager = IamCache::new(store).await.expect("initialize IAM cache");
+        let iam_sys = Arc::new(IamSys::new(cache_manager));
+        let probe = IamSys::<StsTestMockStore>::load_user_notification_probe(0, false, false);
+        let call = {
+            let iam_sys = Arc::clone(&iam_sys);
+            crate::LOAD_USER_NOTIFICATION_PROBE
+                .scope(Arc::clone(&probe), async move { iam_sys.delete_temp_account(ACCESS_KEY, true).await })
+        };
+        let call = tokio::spawn(call);
+        store_probe.delete_started.notified().await;
+
+        call.abort();
+        assert!(call.await.expect_err("caller task should be cancelled").is_cancelled());
+        store_probe.release_delete.notify_one();
+        probe.completed.notified().await;
+
+        assert!(
+            !store_probe
+                .saved_sts_users
+                .lock()
+                .expect("saved_sts_users mutex poisoned")
+                .contains_key(ACCESS_KEY)
+        );
+    }
+
+    #[test]
+    fn notified_delete_without_tokio_runtime_returns_error() {
+        let runtime = tokio::runtime::Runtime::new().expect("create test runtime");
+        let iam_sys = runtime.block_on(async {
+            let store = StsTestMockStore::new(false);
+            let cache_manager = IamCache::new(store).await.expect("initialize IAM cache");
+            IamSys::new(cache_manager)
+        });
+        drop(runtime);
+
+        let result = futures::executor::block_on(iam_sys.delete_temp_account("deleted-notify-sts", true));
+        let err = result.expect_err("notified deletion without a Tokio runtime must return an error");
+        assert!(err.to_string().contains("Tokio"));
+    }
+
+    #[tokio::test]
+    async fn notified_delete_without_notification_system_returns_error() {
+        let store = StsTestMockStore::new(false);
+        let cache_manager = IamCache::new(store).await.expect("initialize IAM cache");
+        let iam_sys = IamSys::new(cache_manager);
+
+        let err = iam_sys
+            .delete_temp_account("deleted-notify-sts", true)
+            .await
+            .expect_err("missing peer notification system must fail STS revocation");
+        assert!(err.to_string().contains("peer notification system is unavailable"));
+    }
+
+    #[tokio::test]
+    async fn missing_sts_notification_evicts_only_sts_cache_entry() {
+        const ACCESS_KEY: &str = "deleted-notify-sts";
+        const GROUP: &str = "deleted-notify-sts-group";
+
+        let store = StsTestMockStore::new(false);
+        let cache_manager = IamCache::new(store).await.expect("initialize IAM cache");
+        let iam_sys = IamSys::new(cache_manager);
+        let regular_user = UserIdentity::from(Credentials {
+            access_key: ACCESS_KEY.to_string(),
+            secret_key: "regular-user-secret".to_string(),
+            status: ACCOUNT_ON.to_string(),
+            ..Default::default()
+        });
+        let sts_user = UserIdentity::from(Credentials {
+            access_key: ACCESS_KEY.to_string(),
+            secret_key: "temporary-user-secret".to_string(),
+            session_token: "session-token".to_string(),
+            status: ACCOUNT_ON.to_string(),
+            ..Default::default()
+        });
+        let mapped_policy = MappedPolicy::new("readwrite");
+        let membership = HashSet::from([GROUP.to_string()]);
+        let group = GroupInfo::new(vec![ACCESS_KEY.to_string()]);
+        iam_sys.store.cache.with_write_lock(|cache| {
+            let now = OffsetDateTime::now_utc();
+            cache.add_or_update_user(ACCESS_KEY, &regular_user, now);
+            cache.add_or_update_user_policy(ACCESS_KEY, &mapped_policy, now);
+            cache.add_or_update_group(GROUP, &group, now);
+            cache.add_or_update_user_group_membership(ACCESS_KEY, &membership, now);
+            cache.add_or_update_sts_account(ACCESS_KEY, &sts_user, now);
+        });
+
+        iam_sys
+            .load_user(ACCESS_KEY, UserType::Sts)
+            .await
+            .expect("process missing STS user notification");
+
+        let cache = iam_sys.store.cache.snapshot();
+        assert!(!cache.sts_accounts.contains_key(ACCESS_KEY));
+        assert!(
+            cache.users.contains_key(ACCESS_KEY),
+            "STS invalidation must not evict a same-name regular user"
+        );
+        assert!(cache.user_policies.contains_key(ACCESS_KEY));
+        assert!(cache.user_group_memberships.contains_key(ACCESS_KEY));
+        assert!(
+            cache
+                .groups
+                .get(GROUP)
+                .is_some_and(|group| group.members.contains(&ACCESS_KEY.to_string())),
+            "STS invalidation must preserve same-name regular-user group membership"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_temp_account_preserves_same_name_regular_cache_state() {
+        const ACCESS_KEY: &str = "deleted-notify-sts";
+
+        let store = StsTestMockStore::new(false);
+        let cache_manager = IamCache::new(store).await.expect("initialize IAM cache");
+        let iam_sys = IamSys::new(cache_manager);
+        let regular_user = UserIdentity::from(Credentials {
+            access_key: ACCESS_KEY.to_string(),
+            secret_key: "regular-user-secret".to_string(),
+            status: ACCOUNT_ON.to_string(),
+            ..Default::default()
+        });
+        let sts_user = UserIdentity::from(Credentials {
+            access_key: ACCESS_KEY.to_string(),
+            secret_key: "temporary-user-secret".to_string(),
+            session_token: "session-token".to_string(),
+            status: ACCOUNT_ON.to_string(),
+            ..Default::default()
+        });
+        let mapped_policy = MappedPolicy::new("readwrite");
+        iam_sys.store.cache.with_write_lock(|cache| {
+            let now = OffsetDateTime::now_utc();
+            cache.add_or_update_user(ACCESS_KEY, &regular_user, now);
+            cache.add_or_update_user_policy(ACCESS_KEY, &mapped_policy, now);
+            cache.add_or_update_sts_account(ACCESS_KEY, &sts_user, now);
+        });
+
+        iam_sys
+            .delete_temp_account(ACCESS_KEY, false)
+            .await
+            .expect("delete temporary account without peer notification");
+
+        let cache = iam_sys.store.cache.snapshot();
+        assert!(!cache.sts_accounts.contains_key(ACCESS_KEY));
+        assert!(cache.users.contains_key(ACCESS_KEY));
+        assert!(cache.user_policies.contains_key(ACCESS_KEY));
+        assert!(
+            iam_sys
+                .store
+                .api
+                .deleted_mapped_policies
+                .lock()
+                .expect("deleted_mapped_policies mutex poisoned")
+                .is_empty(),
+            "deleting one STS identity must not delete a parent-scoped STS policy mapping"
+        );
     }
 
     #[tokio::test]

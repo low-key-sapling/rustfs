@@ -22,13 +22,12 @@
 //! - KMS backend configuration (Local and Vault)
 //! - SSE encryption testing utilities
 
-use crate::common::{
-    RustFSTestEnvironment, awscurl_available, awscurl_get, awscurl_post, init_logging as common_init_logging, local_http_client,
-};
+use crate::common::{RustFSTestEnvironment, awscurl_get, awscurl_post, init_logging as common_init_logging, local_http_client};
 use aws_sdk_s3::Client;
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::ServerSideEncryption;
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use base64_simd::STANDARD as BASE64;
 use http::header::{CONTENT_TYPE, HOST};
 use md5::{Digest as Md5Digest, Md5};
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
@@ -40,7 +39,7 @@ use std::time::Duration;
 use tokio::fs;
 use tokio::net::TcpStream;
 use tokio::time::sleep;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 // KMS-specific constants
 pub const TEST_BUCKET: &str = "kms-test-bucket";
@@ -52,6 +51,9 @@ pub const VAULT_TOKEN: &str = "dev-root-token";
 pub const VAULT_TRANSIT_PATH: &str = "transit";
 pub const VAULT_KEY_NAME: &str = "rustfs-master-key";
 pub const ENV_TEST_VAULT_BIN: &str = "RUSTFS_TEST_VAULT_BIN";
+pub const SSE_C_KEY_MISMATCH_MESSAGE: &str =
+    "The provided encryption parameters did not match the ones used originally to encrypt the object.";
+pub const SSE_C_MISSING_PARAMETERS_MESSAGE: &str = "The object was stored using a form of Server Side Encryption. The correct parameters must be provided to retrieve the object.";
 
 /// Initialize tracing for KMS tests with KMS-specific log levels
 pub fn init_logging() {
@@ -59,19 +61,28 @@ pub fn init_logging() {
     // Additional KMS-specific logging configuration can be added here if needed
 }
 
-pub fn skip_if_kms_admin_tool_unavailable(test_name: &str) -> bool {
-    if awscurl_available() {
-        return false;
-    }
-
-    info!("Skipping {} because awscurl is not available in PATH", test_name);
-    true
-}
-
 pub fn sse_customer_key_md5_base64(key: &str) -> String {
     let mut hasher = Md5::new();
     hasher.update(key.as_bytes());
-    BASE64.encode(hasher.finalize())
+    BASE64.encode_to_string(hasher.finalize())
+}
+
+pub fn assert_s3_error<T, E>(result: Result<T, SdkError<E>>, status: u16, code: &str, message: &str, context: &str)
+where
+    T: std::fmt::Debug,
+    E: ProvideErrorMetadata + std::fmt::Debug,
+{
+    let error = result.expect_err(context);
+    assert_eq!(
+        error.raw_response().map(|response| response.status().as_u16()),
+        Some(status),
+        "{context}: unexpected HTTP status: {error:?}"
+    );
+    let service_error = error
+        .as_service_error()
+        .expect("request failure should retain an S3 service error");
+    assert_eq!(service_error.code(), Some(code), "{context}: unexpected error code: {error:?}");
+    assert_eq!(service_error.message(), Some(message), "{context}: unexpected error message: {error:?}");
 }
 
 pub async fn kms_admin_request(
@@ -177,6 +188,136 @@ pub async fn get_kms_status(
     Ok(status)
 }
 
+/// Poll the KMS status endpoint until the backend reports ready or the timeout
+/// expires.  Replaces hard-coded `sleep(Duration::from_secs(3))` startup waits
+/// with an active readiness probe so tests start as soon as KMS is usable
+/// (typically < 1 s) instead of always waiting the full 3 s.
+///
+/// Uses exponential back-off starting at 200 ms (doubling each attempt, capped
+/// at 1 s) up to a total wall-clock budget of 5 s.
+pub async fn wait_for_kms_ready(
+    base_url: &str,
+    access_key: &str,
+    secret_key: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    wait_for_kms_ready_with_timeout(base_url, access_key, secret_key, Duration::from_secs(5)).await
+}
+
+async fn wait_for_kms_ready_with_timeout(
+    base_url: &str,
+    access_key: &str,
+    secret_key: &str,
+    total_deadline: Duration,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let start = tokio::time::Instant::now();
+    let deadline = start + total_deadline;
+    let mut backoff = Duration::from_millis(200);
+    let max_backoff = Duration::from_secs(1);
+
+    loop {
+        match tokio::time::timeout_at(deadline, get_kms_status(base_url, access_key, secret_key)).await {
+            Ok(Ok(status)) => {
+                let backend_status = serde_json::from_str::<serde_json::Value>(&status)
+                    .ok()
+                    .and_then(|value| value.get("backend_status")?.as_str().map(str::to_owned));
+                if backend_status.as_deref() == Some("healthy") {
+                    info!("KMS is ready (status: {})", status);
+                    return Ok(());
+                }
+                warn!(
+                    backend_status = backend_status.as_deref().unwrap_or("missing"),
+                    elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    "KMS not ready yet, retrying…"
+                );
+            }
+            Ok(Err(e)) => {
+                let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                warn!(error = %e, elapsed_ms, "KMS not ready yet, retrying…");
+            }
+            Err(_) => return Err(format!("KMS failed to become ready within {} ms", total_deadline.as_millis()).into()),
+        }
+
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(format!("KMS failed to become ready within {} ms", total_deadline.as_millis()).into());
+        }
+        sleep((now + backoff).min(deadline) - now).await;
+        backoff = (backoff * 2).min(max_backoff);
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::{wait_for_kms_ready, wait_for_kms_ready_with_timeout};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn kms_readiness_retries_http_success_until_backend_is_healthy() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind readiness test server");
+        let address = listener.local_addr().expect("read readiness test server address");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = Arc::clone(&requests);
+        let server = tokio::spawn(async move {
+            for backend_status in ["error", "healthy"] {
+                let (mut socket, _) = listener.accept().await.expect("accept readiness request");
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = socket.read(&mut chunk).await.expect("read readiness request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                server_requests.fetch_add(1, Ordering::SeqCst);
+
+                let body = format!(r#"{{"backend_status":"{backend_status}"}}"#);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.expect("write readiness response");
+            }
+        });
+
+        wait_for_kms_ready(&format!("http://{address}"), "access-key", "secret-key")
+            .await
+            .expect("KMS should become ready after the healthy response");
+
+        let observed_requests = requests.load(Ordering::SeqCst);
+        server.abort();
+        assert_eq!(observed_requests, 2, "an HTTP 200 unhealthy status must be retried");
+    }
+
+    #[tokio::test]
+    async fn kms_readiness_deadline_covers_a_stalled_status_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind readiness test server");
+        let address = listener.local_addr().expect("read readiness test server address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept readiness request");
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.expect("read readiness request");
+            std::future::pending::<()>().await;
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_kms_ready_with_timeout(&format!("http://{address}"), "access-key", "secret-key", Duration::from_millis(50)),
+        )
+        .await
+        .expect("readiness helper must enforce its own deadline");
+
+        server.abort();
+        assert!(result.is_err(), "a stalled status request must not outlive the readiness deadline");
+    }
+}
+
 /// Create a default KMS key for testing and return the created key ID
 pub async fn create_default_key(
     base_url: &str,
@@ -224,7 +365,7 @@ pub async fn create_key_with_specific_id(key_dir: &str, key_id: &str) -> Result<
         "created_at": format!("{}[UTC]", chrono::Utc::now().to_rfc3339()),
         "rotated_at": serde_json::Value::Null,
         "created_by": "e2e-test",
-        "encrypted_key_material": BASE64.encode(key_data),
+        "encrypted_key_material": BASE64.encode_to_string(key_data),
         "nonce": Vec::<u8>::new()
     });
 
@@ -242,7 +383,7 @@ pub async fn test_sse_c_encryption(s3_client: &Client, bucket: &str) -> Result<(
     info!("Testing SSE-C encryption");
 
     let test_key = "01234567890123456789012345678901"; // 32-byte key
-    let test_key_b64 = base64::engine::general_purpose::STANDARD.encode(test_key);
+    let test_key_b64 = base64_simd::STANDARD.encode_to_string(test_key);
     let test_key_md5 = sse_customer_key_md5_base64(test_key);
     let test_data = b"Hello, KMS SSE-C World!";
     let object_key = "test-sse-c-object";
@@ -360,10 +501,6 @@ pub async fn test_kms_key_management(
     access_key: &str,
     secret_key: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if skip_if_kms_admin_tool_unavailable("test_kms_key_management") {
-        return Ok(());
-    }
-
     info!("Testing KMS key management APIs");
 
     // Test CreateKey
@@ -414,8 +551,8 @@ pub async fn test_error_scenarios(s3_client: &Client, bucket: &str) -> Result<()
     // Test SSE-C with wrong key for download
     let test_key = "01234567890123456789012345678901";
     let wrong_key = "98765432109876543210987654321098";
-    let test_key_b64 = base64::engine::general_purpose::STANDARD.encode(test_key);
-    let wrong_key_b64 = base64::engine::general_purpose::STANDARD.encode(wrong_key);
+    let test_key_b64 = base64_simd::STANDARD.encode_to_string(test_key);
+    let wrong_key_b64 = base64_simd::STANDARD.encode_to_string(wrong_key);
     let test_key_md5 = sse_customer_key_md5_base64(test_key);
     let wrong_key_md5 = sse_customer_key_md5_base64(wrong_key);
     let test_data = b"Test data for error scenarios";
@@ -444,7 +581,13 @@ pub async fn test_error_scenarios(s3_client: &Client, bucket: &str) -> Result<()
         .send()
         .await;
 
-    assert!(wrong_key_result.is_err(), "Download with wrong SSE-C key should fail");
+    assert_s3_error(
+        wrong_key_result,
+        400,
+        "InvalidRequest",
+        SSE_C_KEY_MISMATCH_MESSAGE,
+        "download with a wrong SSE-C key must be rejected",
+    );
     info!("✅ Correctly rejected download with wrong SSE-C key");
 
     info!("Error scenario tests completed successfully");
@@ -664,7 +807,7 @@ pub async fn test_multipart_upload_with_config(
     // Prepare encryption parameters
     let (sse_c_key_b64, sse_c_key_md5) = match &config.encryption_type {
         EncryptionType::SSEC { key, key_md5 } => {
-            let key_b64 = base64::engine::general_purpose::STANDARD.encode(key);
+            let key_b64 = base64_simd::STANDARD.encode_to_string(key);
             (Some(key_b64), Some(key_md5.clone()))
         }
         _ => (None, None),
@@ -859,6 +1002,13 @@ impl LocalKMSTestEnvironment {
             .start_rustfs_server_with_env(extra_args, &[("RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS", "true")])
             .await?;
         Ok(default_key_id.to_string())
+    }
+
+    /// Poll the KMS status endpoint until the backend reports ready.
+    ///
+    /// Prefer this over a fixed `sleep` after calling `start_rustfs_for_local_kms`.
+    pub async fn wait_for_kms_ready(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        wait_for_kms_ready(&self.base_env.url, &self.base_env.access_key, &self.base_env.secret_key).await
     }
 
     /// Configure Local KMS backend with a predefined default key

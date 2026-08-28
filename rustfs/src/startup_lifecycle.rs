@@ -14,6 +14,7 @@
 
 use crate::storage_api::startup::lifecycle::ECStore;
 use crate::{
+    connect::runtime::shutdown_connect_runtimes,
     product,
     server::{ServiceStateManager, ShutdownHandle, start_persisted_event_notifier_reconciler, wait_for_shutdown},
     startup_iam::{IamBootstrapDisposition, publish_ready_for_iam_bootstrap},
@@ -22,6 +23,7 @@ use crate::{
     startup_shutdown::run_startup_shutdown_sequence,
 };
 use rustfs_common::GlobalReadiness;
+use rustfs_object_capacity::capacity_manager::CapacityBackgroundTasks;
 use rustfs_scanner::init_data_scanner;
 use std::{
     io::{Error, Result},
@@ -107,6 +109,7 @@ pub(crate) struct StartupRuntimeLifecycle {
     pub(crate) state_manager: Arc<ServiceStateManager>,
     pub(crate) s3_shutdown_tx: Option<ShutdownHandle>,
     pub(crate) console_shutdown_tx: Option<ShutdownHandle>,
+    pub(crate) capacity_tasks: Option<CapacityBackgroundTasks>,
     pub(crate) service_runtime: StartupServiceRuntime,
     pub(crate) store: Arc<ECStore>,
     pub(crate) shutdown_token: CancellationToken,
@@ -119,6 +122,7 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
         state_manager,
         s3_shutdown_tx,
         console_shutdown_tx,
+        capacity_tasks,
         service_runtime,
         store,
         shutdown_token,
@@ -126,6 +130,8 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
     } = lifecycle;
     let StartupServiceRuntime {
         optional_runtimes,
+        heartbeat,
+        inventory,
         iam_bootstrap,
         enable_scanner,
     } = service_runtime;
@@ -158,9 +164,11 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
         s3_shutdown_tx,
         console_shutdown_tx,
         optional_runtimes,
+        capacity_tasks,
         shutdown_token,
     )
     .await;
+    shutdown_connect_runtimes(heartbeat, inventory).await;
     if let Err(err) = event_notifier_reconciler.await {
         tracing::warn!(
             target: "rustfs::main::run",

@@ -22,8 +22,9 @@
 //! bucket-metadata-sys OnceCell) — under `cargo nextest` each test runs
 //! in its own process so the OnceCell never collides.
 
+#![recursion_limit = "256"]
+
 use http::HeaderMap;
-use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_heal::heal::{
     manager::{HealConfig, HealManager},
     storage::{
@@ -31,6 +32,7 @@ use rustfs_heal::heal::{
     },
     task::{HealOptions, HealPriority, HealRequest, HealTaskStatus, HealType},
 };
+use rustfs_heal_contracts::heal_channel::{HealOpts, HealScanMode};
 use serial_test::serial;
 use std::{
     path::{Path, PathBuf},
@@ -158,6 +160,22 @@ fn xl_meta_path(obj_dir: &Path) -> PathBuf {
     obj_dir.join("xl.meta")
 }
 
+async fn wait_for_two_version_copies(disks: &[PathBuf], bucket: &str, object: &str) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if disks.iter().all(|disk| {
+                let object_dir = object_dir(disk, bucket, object);
+                xl_meta_path(&object_dir).exists() && count_part_files(&object_dir) >= 2
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("PUT rename tails must converge before wiping the versioned fixture");
+}
+
 fn recreate_heal_opts() -> HealOpts {
     // Mirrors the proven-working object heal opts in
     // `heal_integration_test::test_heal_format_with_data`.
@@ -174,7 +192,7 @@ async fn enumerate_all_versions(heal_storage: &Arc<ECStoreHealStorage>, bucket: 
     let mut token: Option<String> = None;
     loop {
         let (page, next, truncated) = heal_storage
-            .list_objects_for_heal_page(bucket, "", token.as_deref())
+            .list_objects_for_heal_page(bucket, "", token.as_deref(), false)
             .await
             .expect("list_objects_for_heal_page failed");
         items.extend(page);
@@ -287,6 +305,7 @@ mod serial_tests {
         let data_v2 = versioned_test_data(20);
         let v1 = put_versioned(&ecstore, bucket, object, &data_v1).await; // OLD, non-latest
         let v2 = put_versioned(&ecstore, bucket, object, &data_v2).await; // latest
+        wait_for_two_version_copies(&disk_paths, bucket, object).await;
 
         // ── Pre-wipe: prove the fixture actually has 2 versions on disk[0] ──
         let obj_dir0 = object_dir(&disk_paths[0], bucket, object);

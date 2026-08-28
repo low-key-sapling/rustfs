@@ -15,7 +15,7 @@
 use crate::cluster::rpc::client::{
     AuthenticatedChannel, TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client,
 };
-use crate::cluster::rpc::set_tonic_mutation_body_digest;
+use crate::cluster::rpc::set_tonic_rolling_mutation_body_digest;
 use async_trait::async_trait;
 use bytes::Bytes;
 use rustfs_lock::{
@@ -27,11 +27,15 @@ use rustfs_protos::{
     ConnectionEvictionLogLevel, evict_failed_connection_with_log_level, models::PingBodyBuilder,
     proto_gen::node_service::node_service_client::NodeServiceClient,
 };
-use std::time::Duration;
+use std::{sync::OnceLock, time::Duration};
 use tokio::time::timeout;
 use tonic::Request;
 use tonic::service::interceptor::InterceptedService;
 use tracing::{debug, info, warn};
+
+fn attach_lock_mutation_body_digest<T: rustfs_protos::CanonicalMutationBody>(request: &mut Request<T>) -> std::io::Result<()> {
+    set_tonic_rolling_mutation_body_digest(request)
+}
 
 /// Remote lock client implementation
 #[derive(Debug, Clone)]
@@ -40,15 +44,35 @@ pub struct RemoteClient {
 }
 
 impl RemoteClient {
+    const ONLINE_CHECK_RESOURCE: &'static str = "health-lock-online";
+
     pub fn new(endpoint: String) -> Self {
         Self { addr: endpoint }
     }
 
-    pub fn from_url(url: url::Url) -> Self {
-        Self { addr: url.to_string() }
+    fn ping_body() -> Bytes {
+        static BODY: OnceLock<Bytes> = OnceLock::new();
+        BODY.get_or_init(|| {
+            let mut fbb = flatbuffers::FlatBufferBuilder::new();
+            let payload = fbb.create_vector(b"health-check");
+            let mut builder = PingBodyBuilder::new(&mut fbb);
+            builder.add_payload(payload);
+            let root = builder.finish();
+            fbb.finish(root, None);
+            Bytes::copy_from_slice(fbb.finished_data())
+        })
+        .clone()
     }
 
     fn build_ping_request() -> PingRequest {
+        PingRequest {
+            version: 1,
+            body: Self::ping_body(),
+        }
+    }
+
+    #[cfg(test)]
+    fn build_fresh_ping_request_for_test() -> PingRequest {
         let mut fbb = flatbuffers::FlatBufferBuilder::new();
         let payload = fbb.create_vector(b"health-check");
         let mut builder = PingBodyBuilder::new(&mut fbb);
@@ -159,6 +183,16 @@ impl RemoteClient {
             rustfs_utils::get_env_u64(
                 rustfs_config::ENV_OBJECT_LOCK_RPC_TIMEOUT_MS,
                 rustfs_config::DEFAULT_OBJECT_LOCK_RPC_TIMEOUT_MS,
+            )
+            .max(1),
+        )
+    }
+
+    fn online_check_timeout() -> Duration {
+        Duration::from_millis(
+            rustfs_utils::get_env_u64(
+                rustfs_config::ENV_HEALTH_LOCK_ONLINE_TIMEOUT_MS,
+                rustfs_config::DEFAULT_HEALTH_LOCK_ONLINE_TIMEOUT_MS,
             )
             .max(1),
         )
@@ -319,7 +353,7 @@ impl LockClient for RemoteClient {
             args: serde_json::to_string(&request)
                 .map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))?,
         });
-        set_tonic_mutation_body_digest(&mut req)?;
+        attach_lock_mutation_body_digest(&mut req)?;
 
         let resp = match self.execute_rpc("lock", &resource_summary, client.lock(req)).await {
             Ok(resp) => resp.into_inner(),
@@ -358,7 +392,7 @@ impl LockClient for RemoteClient {
                 })
                 .collect::<Result<Vec<_>>>()?,
         });
-        set_tonic_mutation_body_digest(&mut req)?;
+        attach_lock_mutation_body_digest(&mut req)?;
 
         let resp = match self
             .execute_rpc("lock_batch", &resource_summary, client.lock_batch(req))
@@ -400,7 +434,7 @@ impl LockClient for RemoteClient {
         let mut client = self.get_client().await?;
         let resource_summary = unlock_request.resource.to_string();
         let mut req = Request::new(GenerallyLockRequest { args: request_string });
-        set_tonic_mutation_body_digest(&mut req)?;
+        attach_lock_mutation_body_digest(&mut req)?;
         let resp = self
             .execute_rpc("release", &resource_summary, client.un_lock(req))
             .await?
@@ -427,7 +461,7 @@ impl LockClient for RemoteClient {
                 })
                 .collect::<Result<Vec<_>>>()?,
         });
-        set_tonic_mutation_body_digest(&mut req)?;
+        attach_lock_mutation_body_digest(&mut req)?;
 
         let resp = self
             .execute_rpc("release_batch", &resource_summary, client.un_lock_batch(req))
@@ -450,7 +484,7 @@ impl LockClient for RemoteClient {
             args: serde_json::to_string(&refresh_request)
                 .map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))?,
         });
-        set_tonic_mutation_body_digest(&mut req)?;
+        attach_lock_mutation_body_digest(&mut req)?;
         let resp = self
             .execute_rpc("refresh", &resource_summary, client.refresh(req))
             .await?
@@ -470,7 +504,7 @@ impl LockClient for RemoteClient {
             args: serde_json::to_string(&force_request)
                 .map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))?,
         });
-        set_tonic_mutation_body_digest(&mut req)?;
+        attach_lock_mutation_body_digest(&mut req)?;
         let resp = self
             .execute_rpc("force_release", &resource_summary, client.force_un_lock(req))
             .await?
@@ -495,7 +529,7 @@ impl LockClient for RemoteClient {
             args: serde_json::to_string(&status_request)
                 .map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))?,
         });
-        set_tonic_mutation_body_digest(&mut req)?;
+        attach_lock_mutation_body_digest(&mut req)?;
 
         // Try exclusive lock first with very short timeout
         let resp = match self.execute_rpc("check_status", &resource_summary, client.lock(req)).await {
@@ -510,7 +544,7 @@ impl LockClient for RemoteClient {
                 args: serde_json::to_string(&status_request)
                     .map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))?,
             });
-            set_tonic_mutation_body_digest(&mut release_req)?;
+            attach_lock_mutation_body_digest(&mut release_req)?;
             let _ = self
                 .execute_rpc("check_status_release", &resource_summary, client.un_lock(release_req))
                 .await;
@@ -547,24 +581,37 @@ impl LockClient for RemoteClient {
     }
 
     async fn is_online(&self) -> bool {
-        // Use Ping interface to test if remote service is online
-        let mut client = match self.get_client().await {
-            Ok(client) => client,
-            Err(_) => {
-                info!("remote client {} connection failed", self.addr);
-                return false;
-            }
-        };
-
-        let ping_req = Request::new(Self::build_ping_request());
-
-        match client.ping(ping_req).await {
-            Ok(_) => {
-                info!("remote client {} is online", self.addr);
+        let online_timeout = Self::online_check_timeout();
+        match timeout(online_timeout, async {
+            let mut client = self.get_client().await?;
+            let ping_req = Request::new(Self::build_ping_request());
+            self.execute_rpc("ping", Self::ONLINE_CHECK_RESOURCE, client.ping(ping_req))
+                .await?;
+            Ok::<(), LockError>(())
+        })
+        .await
+        {
+            Ok(Ok(())) => {
+                debug!(addr = %self.addr, timeout_ms = online_timeout.as_millis(), "remote lock client is online");
                 true
             }
+            Ok(Err(err)) => {
+                debug!(
+                    addr = %self.addr,
+                    timeout_ms = online_timeout.as_millis(),
+                    error = %err,
+                    "remote lock client online check failed"
+                );
+                false
+            }
             Err(_) => {
-                info!("remote client {} ping failed", self.addr);
+                let reason = format!("online check timed out after {:?}", online_timeout);
+                warn!(
+                    addr = %self.addr,
+                    timeout_ms = online_timeout.as_millis(),
+                    "remote lock client online check timed out"
+                );
+                self.evict_connection("ping", &reason, Self::ONLINE_CHECK_RESOURCE).await;
                 false
             }
         }
@@ -624,6 +671,40 @@ mod tests {
         LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner-a")
             .with_acquire_timeout(timeout_duration)
             .with_priority(LockPriority::Normal)
+    }
+
+    #[test]
+    fn lock_mutation_helper_marks_single_and_batch_requests_for_rolling_auth() {
+        let mut single = Request::new(GenerallyLockRequest {
+            args: "single-lock".to_string(),
+        });
+        attach_lock_mutation_body_digest(&mut single).expect("single lock digest must be attached");
+        assert!(
+            single
+                .extensions()
+                .get::<crate::cluster::rpc::http_auth::RollingMutationBodyDigest>()
+                .is_some()
+        );
+
+        let mut batch = Request::new(BatchGenerallyLockRequest {
+            args: vec!["batch-lock".to_string()],
+        });
+        attach_lock_mutation_body_digest(&mut batch).expect("batch lock digest must be attached");
+        assert!(
+            batch
+                .extensions()
+                .get::<crate::cluster::rpc::http_auth::RollingMutationBodyDigest>()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn cached_ping_request_matches_fresh_flatbuffer_payload() {
+        let cached = RemoteClient::build_ping_request();
+        let fresh = RemoteClient::build_fresh_ping_request_for_test();
+
+        assert_eq!(cached.version, fresh.version);
+        assert_eq!(cached.body, fresh.body);
     }
 
     #[tokio::test]
@@ -756,6 +837,48 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn test_remote_client_is_online_uses_health_timeout_and_evicts_connection() {
+        ensure_test_rpc_secret();
+        let Some((addr, accept_task)) = spawn_hanging_listener().await else {
+            return;
+        };
+        cache_lazy_channel(&addr).await;
+        assert!(runtime_sources::test_node_channel_is_cached(&addr).await);
+
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_HEALTH_LOCK_ONLINE_TIMEOUT_MS, Some("50")),
+                (rustfs_config::ENV_OBJECT_LOCK_RPC_TIMEOUT_MS, Some("1000")),
+            ],
+            async {
+                let client = RemoteClient::new(addr.clone());
+                let started_at = tokio::time::Instant::now();
+
+                let online = client.is_online().await;
+                let elapsed = started_at.elapsed();
+
+                assert!(!online, "hanging remote lock peer must not be reported online");
+                assert!(
+                    elapsed >= Duration::from_millis(40),
+                    "remote online check should honor configured health timeout, got {elapsed:?}"
+                );
+                assert!(
+                    elapsed < Duration::from_secs(1),
+                    "health timeout should keep readiness probes bounded, got {elapsed:?}"
+                );
+                assert!(
+                    !runtime_sources::test_node_channel_is_cached(&addr).await,
+                    "online-check timeout should evict cached connection"
+                );
+            },
+        )
+        .await;
+
+        accept_task.abort();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn test_remote_client_refresh_tonic_error_evicts_connection() {
         ensure_test_rpc_secret();
         let Some(addr) = closed_listener_addr().await else {
@@ -879,6 +1002,23 @@ mod tests {
         });
         temp_env::with_var(rustfs_config::ENV_OBJECT_LOCK_RPC_TIMEOUT_MS, Some("0"), || {
             assert_eq!(RemoteClient::rpc_timeout(), Duration::from_millis(1));
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_remote_client_online_timeout_honors_configured_deadline() {
+        temp_env::with_var(rustfs_config::ENV_HEALTH_LOCK_ONLINE_TIMEOUT_MS, None::<&str>, || {
+            assert_eq!(
+                RemoteClient::online_check_timeout(),
+                Duration::from_millis(rustfs_config::DEFAULT_HEALTH_LOCK_ONLINE_TIMEOUT_MS)
+            );
+        });
+        temp_env::with_var(rustfs_config::ENV_HEALTH_LOCK_ONLINE_TIMEOUT_MS, Some("50"), || {
+            assert_eq!(RemoteClient::online_check_timeout(), Duration::from_millis(50));
+        });
+        temp_env::with_var(rustfs_config::ENV_HEALTH_LOCK_ONLINE_TIMEOUT_MS, Some("0"), || {
+            assert_eq!(RemoteClient::online_check_timeout(), Duration::from_millis(1));
         });
     }
 }

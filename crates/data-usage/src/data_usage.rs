@@ -12,8 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use serde::{Deserialize, Serialize, ser::SerializeMap as _};
+use serde::{
+    Deserialize, Serialize,
+    de::{IgnoredAny, SeqAccess, Visitor},
+    ser::SerializeMap as _,
+};
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     hash::{DefaultHasher, Hash, Hasher},
     time::{Duration, SystemTime},
@@ -37,12 +42,21 @@ pub const USAGE_LAST_UPDATE_FUTURE_TOLERANCE: Duration = Duration::from_secs(5 *
 /// Keeping the existing object name preserves rolling-upgrade and rollback
 /// compatibility without allowing an ambiguous snapshot to become authoritative.
 pub const DATA_USAGE_OBJECT_NAME: &str = ".usage.v2.json";
+/// Latest structurally complete scanner observation. Unlike
+/// [`DATA_USAGE_OBJECT_NAME`], this object is never authoritative for quota
+/// admission because namespace activity may have raced the scan.
+pub const DATA_USAGE_OBSERVED_OBJECT_NAME: &str = ".usage.observed.json";
 
 /// Usage snapshot written by scanner implementations predating distributed
 /// leadership fencing. It is read only when neither authoritative snapshot
 /// copy exists.
 // RUSTFS_COMPAT_TODO(scanner-usage-v2): keep .usage.json readable and removable during rolling upgrades from pre-v2 scanners. Remove after supported direct-upgrade sources all write .usage.v2.json.
 pub const LEGACY_DATA_USAGE_OBJECT_NAME: &str = ".usage.json";
+
+/// Fixed bucket for objects whose storage class is not in the scanner's
+/// cycle-local tier registry.  Keeping this key fixed prevents untrusted or
+/// stale tier names from growing persisted per-tier maps without bound.
+pub const UNKNOWN_TIER: &str = "UNKNOWN_TIER";
 
 /// Returns true when `existing_last_update` is ahead of `now` by more than
 /// [`USAGE_LAST_UPDATE_FUTURE_TOLERANCE`], i.e. the persisted timestamp cannot be
@@ -74,9 +88,298 @@ impl TierStats {
             && self.num_objects.checked_add(u.num_objects).is_some()
     }
 
+    /// Add tier counters without allowing a counter to wrap.
+    pub fn checked_add(&self, u: &TierStats) -> Option<TierStats> {
+        Some(TierStats {
+            total_size: self.total_size.checked_add(u.total_size)?,
+            num_versions: self.num_versions.checked_add(u.num_versions)?,
+            num_objects: self.num_objects.checked_add(u.num_objects)?,
+        })
+    }
+
     /// True when this tier contributed nothing, i.e. merging it is a no-op.
     pub fn is_empty(&self) -> bool {
         self.total_size == 0 && self.num_versions == 0 && self.num_objects == 0
+    }
+}
+
+/// Bounded diagnostics for objects whose tier is absent from the cycle
+/// registry. Counters are authoritative; diagnostics are only a small,
+/// redacted reconciliation aid and may be dropped at the configured caps.
+pub const UNKNOWN_TIER_DIAGNOSTIC_ENTRY_CAP: usize = 64;
+pub const UNKNOWN_TIER_DIAGNOSTIC_BYTE_CAP: usize = 4096;
+pub const UNKNOWN_TIER_DIAGNOSTIC_TTL: Duration = Duration::from_secs(60 * 60);
+const UNKNOWN_TIER_DIAGNOSTIC_KEY_BYTES: usize = 256;
+const UNKNOWN_TIER_DIAGNOSTIC_INPUT_CAP: usize = UNKNOWN_TIER_DIAGNOSTIC_ENTRY_CAP * 4;
+
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct UnknownTierStats {
+    /// Logical bytes retained in the scanner's normal usage total.
+    pub unknown_bytes: u64,
+    /// Physical bytes recorded in the per-tier accounting dimension.
+    ///
+    /// Older writers only had `unknown_bytes`; decoding those snapshots keeps
+    /// this field at zero and the scanner fills it for new observations.
+    #[serde(default)]
+    pub unknown_physical_bytes: u64,
+    pub unknown_objects: u64,
+    pub unknown_versions: u64,
+    pub diagnostics_dropped: u64,
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
+    #[serde(default)]
+    pub diagnostics_at: Option<SystemTime>,
+    /// A saturating update occurred; this snapshot cannot prove conservation.
+    /// The field is persisted so a restarted scanner cannot mistake a
+    /// saturated legacy aggregate for exact accounting evidence.
+    #[serde(default)]
+    pub counter_overflowed: bool,
+}
+
+#[derive(Default)]
+struct BoundedDiagnostics {
+    entries: Vec<String>,
+    dropped: u64,
+}
+
+impl<'de> Deserialize<'de> for BoundedDiagnostics {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct BoundedDiagnosticsVisitor;
+
+        impl<'de> Visitor<'de> for BoundedDiagnosticsVisitor {
+            type Value = BoundedDiagnostics;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a sequence of bounded tier diagnostics")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut bounded = BoundedDiagnostics::default();
+                let mut bytes = 0_usize;
+                let mut inspected = 0_usize;
+                loop {
+                    if bounded.entries.len() >= UNKNOWN_TIER_DIAGNOSTIC_ENTRY_CAP
+                        || bytes >= UNKNOWN_TIER_DIAGNOSTIC_BYTE_CAP
+                        || inspected >= UNKNOWN_TIER_DIAGNOSTIC_INPUT_CAP
+                    {
+                        if sequence.next_element::<IgnoredAny>()?.is_none() {
+                            break;
+                        }
+                        bounded.dropped = bounded.dropped.saturating_add(1);
+                        continue;
+                    }
+                    let Some(diagnostic) = sequence.next_element::<Cow<'de, str>>()? else {
+                        break;
+                    };
+                    inspected = inspected.saturating_add(1);
+                    if !is_redacted_tier_diagnostic(&diagnostic)
+                        || bytes.saturating_add(diagnostic.len()) > UNKNOWN_TIER_DIAGNOSTIC_BYTE_CAP
+                        || bounded.entries.iter().any(|entry| entry == &diagnostic)
+                    {
+                        bounded.dropped = bounded.dropped.saturating_add(1);
+                        continue;
+                    }
+                    bytes = bytes.saturating_add(diagnostic.len());
+                    bounded.entries.push(diagnostic.into_owned());
+                }
+                Ok(bounded)
+            }
+        }
+
+        deserializer.deserialize_seq(BoundedDiagnosticsVisitor)
+    }
+}
+
+#[derive(Deserialize)]
+struct UnknownTierStatsWire {
+    #[serde(default)]
+    unknown_bytes: u64,
+    #[serde(default)]
+    unknown_physical_bytes: u64,
+    #[serde(default)]
+    unknown_objects: u64,
+    #[serde(default)]
+    unknown_versions: u64,
+    #[serde(default)]
+    diagnostics_dropped: u64,
+    #[serde(default)]
+    diagnostics: BoundedDiagnostics,
+    #[serde(default)]
+    diagnostics_at: Option<SystemTime>,
+    #[serde(default)]
+    counter_overflowed: bool,
+}
+
+fn is_redacted_tier_diagnostic(diagnostic: &str) -> bool {
+    diagnostic
+        .strip_prefix("tier-hash:")
+        .is_some_and(|digest| digest.len() == 16 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+fn diagnostics_expired(at: SystemTime, now: SystemTime) -> bool {
+    now.duration_since(at).map_or(true, |age| age > UNKNOWN_TIER_DIAGNOSTIC_TTL)
+}
+
+fn checked_saturating_add(left: u64, right: u64, overflowed: &mut bool) -> u64 {
+    match left.checked_add(right) {
+        Some(value) => value,
+        None => {
+            *overflowed = true;
+            u64::MAX
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for UnknownTierStats {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = UnknownTierStatsWire::deserialize(deserializer)?;
+        let mut stats = Self {
+            unknown_bytes: wire.unknown_bytes,
+            unknown_physical_bytes: wire.unknown_physical_bytes,
+            unknown_objects: wire.unknown_objects,
+            unknown_versions: wire.unknown_versions,
+            counter_overflowed: wire.counter_overflowed,
+            diagnostics_dropped: wire.diagnostics_dropped,
+            diagnostics: wire.diagnostics.entries,
+            diagnostics_at: wire.diagnostics_at,
+        };
+        stats.diagnostics_dropped =
+            checked_saturating_add(stats.diagnostics_dropped, wire.diagnostics.dropped, &mut stats.counter_overflowed);
+        if stats
+            .diagnostics_at
+            .is_some_and(|at| diagnostics_expired(at, SystemTime::now()))
+        {
+            stats.diagnostics.clear();
+            stats.diagnostics_at = None;
+        }
+        Ok(stats)
+    }
+}
+
+impl UnknownTierStats {
+    /// Record one observation where the logical and physical dimensions are
+    /// the same. Kept as a small compatibility helper for callers that only
+    /// have one size value.
+    pub fn record(&mut self, tier: &str, bytes: u64, versions: u64, objects: u64) {
+        self.record_dimensions(tier, bytes, bytes, versions, objects);
+    }
+
+    /// Record one observation without conflating logical usage with physical
+    /// tier bytes. Both counters are saturating so malformed metadata cannot
+    /// wrap an aggregate.
+    pub fn record_dimensions(&mut self, tier: &str, logical_bytes: u64, physical_bytes: u64, versions: u64, objects: u64) {
+        self.unknown_bytes = checked_saturating_add(self.unknown_bytes, logical_bytes, &mut self.counter_overflowed);
+        self.unknown_physical_bytes =
+            checked_saturating_add(self.unknown_physical_bytes, physical_bytes, &mut self.counter_overflowed);
+        self.unknown_objects = checked_saturating_add(self.unknown_objects, objects, &mut self.counter_overflowed);
+        self.unknown_versions = checked_saturating_add(self.unknown_versions, versions, &mut self.counter_overflowed);
+
+        let digest = {
+            let mut hasher = DefaultHasher::new();
+            // Bound hashing work for hostile metadata while retaining enough
+            // length/prefix entropy to reconcile repeated observations.
+            hasher.write_u64(u64::try_from(tier.len()).unwrap_or(u64::MAX));
+            let bounded = &tier.as_bytes()[..tier.len().min(UNKNOWN_TIER_DIAGNOSTIC_KEY_BYTES)];
+            hasher.write(bounded);
+            hasher.write_u8(u8::from(bounded.iter().any(|byte| byte.is_ascii_control())));
+            format!("tier-hash:{:016x}", hasher.finish())
+        };
+        let now = SystemTime::now();
+        if self.diagnostics_at.is_some_and(|at| diagnostics_expired(at, now)) {
+            self.diagnostics.clear();
+        }
+        self.diagnostics_at = Some(now);
+        if self.diagnostics.iter().any(|entry| entry == &digest) {
+            return;
+        }
+        let current_bytes: usize = self.diagnostics.iter().map(String::len).sum();
+        if self.diagnostics.len() >= UNKNOWN_TIER_DIAGNOSTIC_ENTRY_CAP
+            || current_bytes.saturating_add(digest.len()) > UNKNOWN_TIER_DIAGNOSTIC_BYTE_CAP
+        {
+            self.diagnostics_dropped = checked_saturating_add(1, self.diagnostics_dropped, &mut self.counter_overflowed);
+            return;
+        }
+        self.diagnostics.push(digest);
+    }
+
+    pub fn merge(&mut self, other: &Self) {
+        self.unknown_bytes = checked_saturating_add(self.unknown_bytes, other.unknown_bytes, &mut self.counter_overflowed);
+        self.unknown_physical_bytes =
+            checked_saturating_add(self.unknown_physical_bytes, other.unknown_physical_bytes, &mut self.counter_overflowed);
+        self.unknown_objects = checked_saturating_add(self.unknown_objects, other.unknown_objects, &mut self.counter_overflowed);
+        self.unknown_versions =
+            checked_saturating_add(self.unknown_versions, other.unknown_versions, &mut self.counter_overflowed);
+        self.diagnostics_dropped =
+            checked_saturating_add(self.diagnostics_dropped, other.diagnostics_dropped, &mut self.counter_overflowed);
+        self.counter_overflowed |= other.counter_overflowed;
+        let now = SystemTime::now();
+        if self.diagnostics_at.is_some_and(|at| diagnostics_expired(at, now)) {
+            self.diagnostics.clear();
+            self.diagnostics_at = None;
+        }
+        if !other.diagnostics_at.is_some_and(|at| diagnostics_expired(at, now)) {
+            for diagnostic in &other.diagnostics {
+                if !is_redacted_tier_diagnostic(diagnostic) {
+                    self.diagnostics_dropped = checked_saturating_add(1, self.diagnostics_dropped, &mut self.counter_overflowed);
+                    continue;
+                }
+                if self.diagnostics.iter().any(|entry| entry == diagnostic) {
+                    continue;
+                }
+                let current_bytes: usize = self.diagnostics.iter().map(String::len).sum();
+                if self.diagnostics.len() >= UNKNOWN_TIER_DIAGNOSTIC_ENTRY_CAP
+                    || current_bytes.saturating_add(diagnostic.len()) > UNKNOWN_TIER_DIAGNOSTIC_BYTE_CAP
+                {
+                    self.diagnostics_dropped = checked_saturating_add(1, self.diagnostics_dropped, &mut self.counter_overflowed);
+                    continue;
+                }
+                self.diagnostics.push(diagnostic.clone());
+            }
+        }
+        if !self.diagnostics.is_empty() {
+            self.diagnostics_at = Some(now);
+        }
+    }
+
+    pub fn fits_add(&self, other: &Self) -> bool {
+        !self.counter_overflowed
+            && !other.counter_overflowed
+            && self.unknown_bytes.checked_add(other.unknown_bytes).is_some()
+            && self
+                .unknown_physical_bytes
+                .checked_add(other.unknown_physical_bytes)
+                .is_some()
+            && self.unknown_objects.checked_add(other.unknown_objects).is_some()
+            && self.unknown_versions.checked_add(other.unknown_versions).is_some()
+            && self.diagnostics_dropped.checked_add(other.diagnostics_dropped).is_some()
+    }
+
+    pub fn checked_add(&self, other: &Self) -> Option<Self> {
+        if !self.fits_add(other) {
+            return None;
+        }
+        let mut merged = self.clone();
+        merged.merge(other);
+        Some(merged)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.counter_overflowed
+            && self.unknown_bytes == 0
+            && self.unknown_physical_bytes == 0
+            && self.unknown_objects == 0
+            && self.unknown_versions == 0
+            && self.diagnostics_dropped == 0
+            && self.diagnostics.is_empty()
     }
 }
 
@@ -119,6 +422,31 @@ impl AllTierStats {
             .tiers
             .iter()
             .all(|(tier, right)| self.tiers.get(tier).is_none_or(|left| left.fits_add(right)))
+    }
+
+    /// Fold keys from an older cache that are no longer present in the
+    /// current registry into the fixed unknown bucket. Built-in storage
+    /// classes remain known even when no remote tier is configured.
+    pub fn fold_unknown_tiers<'a, I>(&mut self, known_tiers: I)
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let known: HashSet<&str> = known_tiers.into_iter().collect();
+        let mut unknown = self.tiers.remove(UNKNOWN_TIER).unwrap_or_default();
+        let retired_tiers: Vec<String> = self
+            .tiers
+            .keys()
+            .filter(|tier| tier.as_str() != "STANDARD" && tier.as_str() != "REDUCED_REDUNDANCY" && !known.contains(tier.as_str()))
+            .cloned()
+            .collect();
+        for tier in retired_tiers {
+            if let Some(stats) = self.tiers.remove(&tier) {
+                unknown = unknown.add(&stats);
+            }
+        }
+        if !unknown.is_empty() {
+            self.tiers.insert(UNKNOWN_TIER.to_string(), unknown);
+        }
     }
 }
 
@@ -207,6 +535,10 @@ pub struct DataUsageInfo {
     /// tier exists, so an absent value means "not accounted", never "zero".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier_stats: Option<AllTierStats>,
+    /// Bounded diagnostics and separate logical/physical counters for objects
+    /// classified into [`UNKNOWN_TIER`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unknown_tier_stats: Option<UnknownTierStats>,
 
     /// Total number of buckets in this cluster
     pub buckets_count: u64,
@@ -218,11 +550,107 @@ pub struct DataUsageInfo {
     /// explicit entry for every bucket, including confirmed-empty buckets.
     #[serde(default)]
     pub usage_snapshot_complete: bool,
+    /// Whether no namespace activity or dirty-usage generation changed while
+    /// the coordinated snapshot was being produced.
+    ///
+    /// `false` still describes a structurally complete, useful point-in-time
+    /// usage view, but follow-up scanner work remains pending. `None` is kept
+    /// for snapshots written before this status became observable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_snapshot_converged: Option<bool>,
+    /// Identity of the authoritative snapshot from which a nonconverged
+    /// observation started. Admin readers require an exact match before using
+    /// the observation, so bucket namespace mutations fence old observations
+    /// without relying on synchronized clocks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_snapshot_authoritative_baseline: Option<DataUsageSnapshotIdentity>,
+    /// Per-set freshness for an observational aggregate.  A set entry is
+    /// never sufficient to make the aggregate authoritative; it only records
+    /// which last-known-good generation contributed to the view.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub usage_snapshot_set_states: Vec<DataUsageSnapshotSetState>,
+    /// An observational view may contain only the sets that completed this
+    /// cycle (or retained a compatible last-known-good cache).
+    #[serde(default)]
+    pub usage_snapshot_partial: bool,
+    /// Durable marker for a first-start bootstrap that has not produced an
+    /// authoritative usage snapshot yet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub usage_snapshot_bootstrap_pending: bool,
     /// Deprecated kept here for backward compatibility reasons
     pub bucket_sizes: HashMap<String, u64>,
     /// Per-disk snapshot information when available
     #[serde(default)]
     pub disk_usage_status: Vec<DiskUsageStatus>,
+}
+
+/// Stable identity fields changed by both coordinated scanner publication and
+/// backward-compatible bucket namespace cleanup.
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DataUsageSnapshotIdentity {
+    pub last_update: Option<SystemTime>,
+    pub scanner_cycle: Option<u64>,
+    pub scanner_epoch: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DataUsageSnapshotSetState {
+    pub pool_index: u64,
+    pub set_index: u64,
+    #[serde(default)]
+    pub scanner_cycle: Option<u64>,
+    #[serde(default)]
+    pub scanner_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_plan_digest: Option<[u8; 32]>,
+    #[serde(default)]
+    pub complete: bool,
+    #[serde(default)]
+    pub tombstone: bool,
+}
+
+impl DataUsageInfo {
+    pub fn snapshot_identity(&self) -> DataUsageSnapshotIdentity {
+        DataUsageSnapshotIdentity {
+            last_update: self.last_update,
+            scanner_cycle: self.scanner_cycle,
+            scanner_epoch: self.scanner_epoch,
+        }
+    }
+}
+
+/// Return whether `candidate` was produced after `baseline`.
+///
+/// New coordinated snapshots are ordered by leadership epoch and scanner
+/// cycle. The timestamp fallback preserves ordering for legacy snapshots that
+/// predate those fields.
+pub fn data_usage_snapshot_is_newer(candidate: &DataUsageInfo, baseline: &DataUsageInfo) -> bool {
+    match (
+        candidate.scanner_epoch.zip(candidate.scanner_cycle),
+        baseline.scanner_epoch.zip(baseline.scanner_cycle),
+    ) {
+        (Some(candidate), Some(baseline)) => candidate > baseline,
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => match (candidate.last_update, baseline.last_update) {
+            (Some(candidate), Some(baseline)) => candidate > baseline,
+            (Some(_), None) => true,
+            (None, Some(_) | None) => false,
+        },
+    }
+}
+
+/// Return whether a nonconverged observation may safely supersede the admin
+/// view of `authoritative`.
+///
+/// The exact baseline identity is independent of clock ordering. Older binaries
+/// already advance the authoritative timestamp when deleting a bucket, so a
+/// rollback delete/recreate fences the previous bucket incarnation too.
+pub fn observed_data_usage_is_newer(observed: &DataUsageInfo, authoritative: &DataUsageInfo) -> bool {
+    observed.usage_snapshot_converged == Some(false)
+        && (observed.is_complete_bucket_usage_snapshot() || observed.is_valid_partial_snapshot())
+        && observed.usage_snapshot_authoritative_baseline.as_ref() == Some(&authoritative.snapshot_identity())
+        && data_usage_snapshot_is_newer(observed, authoritative)
 }
 
 /// Metadata describing the status of a disk-level data usage snapshot.
@@ -236,6 +664,80 @@ pub struct DiskUsageStatus {
     pub snapshot_exists: bool,
 }
 
+/// Independent conservation evidence for a scanner summary.
+///
+/// The totals are maintained while objects are accounted and are deliberately
+/// not reconstructed from the tier map at publish time. `*_known` records the
+/// portion represented by the corresponding accounting dimension.
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TierAccountingProof {
+    pub logical_total: u64,
+    pub logical_known: u64,
+    pub physical_total: u64,
+    pub physical_known: u64,
+    #[serde(default)]
+    pub overflowed: bool,
+}
+
+impl TierAccountingProof {
+    pub fn checked_add(self, other: Self) -> Option<Self> {
+        if self.overflowed || other.overflowed {
+            return None;
+        }
+        Some(Self {
+            logical_total: self.logical_total.checked_add(other.logical_total)?,
+            logical_known: self.logical_known.checked_add(other.logical_known)?,
+            physical_total: self.physical_total.checked_add(other.physical_total)?,
+            physical_known: self.physical_known.checked_add(other.physical_known)?,
+            overflowed: false,
+        })
+    }
+
+    pub fn saturating_add(&mut self, other: Self) {
+        let Some(merged) = (*self).checked_add(other) else {
+            self.logical_total = self.logical_total.saturating_add(other.logical_total);
+            self.logical_known = self.logical_known.saturating_add(other.logical_known);
+            self.physical_total = self.physical_total.saturating_add(other.physical_total);
+            self.physical_known = self.physical_known.saturating_add(other.physical_known);
+            self.overflowed = true;
+            return;
+        };
+        *self = merged;
+    }
+}
+
+/// A bounded reconciliation record for an object whose logical size could not
+/// be trusted at the scanner boundary. The scanner persists these records in
+/// its cache; keeping the model here avoids a second, incompatible accounting
+/// representation in storage-facing crates.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SizeReconciliationEntry {
+    /// Stable object/version identity key (not a metrics label).
+    pub key: String,
+    pub bucket: String,
+    pub object: String,
+    #[serde(default)]
+    pub version_id: Option<String>,
+    #[serde(default)]
+    pub generation: Option<String>,
+    /// Structured reason label; raw metadata values must never be stored here.
+    pub reason: String,
+    #[serde(default)]
+    pub physical_size: Option<u64>,
+    #[serde(default)]
+    pub first_seen: u64,
+    #[serde(default)]
+    pub attempts: u32,
+}
+
+/// Object scope refreshed by one scanner pass. Existing debts in this scope
+/// are removed before the pass's unresolved records are inserted.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SizeReconciliationScope {
+    pub bucket: String,
+    pub object: String,
+}
+
 /// Size summary for a single object or group of objects
 #[derive(Debug, Default, Clone)]
 pub struct SizeSummary {
@@ -246,15 +748,15 @@ pub struct SizeSummary {
     /// Number of delete markers
     pub delete_markers: usize,
     /// Replicated size
-    pub replicated_size: usize,
+    pub replicated_size: i64,
     /// Replicated count
     pub replicated_count: usize,
     /// Pending size
-    pub pending_size: usize,
+    pub pending_size: i64,
     /// Failed size
-    pub failed_size: usize,
+    pub failed_size: i64,
     /// Replica size
-    pub replica_size: usize,
+    pub replica_size: i64,
     /// Replica count
     pub replica_count: usize,
     /// Pending count
@@ -263,19 +765,35 @@ pub struct SizeSummary {
     pub failed_count: usize,
     /// Replication target stats
     pub repl_target_stats: HashMap<String, ReplTargetSizeSummary>,
+    /// Per-tier accounting, keyed by storage class or remote tier name
+    pub tier_stats: HashMap<String, TierStats>,
+    /// Counters and bounded diagnostics for unknown tiers in this summary.
+    pub unknown_tier_stats: UnknownTierStats,
+    /// Independent logical/physical conservation evidence.
+    pub tier_accounting_proof: TierAccountingProof,
+    /// Size-resolution debts observed while scanning this summary.
+    pub size_reconciliation: Vec<SizeReconciliationEntry>,
+    /// True when the per-object summary exceeded its bounded debt buffer.
+    /// Callers must retain prior ledger entries rather than treating the
+    /// partial list as a complete refresh.
+    pub size_reconciliation_truncated: bool,
+    /// Object scopes refreshed by this summary. They let the durable ledger
+    /// remove versions that resolved without allocating one key per healthy
+    /// version on the hot path.
+    pub reconciliation_scopes: Vec<SizeReconciliationScope>,
 }
 
 /// Replication target size summary
 #[derive(Debug, Default, Clone)]
 pub struct ReplTargetSizeSummary {
     /// Replicated size
-    pub replicated_size: usize,
+    pub replicated_size: i64,
     /// Replicated count
     pub replicated_count: usize,
     /// Pending size
-    pub pending_size: usize,
+    pub pending_size: i64,
     /// Failed size
-    pub failed_size: usize,
+    pub failed_size: i64,
     /// Pending count
     pub pending_count: usize,
     /// Failed count
@@ -354,6 +872,10 @@ impl<'de> Deserialize<'de> for SizeHistogram {
 }
 
 impl SizeHistogram {
+    pub fn is_empty(&self) -> bool {
+        self.0.iter().all(|value| *value == 0)
+    }
+
     pub fn add(&mut self, size: u64) {
         let intervals = [
             (0, 1024 - 1),                              // LESS_THAN_1024_B
@@ -468,6 +990,10 @@ impl<'de> Deserialize<'de> for VersionsHistogram {
 }
 
 impl VersionsHistogram {
+    pub fn is_empty(&self) -> bool {
+        self.0.iter().all(|value| *value == 0)
+    }
+
     pub fn add(&mut self, count: u64) {
         let intervals = [
             (0, 0),            // UNVERSIONED
@@ -512,9 +1038,12 @@ impl VersionsHistogram {
     }
 }
 
-/// Replication statistics for a single target
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct ReplicationStats {
+/// Replication statistics for a single target.
+///
+/// Renamed from `ReplicationStats`; serde field names are preserved
+/// byte-identically to maintain wire compatibility with existing snapshots.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplicationTargetUsage {
     pub pending_size: u64,
     pub replicated_size: u64,
     pub failed_size: u64,
@@ -527,7 +1056,7 @@ pub struct ReplicationStats {
     pub replicated_count: u64,
 }
 
-impl ReplicationStats {
+impl ReplicationTargetUsage {
     pub fn is_empty(&self) -> bool {
         let Self {
             pending_size,
@@ -563,7 +1092,7 @@ impl ReplicationStats {
 /// Replication statistics for all targets
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ReplicationAllStats {
-    pub targets: HashMap<String, ReplicationStats>,
+    pub targets: HashMap<String, ReplicationTargetUsage>,
     pub replica_size: u64,
     pub replica_count: u64,
 }
@@ -576,7 +1105,7 @@ impl ReplicationAllStats {
             targets,
         } = self;
 
-        *replica_size == 0 && *replica_count == 0 && targets.values().all(ReplicationStats::is_empty)
+        *replica_size == 0 && *replica_count == 0 && targets.values().all(ReplicationTargetUsage::is_empty)
     }
 
     #[deprecated(note = "use is_empty instead")]
@@ -605,6 +1134,13 @@ pub struct DataUsageEntry {
     /// observed tier-classified objects.
     #[serde(default)]
     pub all_tier_stats: Option<AllTierStats>,
+    /// Bounded unknown-tier reconciliation state for this cache entry.
+    #[serde(default)]
+    pub unknown_tier_stats: Option<UnknownTierStats>,
+    /// Optional conservation proof. Missing values are legacy/unproven, not
+    /// zero-valued evidence.
+    #[serde(default)]
+    pub tier_accounting_proof: Option<TierAccountingProof>,
 }
 
 impl Serialize for DataUsageEntry {
@@ -615,7 +1151,9 @@ impl Serialize for DataUsageEntry {
         // Keep entries map-encoded so older readers can ignore fields appended
         // by newer scanner versions during rolling upgrades. The derived
         // (array) encoding made any appended field a decode error for them.
-        let mut state = serializer.serialize_map(Some(11))?;
+        let mut state = serializer.serialize_map(Some(
+            11 + usize::from(self.unknown_tier_stats.is_some()) + usize::from(self.tier_accounting_proof.is_some()),
+        ))?;
         state.serialize_entry("children", &self.children)?;
         state.serialize_entry("size", &self.size)?;
         state.serialize_entry("objects", &self.objects)?;
@@ -627,11 +1165,35 @@ impl Serialize for DataUsageEntry {
         state.serialize_entry("compacted", &self.compacted)?;
         state.serialize_entry("failed_objects", &self.failed_objects)?;
         state.serialize_entry("all_tier_stats", &self.all_tier_stats)?;
+        // Keep the legacy no-unknown shape byte-for-byte stable. Once unknown
+        // accounting exists, append its map field before the optional proof.
+        if let Some(unknown_tier_stats) = self.unknown_tier_stats.as_ref() {
+            state.serialize_entry("unknown_tier_stats", unknown_tier_stats)?;
+        }
+        if let Some(proof) = self.tier_accounting_proof.as_ref() {
+            state.serialize_entry("tier_accounting_proof", proof)?;
+        }
         state.end()
     }
 }
 
 impl DataUsageEntry {
+    fn has_local_usage(&self) -> bool {
+        self.size != 0
+            || self.objects != 0
+            || self.versions != 0
+            || self.delete_markers != 0
+            || self.failed_objects != 0
+            || self.obj_sizes.0.iter().any(|value| *value != 0)
+            || self.obj_versions.0.iter().any(|value| *value != 0)
+            || self.replication_stats.as_ref().is_some_and(|stats| !stats.is_empty())
+            || self
+                .all_tier_stats
+                .as_ref()
+                .is_some_and(|stats| stats.tiers.values().any(|tier| !tier.is_empty()))
+            || self.unknown_tier_stats.as_ref().is_some_and(|stats| !stats.is_empty())
+    }
+
     pub fn add_child(&mut self, hash: &DataUsageHash) {
         if self.children.contains(&hash.key()) {
             return;
@@ -639,29 +1201,9 @@ impl DataUsageEntry {
         self.children.insert(hash.key());
     }
 
-    pub fn add_sizes(&mut self, summary: &SizeSummary) {
-        self.size += summary.total_size;
-        self.versions += summary.versions;
-        self.delete_markers += summary.delete_markers;
-        self.obj_sizes.add(summary.total_size as u64);
-        self.obj_versions.add(summary.versions as u64);
-
-        let replication_stats = self.replication_stats.get_or_insert_with(ReplicationAllStats::default);
-        replication_stats.replica_size += summary.replica_size as u64;
-        replication_stats.replica_count += summary.replica_count as u64;
-
-        for (arn, st) in &summary.repl_target_stats {
-            let tgt_stat = replication_stats.targets.entry(arn.to_string()).or_default();
-            tgt_stat.pending_size += st.pending_size as u64;
-            tgt_stat.failed_size += st.failed_size as u64;
-            tgt_stat.replicated_size += st.replicated_size as u64;
-            tgt_stat.replicated_count += st.replicated_count as u64;
-            tgt_stat.failed_count += st.failed_count as u64;
-            tgt_stat.pending_count += st.pending_count as u64;
-        }
-    }
-
     pub fn merge(&mut self, other: &DataUsageEntry) {
+        let self_had_local_usage = self.has_local_usage();
+        let other_had_local_usage = other.has_local_usage();
         self.objects += other.objects;
         self.versions += other.versions;
         self.delete_markers += other.delete_markers;
@@ -690,6 +1232,29 @@ impl DataUsageEntry {
         if let Some(o_tiers) = other.all_tier_stats.as_ref().filter(|tiers| !tiers.is_empty()) {
             self.all_tier_stats.get_or_insert_with(AllTierStats::new).merge(o_tiers);
         }
+        if let Some(other_unknown) = other.unknown_tier_stats.as_ref() {
+            self.unknown_tier_stats
+                .get_or_insert_with(UnknownTierStats::default)
+                .merge(other_unknown);
+        }
+
+        self.tier_accounting_proof = match (self.tier_accounting_proof, other.tier_accounting_proof) {
+            (Some(mut left), Some(right)) => {
+                left.saturating_add(right);
+                Some(left)
+            }
+            (None, Some(right)) if !self_had_local_usage => Some(right),
+            (Some(left), None) if !other_had_local_usage => Some(left),
+            (None, None) => None,
+            _ => None,
+        };
+        // A saturated unknown-tier counter invalidates conservation evidence;
+        // never let an otherwise valid proof hide that loss of precision.
+        if self.unknown_tier_stats.as_ref().is_some_and(|stats| stats.counter_overflowed)
+            && let Some(proof) = self.tier_accounting_proof.as_mut()
+        {
+            proof.overflowed = true;
+        }
 
         self.obj_sizes.merge_from(&other.obj_sizes);
         self.obj_versions.merge_from(&other.obj_versions);
@@ -701,6 +1266,15 @@ impl DataUsageEntry {
             return;
         }
         self.all_tier_stats.get_or_insert_with(AllTierStats::new).add_sizes(tiers);
+    }
+
+    pub fn add_unknown_tier_stats(&mut self, stats: &UnknownTierStats) {
+        if stats.is_empty() {
+            return;
+        }
+        self.unknown_tier_stats
+            .get_or_insert_with(UnknownTierStats::default)
+            .merge(stats);
     }
 
     pub fn checked_merge(&mut self, other: &DataUsageEntry) -> bool {
@@ -766,8 +1340,21 @@ impl DataUsageEntry {
             (_, None) | (None, Some(_)) => true,
             (Some(left), Some(right)) => left.fits_merge(right),
         };
+        let unknown_tier_stats_fit = match (&self.unknown_tier_stats, &other.unknown_tier_stats) {
+            (None, None) => true,
+            (Some(left), None) => !left.counter_overflowed,
+            (None, Some(right)) => !right.counter_overflowed,
+            (Some(left), Some(right)) => left.fits_add(right),
+        };
 
-        if !scalar_counts_fit || !histograms_fit || !replication_fits || !tier_stats_fit {
+        let proof_fit = match (self.tier_accounting_proof, other.tier_accounting_proof) {
+            (Some(left), Some(right)) => left.checked_add(right).is_some(),
+            (Some(proof), None) | (None, Some(proof)) => !proof.overflowed,
+            (None, None) => true,
+        };
+
+        if !scalar_counts_fit || !histograms_fit || !replication_fits || !tier_stats_fit || !unknown_tier_stats_fit || !proof_fit
+        {
             return false;
         }
         self.merge(other);
@@ -775,8 +1362,16 @@ impl DataUsageEntry {
     }
 }
 
-/// Data usage cache info
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+/// Read-only projection of the scanner's `.usage-cache.bin` info block.
+///
+/// The canonical wire format is written by the hand-written map-encoded
+/// `Serialize` on the scanner-side `DataUsageCacheInfo`
+/// (`crates/scanner/src/data_usage_define.rs`), which carries the original 16
+/// fields plus an optional reconciliation field.
+/// This type decodes only the shared subset and is deliberately not
+/// `Serialize`: a derived (array) encoding of this 6-field subset would
+/// corrupt the cache for scanner readers, so no write path may exist here.
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct DataUsageCacheInfo {
     pub name: String,
     pub next_cycle: u64,
@@ -792,8 +1387,163 @@ pub struct DataUsageCacheInfo {
     pub snapshot_complete: bool,
 }
 
-/// Data usage cache
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+/// Prefix-level usage over a raw entry map — the shared core behind
+/// [`DataUsageCache::prefix_usage`], usable by any cache-shaped reader (the
+/// scanner's writer-side cache has the same map type).
+///
+/// Cache keys are cleaned literal paths (`bucket/pre/fix`), so sub-prefix
+/// names come straight off the child keys — no reverse mapping exists or is
+/// needed. A compacted prefix carries its aggregate but no children, which
+/// the `compacted` flag reports so callers can say why the breakdown is
+/// empty. `truncated` is set when the breakdown exceeded `max_entries` and
+/// was cut (largest first).
+pub fn prefix_usage_in_cache(
+    cache: &HashMap<String, DataUsageEntry>,
+    bucket: &str,
+    prefix: &str,
+    max_entries: usize,
+) -> Option<PrefixUsageQuery> {
+    let prefix = prefix.trim_matches('/');
+    let root = if prefix.is_empty() {
+        bucket.to_string()
+    } else {
+        format!("{bucket}/{prefix}")
+    };
+    let entry = cache.get(&hash_path(&root).key())?.clone();
+
+    let usage = PrefixUsageSummary::from_entry(&flatten_entry(cache, &entry, 0)?);
+
+    let child_prefix = format!("{root}/");
+    let mut sub_prefixes: Vec<PrefixUsageEntry> = entry
+        .children
+        .iter()
+        .filter_map(|child_key| {
+            let child = cache.get(child_key)?;
+            let child_flat = flatten_entry(cache, child, 1)?;
+            // Child keys are literal `bucket/pre/name` paths; a trailing
+            // slash marks a directory object and is display-only here.
+            let name = child_key
+                .strip_prefix(child_prefix.as_str())
+                .unwrap_or(child_key.as_str())
+                .trim_end_matches('/')
+                .to_string();
+            Some(PrefixUsageEntry {
+                prefix: name,
+                usage: PrefixUsageSummary::from_entry(&child_flat),
+            })
+        })
+        .collect();
+    sub_prefixes.sort_by(|left, right| {
+        right
+            .usage
+            .size
+            .cmp(&left.usage.size)
+            .then_with(|| left.prefix.cmp(&right.prefix))
+    });
+    let truncated = sub_prefixes.len() > max_entries;
+    sub_prefixes.truncate(max_entries);
+
+    Some(PrefixUsageQuery {
+        usage,
+        compacted: entry.compacted,
+        truncated,
+        sub_prefixes,
+    })
+}
+
+/// Maximum subtree depth [`flatten_entry`] will walk before declaring the
+/// cache corrupt — the same bound the scanner's checked flatten uses.
+const PREFIX_USAGE_MAX_DEPTH: usize = 1024;
+
+/// Flatten one entry's subtree into an aggregate: the free-function twin of
+/// [`DataUsageCache::flatten`], carrying the scanner checked-flatten
+/// hardening so a corrupt cache (cycles, over-deep trees, overflowing
+/// counters) yields `None` instead of unbounded recursion or wrapped totals.
+fn flatten_entry(cache: &HashMap<String, DataUsageEntry>, root: &DataUsageEntry, depth: usize) -> Option<DataUsageEntry> {
+    if depth > PREFIX_USAGE_MAX_DEPTH {
+        return None;
+    }
+    let mut flattened = DataUsageEntry::default();
+    if !flattened.checked_merge(root) {
+        return None;
+    }
+    flattened.compacted = root.compacted;
+    // The root itself is not pre-seeded: it is merged above, and a corrupt
+    // child edge pointing back at the root's own key is still terminated by
+    // the visited set on first encounter.
+    let mut visited: HashSet<&str> = HashSet::new();
+    let mut pending: Vec<(&String, usize)> = root.children.iter().map(|child| (child, depth + 1)).collect();
+    while let Some((key, child_depth)) = pending.pop() {
+        if child_depth > PREFIX_USAGE_MAX_DEPTH || !visited.insert(key.as_str()) {
+            return None;
+        }
+        let entry = cache.get(key)?;
+        if !flattened.checked_merge(entry) {
+            return None;
+        }
+        pending.extend(entry.children.iter().map(|child| (child, child_depth + 1)));
+    }
+    flattened.children.clear();
+    Some(flattened)
+}
+
+/// Flattened counters of one prefix subtree, as returned by
+/// [`DataUsageCache::prefix_usage`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrefixUsageSummary {
+    pub size: u64,
+    pub objects: u64,
+    pub versions: u64,
+    pub delete_markers: u64,
+}
+
+impl PrefixUsageSummary {
+    fn from_entry(entry: &DataUsageEntry) -> Self {
+        Self {
+            size: entry.size as u64,
+            objects: entry.objects as u64,
+            versions: entry.versions as u64,
+            delete_markers: entry.delete_markers as u64,
+        }
+    }
+
+    /// Add another set's counters into this one (entries are partitioned by
+    /// set, so per-set results sum).
+    pub fn merge(&mut self, other: &Self) {
+        self.size = self.size.saturating_add(other.size);
+        self.objects = self.objects.saturating_add(other.objects);
+        self.versions = self.versions.saturating_add(other.versions);
+        self.delete_markers = self.delete_markers.saturating_add(other.delete_markers);
+    }
+}
+
+/// One first-level sub-prefix row of a [`PrefixUsageQuery`].
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct PrefixUsageEntry {
+    pub prefix: String,
+    pub usage: PrefixUsageSummary,
+}
+
+/// Result of [`DataUsageCache::prefix_usage`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrefixUsageQuery {
+    pub usage: PrefixUsageSummary,
+    /// The prefix entry was compacted by the scanner: its aggregate is valid
+    /// but no sub-prefix breakdown exists on disk.
+    pub compacted: bool,
+    /// The breakdown had more entries than `max_entries`; the largest remain.
+    pub truncated: bool,
+    pub sub_prefixes: Vec<PrefixUsageEntry>,
+}
+
+/// Read-only projection of a scanner-written `.usage-cache.bin` file.
+///
+/// The scanner-side `DataUsageCache` (`crates/scanner/src/data_usage_define.rs`)
+/// owns the persisted format; this type only decodes it (see
+/// [`DataUsageCacheInfo`]) and must never grow a serialization path.
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct DataUsageCache {
     pub info: DataUsageCacheInfo,
     pub cache: HashMap<String, DataUsageEntry>,
@@ -913,6 +1663,21 @@ impl DataUsageCache {
             Some(due) => due.compacted,
             None => false,
         }
+    }
+
+    /// Prefix-level usage for one bucket subtree, plus the one-level
+    /// breakdown below it (rustfs/backlog#1872, MinIO
+    /// `loadPrefixUsageFromBackend` parity and beyond: arbitrary prefixes and
+    /// full counters instead of first-level sizes only).
+    ///
+    /// Cache keys are cleaned literal paths (`bucket/pre/fix`), so sub-prefix
+    /// names come straight off the child keys — no reverse mapping exists or
+    /// is needed. A compacted prefix carries its aggregate but no children,
+    /// which the `compacted` flag reports so callers can say why the
+    /// breakdown is empty. `truncated` is set when the breakdown exceeded
+    /// `max_entries` and was cut (largest first).
+    pub fn prefix_usage(&self, bucket: &str, prefix: &str, max_entries: usize) -> Option<PrefixUsageQuery> {
+        prefix_usage_in_cache(&self.cache, bucket, prefix, max_entries)
     }
 
     pub fn force_compact(&mut self, limit: usize) {
@@ -1108,6 +1873,7 @@ impl DataUsageCache {
             delete_markers_total_count: flat.delete_markers as u64,
             objects_total_size: flat.size as u64,
             tier_stats: flat.all_tier_stats.filter(|tiers| !tiers.is_empty()),
+            unknown_tier_stats: flat.unknown_tier_stats.filter(|stats| !stats.is_empty()),
             buckets_count: u64::try_from(buckets.len()).unwrap_or(u64::MAX),
             buckets_usage,
             usage_snapshot_complete: self.info.snapshot_complete,
@@ -1115,31 +1881,10 @@ impl DataUsageCache {
         }
     }
 
-    pub fn marshal_msg(&self) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-        let mut buf = Vec::new();
-        self.serialize(&mut rmp_serde::Serializer::new(&mut buf))?;
-        Ok(buf)
-    }
-
     pub fn unmarshal(buf: &[u8]) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let t: Self = rmp_serde::from_slice(buf)?;
         Ok(t)
     }
-
-    // Note: load and save methods are storage-specific and should be implemented
-    // in the ecstore crate where storage access is available
-}
-
-/// Trait for storage-specific operations on DataUsageCache
-#[async_trait::async_trait]
-pub trait DataUsageCacheStorage {
-    /// Load data usage cache from backend storage
-    async fn load(store: &dyn std::any::Any, name: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>>
-    where
-        Self: Sized;
-
-    /// Save data usage cache to backend storage
-    async fn save(&self, name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
 // Helper structs and functions for cache operations
@@ -1221,9 +1966,44 @@ impl DataUsageInfo {
 
     /// Whether this snapshot authoritatively covers every reported bucket.
     pub fn is_complete_bucket_usage_snapshot(&self) -> bool {
-        self.usage_snapshot_complete
+        !self.usage_snapshot_bootstrap_pending
+            && self.usage_snapshot_complete
             && self.last_update.is_some()
             && u64::try_from(self.buckets_usage.len()).ok() == Some(self.buckets_count)
+    }
+
+    /// Validate provenance before an observational view can be selected for
+    /// admin display. Partial data is accepted only with unique set states,
+    /// a plan digest for every state, and at least one usable generation.
+    pub fn is_valid_partial_snapshot(&self) -> bool {
+        if self.usage_snapshot_bootstrap_pending
+            || !self.usage_snapshot_partial
+            || self.usage_snapshot_converged != Some(false)
+            || self.last_update.is_none()
+            || self.scanner_cycle.is_none()
+            || self.scanner_epoch.is_none()
+            || self.usage_snapshot_set_states.is_empty()
+            || u64::try_from(self.buckets_usage.len()).ok() != Some(self.buckets_count)
+        {
+            return false;
+        }
+
+        let mut previous = None;
+        let mut plan_digest = None;
+        let mut has_source = false;
+        for state in &self.usage_snapshot_set_states {
+            if state.scan_plan_digest.is_none()
+                || plan_digest.is_some_and(|digest| Some(digest) != state.scan_plan_digest)
+                || state.scanner_cycle.is_some() != state.scanner_epoch.is_some()
+                || previous.is_some_and(|(pool, set)| (pool, set) >= (state.pool_index, state.set_index))
+            {
+                return false;
+            }
+            previous = Some((state.pool_index, state.set_index));
+            plan_digest = state.scan_plan_digest;
+            has_source |= state.scanner_cycle.is_some() && !state.tombstone;
+        }
+        has_source
     }
 
     /// Add object metadata to data usage statistics
@@ -1495,14 +2275,6 @@ impl BucketUsageInfo {
     }
 
     /// Add size summary to this bucket usage
-    pub fn add_size_summary(&mut self, summary: &SizeSummary) {
-        self.size += summary.total_size as u64;
-        self.versions_count += summary.versions as u64;
-        self.delete_markers_count += summary.delete_markers as u64;
-        self.replica_size += summary.replica_size as u64;
-        self.replica_count += summary.replica_count as u64;
-    }
-
     /// Merge another BucketUsageInfo into this one
     pub fn merge(&mut self, other: &BucketUsageInfo) {
         self.size += other.size;
@@ -1548,29 +2320,91 @@ impl SizeSummary {
         Self::default()
     }
 
-    /// Add another SizeSummary to this one
+    /// Add another SizeSummary to this one.
+    ///
+    /// Saturating throughout: a scan that overflows a counter should report the
+    /// ceiling rather than panic in a debug build or wrap in a release one.
     pub fn add(&mut self, other: &SizeSummary) {
-        self.total_size += other.total_size;
-        self.versions += other.versions;
-        self.delete_markers += other.delete_markers;
-        self.replicated_size += other.replicated_size;
-        self.replicated_count += other.replicated_count;
-        self.pending_size += other.pending_size;
-        self.failed_size += other.failed_size;
-        self.replica_size += other.replica_size;
-        self.replica_count += other.replica_count;
-        self.pending_count += other.pending_count;
-        self.failed_count += other.failed_count;
+        self.total_size = self.total_size.saturating_add(other.total_size);
+        self.versions = self.versions.saturating_add(other.versions);
+        self.delete_markers = self.delete_markers.saturating_add(other.delete_markers);
+        self.replicated_size = self.replicated_size.saturating_add(other.replicated_size);
+        self.replicated_count = self.replicated_count.saturating_add(other.replicated_count);
+        self.pending_size = self.pending_size.saturating_add(other.pending_size);
+        self.failed_size = self.failed_size.saturating_add(other.failed_size);
+        self.replica_size = self.replica_size.saturating_add(other.replica_size);
+        self.replica_count = self.replica_count.saturating_add(other.replica_count);
+        self.pending_count = self.pending_count.saturating_add(other.pending_count);
+        self.failed_count = self.failed_count.saturating_add(other.failed_count);
+        self.unknown_tier_stats.merge(&other.unknown_tier_stats);
+        self.tier_accounting_proof.saturating_add(other.tier_accounting_proof);
+        if self.unknown_tier_stats.counter_overflowed {
+            self.tier_accounting_proof.overflowed = true;
+        }
+
+        // A disk/bucket aggregate is assembled from many object summaries.
+        // Keep the per-tier dimension in lockstep with the scalar counters;
+        // dropping this map here would recreate the original silent-loss bug
+        // at the cross-disk merge boundary.
+        for (tier, stats) in &other.tier_stats {
+            let entry = self.tier_stats.entry(tier.clone()).or_default();
+            *entry = entry.add(stats);
+        }
 
         // Merge replication target stats
         for (target, stats) in &other.repl_target_stats {
             let entry = self.repl_target_stats.entry(target.clone()).or_default();
-            entry.replicated_size += stats.replicated_size;
-            entry.replicated_count += stats.replicated_count;
-            entry.pending_size += stats.pending_size;
-            entry.failed_size += stats.failed_size;
-            entry.pending_count += stats.pending_count;
-            entry.failed_count += stats.failed_count;
+            entry.replicated_size = entry.replicated_size.saturating_add(stats.replicated_size);
+            entry.replicated_count = entry.replicated_count.saturating_add(stats.replicated_count);
+            entry.pending_size = entry.pending_size.saturating_add(stats.pending_size);
+            entry.failed_size = entry.failed_size.saturating_add(stats.failed_size);
+            entry.pending_count = entry.pending_count.saturating_add(stats.pending_count);
+            entry.failed_count = entry.failed_count.saturating_add(stats.failed_count);
+        }
+
+        for entry in &other.size_reconciliation {
+            self.record_size_reconciliation(entry.clone());
+        }
+        self.size_reconciliation_truncated |= other.size_reconciliation_truncated;
+        for scope in &other.reconciliation_scopes {
+            self.record_reconciliation_scope(&scope.bucket, &scope.object);
+        }
+    }
+
+    /// Add one reconciliation debt, coalescing repeated observations in the
+    /// same object summary. The scanner cache applies its own larger bound.
+    pub fn record_size_reconciliation(&mut self, entry: SizeReconciliationEntry) {
+        const MAX_SUMMARY_RECONCILIATION_ENTRIES: usize = 1024;
+        if let Some(existing) = self.size_reconciliation.iter_mut().find(|value| value.key == entry.key) {
+            existing.reason = entry.reason;
+            existing.physical_size = entry.physical_size;
+            existing.generation = entry.generation;
+            existing.version_id = entry.version_id;
+            return;
+        }
+        if self.size_reconciliation.len() < MAX_SUMMARY_RECONCILIATION_ENTRIES {
+            self.size_reconciliation.push(entry);
+        } else {
+            self.size_reconciliation_truncated = true;
+        }
+    }
+
+    /// Mark one object scope as refreshed. Duplicate scopes are suppressed so
+    /// merging summaries remains bounded and deterministic.
+    pub fn record_reconciliation_scope(&mut self, bucket: &str, object: &str) {
+        if !self
+            .reconciliation_scopes
+            .iter()
+            .any(|scope| scope.bucket == bucket && scope.object == object)
+        {
+            if self.reconciliation_scopes.len() >= 1024 {
+                self.size_reconciliation_truncated = true;
+                return;
+            }
+            self.reconciliation_scopes.push(SizeReconciliationScope {
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+            });
         }
     }
 }
@@ -1674,6 +2508,59 @@ mod tests {
     }
 
     #[test]
+    fn retired_tier_stats_fold_into_fixed_unknown_bucket() {
+        let mut stats = AllTierStats::default();
+        stats.tiers.insert(
+            "RETIRED".to_string(),
+            TierStats {
+                total_size: 9,
+                num_versions: 2,
+                num_objects: 1,
+            },
+        );
+        stats.tiers.insert(
+            "WARM".to_string(),
+            TierStats {
+                total_size: 4,
+                num_versions: 1,
+                num_objects: 1,
+            },
+        );
+
+        stats.fold_unknown_tiers(["WARM"]);
+
+        assert!(!stats.tiers.contains_key("RETIRED"));
+        assert_eq!(stats.tiers.get("WARM").map(|v| v.total_size), Some(4));
+        assert_eq!(stats.tiers.get(UNKNOWN_TIER).map(|v| v.total_size), Some(9));
+    }
+
+    #[test]
+    fn unknown_tier_stats_deserialization_keeps_diagnostics_bounded() {
+        #[derive(Serialize)]
+        struct RawUnknownTierStats {
+            unknown_bytes: u64,
+            diagnostics: Vec<String>,
+            diagnostics_dropped: u64,
+        }
+
+        let mut diagnostics = vec!["tier-hash:0123456789abcdef".to_string(); UNKNOWN_TIER_DIAGNOSTIC_ENTRY_CAP + 8];
+        diagnostics.push("raw-tier-name-that-must-not-be-exposed".to_string());
+        diagnostics.push("x".repeat(UNKNOWN_TIER_DIAGNOSTIC_BYTE_CAP + 1));
+        let encoded = rmp_serde::to_vec_named(&RawUnknownTierStats {
+            unknown_bytes: 7,
+            diagnostics,
+            diagnostics_dropped: 3,
+        })
+        .expect("unknown tier stats should encode");
+        let decoded: UnknownTierStats = rmp_serde::from_slice(&encoded).expect("unknown tier stats should decode");
+
+        assert_eq!(decoded.unknown_bytes, 7);
+        assert_eq!(decoded.diagnostics.len(), 1);
+        assert!(decoded.diagnostics_dropped >= 3);
+        assert!(decoded.diagnostics.iter().all(|entry| is_redacted_tier_diagnostic(entry)));
+    }
+
+    #[test]
     fn checked_merge_rejects_overflowing_tier_totals() {
         let mut left = tier_entry(
             "WARM",
@@ -1694,6 +2581,57 @@ mod tests {
 
         assert!(!left.checked_merge(&right), "saturating tier totals must not be published");
         assert_eq!(left.all_tier_stats.expect("left is untouched").tiers["WARM"].total_size, u64::MAX);
+    }
+
+    #[test]
+    fn checked_merge_rejects_unknown_counter_overflow_on_either_side() {
+        let overflowed = DataUsageEntry {
+            unknown_tier_stats: Some(UnknownTierStats {
+                counter_overflowed: true,
+                ..Default::default()
+            }),
+            tier_accounting_proof: Some(TierAccountingProof {
+                logical_total: 1,
+                logical_known: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut left = DataUsageEntry::default();
+        assert!(!left.checked_merge(&overflowed));
+
+        let mut left = overflowed.clone();
+        assert!(!left.checked_merge(&DataUsageEntry::default()));
+    }
+
+    #[test]
+    fn checked_merge_rejects_one_sided_overflowed_proof_without_mutation() {
+        let mut left = DataUsageEntry {
+            size: 1,
+            tier_accounting_proof: Some(TierAccountingProof {
+                logical_total: 1,
+                logical_known: 1,
+                overflowed: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let legacy = DataUsageEntry {
+            size: 2,
+            ..Default::default()
+        };
+
+        assert!(!left.checked_merge(&legacy));
+        assert_eq!(left.size, 1);
+        assert_eq!(
+            left.tier_accounting_proof,
+            Some(TierAccountingProof {
+                logical_total: 1,
+                logical_known: 1,
+                overflowed: true,
+                ..Default::default()
+            })
+        );
     }
 
     /// Entry shape released before per-tier accounting, using the derived
@@ -1736,6 +2674,72 @@ mod tests {
     }
 
     #[test]
+    fn tier_accounting_proof_is_optional_and_map_encoded() {
+        let entry = DataUsageEntry {
+            tier_accounting_proof: Some(TierAccountingProof {
+                logical_total: 11,
+                logical_known: 11,
+                physical_total: 7,
+                physical_known: 7,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let encoded = rmp_serde::to_vec(&entry).expect("proof-bearing entry should encode");
+        let decoded: DataUsageEntry = rmp_serde::from_slice(&encoded).expect("proof-bearing entry should decode");
+        assert_eq!(decoded.tier_accounting_proof, entry.tier_accounting_proof);
+
+        let legacy = LegacyEntry {
+            children: DataUsageHashMap::default(),
+            size: 12,
+            objects: 3,
+            versions: 4,
+            delete_markers: 1,
+            obj_sizes: SizeHistogram::default(),
+            obj_versions: VersionsHistogram::default(),
+            replication_stats: None,
+            compacted: false,
+            failed_objects: 2,
+        };
+        let legacy_bytes = rmp_serde::to_vec(&legacy).expect("legacy entry should encode");
+        let decoded: DataUsageEntry = rmp_serde::from_slice(&legacy_bytes).expect("legacy entry should decode");
+        assert!(decoded.tier_accounting_proof.is_none());
+    }
+
+    #[test]
+    fn empty_entry_merge_preserves_accounting_proof() {
+        let mut entry = DataUsageEntry {
+            tier_accounting_proof: Some(TierAccountingProof {
+                logical_total: 7,
+                logical_known: 7,
+                physical_total: 7,
+                physical_known: 7,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        entry.merge(&DataUsageEntry::default());
+        assert!(entry.tier_accounting_proof.is_some());
+
+        let mut empty = DataUsageEntry::default();
+        empty.merge(&entry);
+        assert_eq!(empty.tier_accounting_proof, entry.tier_accounting_proof);
+    }
+
+    #[test]
+    fn unknown_counter_overflow_is_not_empty_and_survives_roundtrip() {
+        let stats = UnknownTierStats {
+            counter_overflowed: true,
+            ..Default::default()
+        };
+        assert!(!stats.is_empty());
+        let encoded = rmp_serde::to_vec_named(&stats).expect("overflow marker should encode");
+        let decoded: UnknownTierStats = rmp_serde::from_slice(&encoded).expect("overflow marker should decode");
+        assert!(decoded.counter_overflowed);
+        assert!(!decoded.is_empty());
+    }
+
+    #[test]
     fn legacy_array_encoded_entries_still_load() {
         let legacy = LegacyEntry {
             children: DataUsageHashMap::default(),
@@ -1761,6 +2765,202 @@ mod tests {
         assert!(decoded.all_tier_stats.is_none());
     }
 
+    /// Scanner-written `.usage-cache.bin` bytes: a 2-element array of the
+    /// canonical 16-field map-encoded info block and one map-encoded entry.
+    /// Captured from the canonical writer's `marshal_msg` — see
+    /// `usage_cache_wire_format_is_pinned` in
+    /// `crates/scanner/src/data_usage_define.rs`, which pins these exact
+    /// bytes and documents regeneration. Hardcoded here because a
+    /// dev-dependency on rustfs-scanner would pull the whole ecstore tree
+    /// into this crate's test build, and a fixture generated at test runtime
+    /// could not detect writer drift anyway.
+    const SCANNER_USAGE_CACHE_WIRE_FIXTURE: &[u8] = &[
+        0x92, 0xde, 0x00, 0x10, 0xa4, 0x6e, 0x61, 0x6d, 0x65, 0xab, 0x77, 0x69, 0x72, 0x65, 0x2d, 0x62, 0x75, 0x63, 0x6b, 0x65,
+        0x74, 0xaa, 0x6e, 0x65, 0x78, 0x74, 0x5f, 0x63, 0x79, 0x63, 0x6c, 0x65, 0x07, 0xac, 0x6c, 0x65, 0x61, 0x64, 0x65, 0x72,
+        0x5f, 0x65, 0x70, 0x6f, 0x63, 0x68, 0x09, 0xab, 0x6c, 0x61, 0x73, 0x74, 0x5f, 0x75, 0x70, 0x64, 0x61, 0x74, 0x65, 0x92,
+        0xce, 0x65, 0x53, 0xf1, 0x00, 0x00, 0xac, 0x73, 0x6b, 0x69, 0x70, 0x5f, 0x68, 0x65, 0x61, 0x6c, 0x69, 0x6e, 0x67, 0xc3,
+        0xa9, 0x6c, 0x69, 0x66, 0x65, 0x63, 0x79, 0x63, 0x6c, 0x65, 0xc0, 0xab, 0x72, 0x65, 0x70, 0x6c, 0x69, 0x63, 0x61, 0x74,
+        0x69, 0x6f, 0x6e, 0xc0, 0xae, 0x66, 0x61, 0x69, 0x6c, 0x65, 0x64, 0x5f, 0x6f, 0x62, 0x6a, 0x65, 0x63, 0x74, 0x73, 0x81,
+        0xb0, 0x77, 0x69, 0x72, 0x65, 0x2d, 0x62, 0x75, 0x63, 0x6b, 0x65, 0x74, 0x2f, 0x6c, 0x6f, 0x73, 0x74, 0x0b, 0xb1, 0x73,
+        0x63, 0x61, 0x6e, 0x5f, 0x72, 0x65, 0x73, 0x75, 0x6d, 0x65, 0x5f, 0x61, 0x66, 0x74, 0x65, 0x72, 0xb2, 0x77, 0x69, 0x72,
+        0x65, 0x2d, 0x62, 0x75, 0x63, 0x6b, 0x65, 0x74, 0x2f, 0x72, 0x65, 0x73, 0x75, 0x6d, 0x65, 0xaf, 0x73, 0x63, 0x61, 0x6e,
+        0x5f, 0x63, 0x68, 0x65, 0x63, 0x6b, 0x70, 0x6f, 0x69, 0x6e, 0x74, 0xc0, 0xad, 0x70, 0x65, 0x6e, 0x64, 0x69, 0x6e, 0x67,
+        0x5f, 0x68, 0x65, 0x61, 0x6c, 0x73, 0x91, 0x9a, 0xa6, 0x6f, 0x62, 0x6a, 0x65, 0x63, 0x74, 0xab, 0x77, 0x69, 0x72, 0x65,
+        0x2d, 0x62, 0x75, 0x63, 0x6b, 0x65, 0x74, 0xa6, 0x62, 0x72, 0x6f, 0x6b, 0x65, 0x6e, 0xc0, 0x01, 0x64, 0xcc, 0xc8, 0x03,
+        0xa8, 0x64, 0x65, 0x66, 0x65, 0x72, 0x72, 0x65, 0x64, 0xa6, 0x62, 0x75, 0x64, 0x67, 0x65, 0x74, 0xab, 0x6f, 0x62, 0x6a,
+        0x65, 0x63, 0x74, 0x5f, 0x6c, 0x6f, 0x63, 0x6b, 0xc0, 0xa6, 0x73, 0x6f, 0x75, 0x72, 0x63, 0x65, 0x92, 0x01, 0x02, 0xb1,
+        0x73, 0x6e, 0x61, 0x70, 0x73, 0x68, 0x6f, 0x74, 0x5f, 0x63, 0x6f, 0x6d, 0x70, 0x6c, 0x65, 0x74, 0x65, 0xc3, 0xb0, 0x73,
+        0x63, 0x61, 0x6e, 0x5f, 0x70, 0x6c, 0x61, 0x6e, 0x5f, 0x64, 0x69, 0x67, 0x65, 0x73, 0x74, 0xdc, 0x00, 0x20, 0x03, 0x03,
+        0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03,
+        0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0xb0, 0x63, 0x61, 0x63, 0x68, 0x65, 0x5f, 0x6b, 0x65, 0x79,
+        0x5f, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, 0x01, 0x81, 0xab, 0x77, 0x69, 0x72, 0x65, 0x2d, 0x62, 0x75, 0x63, 0x6b, 0x65,
+        0x74, 0x8b, 0xa8, 0x63, 0x68, 0x69, 0x6c, 0x64, 0x72, 0x65, 0x6e, 0x90, 0xa4, 0x73, 0x69, 0x7a, 0x65, 0xcd, 0x10, 0x00,
+        0xa7, 0x6f, 0x62, 0x6a, 0x65, 0x63, 0x74, 0x73, 0x03, 0xa8, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x73, 0x05, 0xae,
+        0x64, 0x65, 0x6c, 0x65, 0x74, 0x65, 0x5f, 0x6d, 0x61, 0x72, 0x6b, 0x65, 0x72, 0x73, 0x01, 0xa9, 0x6f, 0x62, 0x6a, 0x5f,
+        0x73, 0x69, 0x7a, 0x65, 0x73, 0x9b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xac, 0x6f, 0x62,
+        0x6a, 0x5f, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x73, 0x97, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xb1, 0x72,
+        0x65, 0x70, 0x6c, 0x69, 0x63, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x5f, 0x73, 0x74, 0x61, 0x74, 0x73, 0xc0, 0xa9, 0x63, 0x6f,
+        0x6d, 0x70, 0x61, 0x63, 0x74, 0x65, 0x64, 0xc3, 0xae, 0x66, 0x61, 0x69, 0x6c, 0x65, 0x64, 0x5f, 0x6f, 0x62, 0x6a, 0x65,
+        0x63, 0x74, 0x73, 0x02, 0xae, 0x61, 0x6c, 0x6c, 0x5f, 0x74, 0x69, 0x65, 0x72, 0x5f, 0x73, 0x74, 0x61, 0x74, 0x73, 0x91,
+        0x81, 0xa4, 0x57, 0x41, 0x52, 0x4d, 0x93, 0xcd, 0x08, 0x00, 0x02, 0x01,
+    ];
+
+    #[test]
+    fn thin_usage_cache_decodes_scanner_wire_fixture() {
+        let decoded =
+            DataUsageCache::unmarshal(SCANNER_USAGE_CACHE_WIRE_FIXTURE).expect("thin projection decodes a scanner-written cache");
+
+        // The six fields shared with the scanner's 16-field info block; the
+        // remaining ten (lifecycle, replication, checkpoint, heals, ...) must
+        // be skipped, not error.
+        assert_eq!(decoded.info.name, "wire-bucket");
+        assert_eq!(decoded.info.next_cycle, 7);
+        assert_eq!(
+            decoded.info.last_update,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+        );
+        assert!(decoded.info.skip_healing);
+        assert_eq!(decoded.info.failed_objects.get("wire-bucket/lost"), Some(&11));
+        assert!(decoded.info.snapshot_complete);
+
+        // Entries use the shared canonical map-encoded type end to end.
+        let entry = decoded.cache.get("wire-bucket").expect("fixture entry decodes");
+        assert_eq!(entry.size, 4096);
+        assert_eq!(entry.objects, 3);
+        assert_eq!(entry.versions, 5);
+        assert_eq!(entry.delete_markers, 1);
+        assert!(entry.compacted);
+        assert_eq!(entry.failed_objects, 2);
+        assert_eq!(
+            entry.all_tier_stats.as_ref().and_then(|tiers| tiers.tiers.get("WARM")),
+            Some(&TierStats {
+                total_size: 2048,
+                num_versions: 2,
+                num_objects: 1,
+            })
+        );
+    }
+
+    /// Build a cache shaped like `bucket/{a,b/{c,d}},bucket/loose` with
+    /// distinct counters so aggregation is observable.
+    fn prefix_usage_fixture_cache() -> DataUsageCache {
+        let mut cache = DataUsageCache::default();
+        let mut insert = |path: &str, parent: &str, size: usize, objects: usize, versions: usize, delete_markers: usize| {
+            cache.replace(
+                path,
+                parent,
+                DataUsageEntry {
+                    size,
+                    objects,
+                    versions,
+                    delete_markers,
+                    ..Default::default()
+                },
+            );
+        };
+        insert("bucket", "", 0, 0, 0, 0);
+        insert("bucket/a", "bucket", 100, 1, 1, 0);
+        insert("bucket/b", "bucket", 0, 0, 0, 0);
+        insert("bucket/b/c", "bucket/b", 200, 2, 2, 1);
+        insert("bucket/b/d", "bucket/b", 40, 1, 3, 0);
+        insert("bucket/loose", "bucket", 10, 1, 1, 1);
+        cache
+    }
+
+    #[test]
+    fn prefix_usage_aggregates_bucket_root_and_one_level_below() {
+        let cache = prefix_usage_fixture_cache();
+
+        let root = cache
+            .prefix_usage("bucket", "", 100)
+            .expect("root query must find the bucket entry");
+        assert_eq!(root.usage.size, 350, "root aggregate flattens the whole subtree");
+        assert_eq!(root.usage.objects, 5);
+        assert_eq!(root.usage.versions, 7);
+        assert_eq!(root.usage.delete_markers, 2);
+        assert!(!root.compacted);
+        assert!(!root.truncated);
+        // Breakdown is one level: b (240) before a (100) before loose (10),
+        // each flattened to its own subtree total.
+        let names: Vec<(&str, u64)> = root
+            .sub_prefixes
+            .iter()
+            .map(|entry| (entry.prefix.as_str(), entry.usage.size))
+            .collect();
+        assert_eq!(names, vec![("b", 240), ("a", 100), ("loose", 10)]);
+    }
+
+    #[test]
+    fn prefix_usage_drills_into_arbitrary_prefixes() {
+        let cache = prefix_usage_fixture_cache();
+
+        let b = cache.prefix_usage("bucket", "b", 100).expect("nested prefix must resolve");
+        assert_eq!(b.usage.size, 240);
+        assert_eq!(b.usage.versions, 5);
+        let names: Vec<&str> = b.sub_prefixes.iter().map(|entry| entry.prefix.as_str()).collect();
+        assert_eq!(names, vec!["c", "d"]);
+
+        // Prefix slashes are normalized away.
+        let slashed = cache.prefix_usage("bucket", "/b/", 100).expect("slash-insensitive lookup");
+        assert_eq!(slashed.usage.size, 240);
+
+        assert!(cache.prefix_usage("bucket", "absent", 100).is_none(), "unknown prefix must be a miss");
+        assert!(cache.prefix_usage("other", "", 100).is_none(), "unknown bucket must be a miss");
+    }
+
+    #[test]
+    fn prefix_usage_reports_and_respects_truncation() {
+        let cache = prefix_usage_fixture_cache();
+        let capped = cache.prefix_usage("bucket", "", 2).expect("root query");
+        assert!(capped.truncated, "three children capped to two must flag truncation");
+        let names: Vec<&str> = capped.sub_prefixes.iter().map(|entry| entry.prefix.as_str()).collect();
+        assert_eq!(names, vec!["b", "a"], "largest prefixes survive the cut");
+    }
+
+    #[test]
+    fn prefix_usage_marks_compacted_entries() {
+        let mut cache = DataUsageCache::default();
+        cache.replace(
+            "bucket",
+            "",
+            DataUsageEntry {
+                size: 999,
+                objects: 9,
+                compacted: true,
+                ..Default::default()
+            },
+        );
+
+        let compacted = cache.prefix_usage("bucket", "", 100).expect("compacted root resolves");
+        assert!(compacted.compacted, "compaction must be visible to callers");
+        assert_eq!(compacted.usage.size, 999);
+        assert!(compacted.sub_prefixes.is_empty(), "a compacted entry carries no children");
+    }
+
+    #[test]
+    fn prefix_usage_rejects_cyclic_and_dangling_caches() {
+        // A self-referencing child (corrupt cache) must yield a miss for the
+        // whole query, not unbounded recursion.
+        let mut cache = prefix_usage_fixture_cache();
+        if let Some(entry) = cache.cache.get_mut("bucket/b") {
+            entry.children.insert("bucket/b".to_string());
+        }
+        assert!(cache.prefix_usage("bucket", "b", 100).is_none(), "a cyclic subtree must be rejected");
+        // The unaffected sibling still answers.
+        assert!(cache.prefix_usage("bucket", "a", 100).is_some());
+
+        // A child key with no entry (dangling link) is rejected rather than
+        // silently dropped: half a tree would under-report usage.
+        let mut dangling = prefix_usage_fixture_cache();
+        if let Some(entry) = dangling.cache.get_mut("bucket/b") {
+            entry.children.insert("bucket/b/ghost".to_string());
+        }
+        assert!(
+            dangling.prefix_usage("bucket", "b", 100).is_none(),
+            "a dangling child link must be rejected"
+        );
+    }
+
     #[test]
     fn hash_path_uses_portable_slash_semantics() {
         for (input, expected) in [
@@ -1783,6 +2983,8 @@ mod tests {
         let current = DataUsageInfo {
             last_update: Some(SystemTime::UNIX_EPOCH),
             usage_snapshot_complete: true,
+            usage_snapshot_converged: Some(false),
+            usage_snapshot_authoritative_baseline: Some(DataUsageSnapshotIdentity::default()),
             ..Default::default()
         };
         let encoded = rmp_serde::to_vec_named(&current).expect("encode current data usage snapshot");
@@ -1790,6 +2992,125 @@ mod tests {
 
         assert_eq!(legacy.buckets_count, 0);
         assert!(current.is_complete_bucket_usage_snapshot());
+        assert_eq!(current.usage_snapshot_converged, Some(false));
+    }
+
+    #[test]
+    fn convergence_marker_defaults_to_unknown_for_older_snapshots() {
+        let encoded = rmp_serde::to_vec_named(&DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH),
+            usage_snapshot_complete: true,
+            ..Default::default()
+        })
+        .expect("encode pre-convergence data usage snapshot");
+        let decoded: DataUsageInfo = rmp_serde::from_slice(&encoded).expect("decode older data usage snapshot");
+
+        assert!(decoded.is_complete_bucket_usage_snapshot());
+        assert_eq!(decoded.usage_snapshot_converged, None);
+    }
+
+    #[test]
+    fn observation_selection_is_clock_independent_and_baseline_fenced() {
+        let mut authoritative = DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(600)),
+            scanner_epoch: Some(7),
+            scanner_cycle: Some(10),
+            usage_snapshot_complete: true,
+            ..Default::default()
+        };
+        let observed = DataUsageInfo {
+            // A newer leader may have a slower wall clock.
+            last_update: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(300)),
+            scanner_epoch: Some(8),
+            scanner_cycle: Some(1),
+            usage_snapshot_complete: true,
+            usage_snapshot_converged: Some(false),
+            usage_snapshot_authoritative_baseline: Some(authoritative.snapshot_identity()),
+            ..Default::default()
+        };
+
+        assert!(observed_data_usage_is_newer(&observed, &authoritative));
+
+        authoritative.last_update = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(601));
+        assert!(
+            !observed_data_usage_is_newer(&observed, &authoritative),
+            "an old-binary namespace mutation must fence the prior bucket incarnation regardless of clock skew"
+        );
+    }
+
+    #[test]
+    fn observation_selection_requires_nonconverged_complete_newer_data() {
+        let authoritative = DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH),
+            scanner_epoch: Some(2),
+            scanner_cycle: Some(10),
+            usage_snapshot_complete: true,
+            ..Default::default()
+        };
+        let baseline = Some(authoritative.snapshot_identity());
+        let candidate = |epoch, cycle, converged, complete| DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+            scanner_epoch: Some(epoch),
+            scanner_cycle: Some(cycle),
+            usage_snapshot_complete: complete,
+            usage_snapshot_converged: converged,
+            usage_snapshot_authoritative_baseline: baseline,
+            ..Default::default()
+        };
+
+        assert!(observed_data_usage_is_newer(&candidate(2, 11, Some(false), true), &authoritative));
+        assert!(!observed_data_usage_is_newer(&candidate(2, 9, Some(false), true), &authoritative));
+        assert!(!observed_data_usage_is_newer(&candidate(2, 11, Some(true), true), &authoritative));
+        assert!(!observed_data_usage_is_newer(&candidate(2, 11, Some(false), false), &authoritative));
+
+        let mut partial = candidate(2, 11, Some(false), false);
+        partial.usage_snapshot_partial = true;
+        partial.usage_snapshot_set_states = vec![DataUsageSnapshotSetState {
+            pool_index: 0,
+            set_index: 0,
+            scanner_cycle: Some(10),
+            scanner_epoch: Some(2),
+            scan_plan_digest: Some([1; 32]),
+            complete: false,
+            tombstone: false,
+        }];
+        assert!(observed_data_usage_is_newer(&partial, &authoritative));
+    }
+
+    #[test]
+    fn mixed_topology_snapshot_is_rejected() {
+        let mut partial = DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(2)),
+            scanner_cycle: Some(11),
+            scanner_epoch: Some(2),
+            buckets_count: 0,
+            usage_snapshot_converged: Some(false),
+            usage_snapshot_partial: true,
+            usage_snapshot_set_states: vec![
+                DataUsageSnapshotSetState {
+                    pool_index: 0,
+                    set_index: 0,
+                    scanner_cycle: Some(11),
+                    scanner_epoch: Some(2),
+                    scan_plan_digest: Some([1; 32]),
+                    complete: true,
+                    tombstone: false,
+                },
+                DataUsageSnapshotSetState {
+                    pool_index: 1,
+                    set_index: 0,
+                    scanner_cycle: Some(10),
+                    scanner_epoch: Some(2),
+                    scan_plan_digest: Some([2; 32]),
+                    complete: false,
+                    tombstone: false,
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(!partial.is_valid_partial_snapshot());
+        partial.usage_snapshot_set_states[1].scan_plan_digest = Some([1; 32]);
+        assert!(partial.is_valid_partial_snapshot());
     }
 
     #[test]
@@ -1846,6 +3167,64 @@ mod tests {
         assert_eq!(usage1.size, 300);
         assert_eq!(usage1.objects_count, 30);
         assert_eq!(usage1.versions_count, 15);
+    }
+
+    #[test]
+    fn size_summary_add_saturates_instead_of_overflowing() {
+        // The scanner folds one summary per object into a per-prefix total, so a
+        // counter at its ceiling must stay there rather than panic in a debug
+        // build or wrap in a release one (backlog#1828).
+        let mut summary = SizeSummary {
+            total_size: usize::MAX,
+            versions: usize::MAX,
+            replicated_size: i64::MAX,
+            pending_size: i64::MAX,
+            failed_size: i64::MAX,
+            replica_size: i64::MAX,
+            ..Default::default()
+        };
+        summary.repl_target_stats.insert(
+            "arn".to_string(),
+            ReplTargetSizeSummary {
+                replicated_size: i64::MAX,
+                pending_size: i64::MAX,
+                failed_size: i64::MAX,
+                ..Default::default()
+            },
+        );
+
+        let mut increment = SizeSummary {
+            total_size: 1,
+            versions: 1,
+            replicated_size: 1,
+            pending_size: 1,
+            failed_size: 1,
+            replica_size: 1,
+            ..Default::default()
+        };
+        increment.repl_target_stats.insert(
+            "arn".to_string(),
+            ReplTargetSizeSummary {
+                replicated_size: 1,
+                pending_size: 1,
+                failed_size: 1,
+                ..Default::default()
+            },
+        );
+
+        summary.add(&increment);
+
+        assert_eq!(summary.total_size, usize::MAX);
+        assert_eq!(summary.versions, usize::MAX);
+        assert_eq!(summary.replicated_size, i64::MAX);
+        assert_eq!(summary.pending_size, i64::MAX);
+        assert_eq!(summary.failed_size, i64::MAX);
+        assert_eq!(summary.replica_size, i64::MAX);
+
+        let target = summary.repl_target_stats.get("arn").expect("target survives the merge");
+        assert_eq!(target.replicated_size, i64::MAX);
+        assert_eq!(target.pending_size, i64::MAX);
+        assert_eq!(target.failed_size, i64::MAX);
     }
 
     #[test]
@@ -1938,7 +3317,7 @@ mod tests {
 
     #[test]
     fn replication_stats_empty_checks_every_field() {
-        type SetField = fn(&mut ReplicationStats);
+        type SetField = fn(&mut ReplicationTargetUsage);
 
         let cases: [(&str, SetField); 10] = [
             ("pending_size", |stats| stats.pending_size = 1),
@@ -1953,9 +3332,9 @@ mod tests {
             ("replicated_count", |stats| stats.replicated_count = 1),
         ];
 
-        assert!(ReplicationStats::default().is_empty());
+        assert!(ReplicationTargetUsage::default().is_empty());
         for (field, set_nonzero) in cases {
-            let mut stats = ReplicationStats::default();
+            let mut stats = ReplicationTargetUsage::default();
             set_nonzero(&mut stats);
             assert!(!stats.is_empty(), "{field} must make replication stats non-empty");
         }
@@ -1986,17 +3365,17 @@ mod tests {
         }
 
         let empty_targets = ReplicationAllStats {
-            targets: HashMap::from([("arn:test:empty".to_string(), ReplicationStats::default())]),
+            targets: HashMap::from([("arn:test:empty".to_string(), ReplicationTargetUsage::default())]),
             ..Default::default()
         };
         assert!(empty_targets.is_empty(), "all-empty targets must keep aggregate stats empty");
 
         let stats = ReplicationAllStats {
             targets: HashMap::from([
-                ("arn:test:empty".to_string(), ReplicationStats::default()),
+                ("arn:test:empty".to_string(), ReplicationTargetUsage::default()),
                 (
                     "arn:test:non-empty".to_string(),
-                    ReplicationStats {
+                    ReplicationTargetUsage {
                         pending_count: 1,
                         ..Default::default()
                     },
@@ -2037,7 +3416,7 @@ mod tests {
                 replication_stats: Some(ReplicationAllStats {
                     targets: HashMap::from([(
                         "arn:test:pending".to_string(),
-                        ReplicationStats {
+                        ReplicationTargetUsage {
                             pending_count: 1,
                             ..Default::default()
                         },
@@ -2178,6 +3557,32 @@ mod tests {
     }
 
     #[test]
+    fn test_dui_filters_empty_unknown_tier_usage_from_the_flattened_tree() {
+        let root_hash = hash_path("root");
+        let bucket_hash = hash_path("bucket-a");
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: "root".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cache.replace_hashed(&root_hash, &None, &DataUsageEntry::default());
+
+        let child = DataUsageEntry {
+            objects: 1,
+            unknown_tier_stats: Some(UnknownTierStats::default()),
+            ..Default::default()
+        };
+        cache.replace_hashed(&bucket_hash, &Some(root_hash), &child);
+
+        let info = cache.dui("root", &["bucket-a".to_string()]);
+
+        assert_eq!(info.objects_total_count, 1);
+        assert!(info.unknown_tier_stats.is_none());
+    }
+
+    #[test]
     fn test_data_usage_entry_merge_preserves_replication_targets() {
         let mut base = DataUsageEntry {
             replication_stats: Some(ReplicationAllStats {
@@ -2186,7 +3591,7 @@ mod tests {
                 targets: HashMap::from([
                     (
                         "arn:self-only".to_string(),
-                        ReplicationStats {
+                        ReplicationTargetUsage {
                             pending_size: 7,
                             pending_count: 1,
                             ..Default::default()
@@ -2194,7 +3599,7 @@ mod tests {
                     ),
                     (
                         "arn:shared".to_string(),
-                        ReplicationStats {
+                        ReplicationTargetUsage {
                             failed_size: 3,
                             failed_count: 1,
                             missed_threshold_size: 2,
@@ -2213,7 +3618,7 @@ mod tests {
                 targets: HashMap::from([
                     (
                         "arn:shared".to_string(),
-                        ReplicationStats {
+                        ReplicationTargetUsage {
                             failed_size: 5,
                             failed_count: 2,
                             after_threshold_size: 4,
@@ -2223,7 +3628,7 @@ mod tests {
                     ),
                     (
                         "arn:other-only".to_string(),
-                        ReplicationStats {
+                        ReplicationTargetUsage {
                             replicated_size: 11,
                             replicated_count: 3,
                             ..Default::default()
@@ -2465,13 +3870,56 @@ mod tests {
     fn replication_target_deserialization_preserves_large_historical_maps() {
         let mut stats = ReplicationAllStats::default();
         for index in 0..=1024 {
-            stats.targets.insert(format!("target-{index}"), ReplicationStats::default());
+            stats
+                .targets
+                .insert(format!("target-{index}"), ReplicationTargetUsage::default());
         }
         let encoded = rmp_serde::to_vec_named(&stats).expect("large replication target fixture should encode");
         let decoded = rmp_serde::from_slice::<ReplicationAllStats>(&encoded)
             .expect("historical replication target maps must remain readable");
 
         assert_eq!(decoded.targets.len(), stats.targets.len());
+    }
+
+    /// Round-trip test: encoding a [`ReplicationTargetUsage`] and decoding it back
+    /// must produce the exact same value.  This guards against accidental serde
+    /// field-name drift during the `ReplicationStats` -> `ReplicationTargetUsage`
+    /// rename.  Wire-level field names are the serialized Rust field identifiers,
+    /// which must remain byte-identical.
+    #[test]
+    fn replication_target_usage_rmp_round_trip() {
+        let original = ReplicationTargetUsage {
+            pending_size: 100,
+            replicated_size: 2_000,
+            failed_size: 50,
+            failed_count: 3,
+            pending_count: 7,
+            missed_threshold_size: 11,
+            after_threshold_size: 22,
+            missed_threshold_count: 1,
+            after_threshold_count: 2,
+            replicated_count: 99,
+        };
+
+        let buf = rmp_serde::to_vec_named(&original).expect("encode ReplicationTargetUsage to msgpack");
+        let decoded: ReplicationTargetUsage = rmp_serde::from_slice(&buf).expect("decode ReplicationTargetUsage from msgpack");
+        assert_eq!(original, decoded, "round-trip through rmp must preserve every field");
+
+        // Also verify that encoding as an unnamed sequence and then decoding
+        // with named fields produces the correct mapping (this catches reordering).
+        let named_buf = rmp_serde::to_vec_named(&original).expect("re-encode for field-name pinning");
+        // Spot-check that known field names appear in the named encoding.
+        let named_str = String::from_utf8_lossy(&named_buf);
+        assert!(named_str.contains("pending_size"), "field 'pending_size' must survive the rename");
+        assert!(named_str.contains("replicated_size"), "field 'replicated_size' must survive the rename");
+        assert!(
+            named_str.contains("missed_threshold_size"),
+            "field 'missed_threshold_size' must survive the rename"
+        );
+        assert!(
+            named_str.contains("after_threshold_count"),
+            "field 'after_threshold_count' must survive the rename"
+        );
     }
 
     #[test]

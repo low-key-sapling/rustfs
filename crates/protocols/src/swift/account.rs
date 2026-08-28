@@ -38,7 +38,6 @@ use std::collections::HashMap;
 /// - Account format is invalid
 /// - Credentials don't contain project_id
 /// - Account project_id doesn't match credentials project_id
-#[allow(dead_code)] // Used by Swift implementation
 pub fn validate_account_access(account: &str, credentials: &Credentials) -> SwiftResult<String> {
     // Extract project_id from account (strip "AUTH_" prefix)
     let account_project_id = account
@@ -70,7 +69,6 @@ pub fn validate_account_access(account: &str, credentials: &Credentials) -> Swif
 ///
 /// Admin users (with "admin" or "reseller_admin" roles) can perform
 /// cross-tenant operations and administrative tasks.
-#[allow(dead_code)] // Used by Swift implementation
 pub fn is_admin_user(credentials: &Credentials) -> bool {
     credentials
         .claims
@@ -99,7 +97,7 @@ fn get_account_metadata_bucket_name(account: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(account.as_bytes());
     let hash_bytes = hasher.finalize();
-    let hash = hex::encode(hash_bytes);
+    let hash = hex_simd::encode_to_string(hash_bytes, hex_simd::AsciiCase::Lower);
     format!("swift-account-{}", &hash[0..16])
 }
 

@@ -25,13 +25,17 @@ keywords = ["erasure-coding", "storage", "rustfs", "Minio", "solomon"]
 categories = ["web-programming", "development-tools", "filesystem"]
 documentation = "https://docs.rs/rustfs-ecstore/latest/rustfs_ecstore/"
 
-
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lints]
 workspace = true
 
 [features]
 default = []
+# Compiles the controlled list-objects namespace-journal chaos injector into a
+# production binary (it is always available to tests). Off by default so the
+# RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_* env vars cannot rewrite journal
+# state in a stock build (backlog#1832).
+list-chaos = []
 rio-v2 = ["dep:rustfs-rio-v2"]
 hotpath = [
     "hotpath/hotpath",
@@ -40,7 +44,6 @@ hotpath = [
     "hotpath/async-channel",
     "hotpath/parking_lot",
     "hotpath/reqwest-0-13",
-    "rustfs-checksums/hotpath",
     "rustfs-common/hotpath",
     "rustfs-concurrency/hotpath",
     "rustfs-config/hotpath",
@@ -58,16 +61,13 @@ hotpath = [
     "rustfs-rio/hotpath",
     "rustfs-rio-v2?/hotpath",
     "rustfs-s3-types/hotpath",
-    "rustfs-signer/hotpath",
     "rustfs-storage-api/hotpath",
-    "rustfs-tls-runtime/hotpath",
     "rustfs-utils/hotpath",
     "rustfs-crypto/hotpath",
 ]
 hotpath-alloc = [
     "hotpath",
     "hotpath/hotpath-alloc",
-    "rustfs-checksums/hotpath-alloc",
     "rustfs-common/hotpath-alloc",
     "rustfs-concurrency/hotpath-alloc",
     "rustfs-config/hotpath-alloc",
@@ -85,16 +85,13 @@ hotpath-alloc = [
     "rustfs-rio/hotpath-alloc",
     "rustfs-rio-v2?/hotpath-alloc",
     "rustfs-s3-types/hotpath-alloc",
-    "rustfs-signer/hotpath-alloc",
     "rustfs-storage-api/hotpath-alloc",
-    "rustfs-tls-runtime/hotpath-alloc",
     "rustfs-utils/hotpath-alloc",
     "rustfs-crypto/hotpath-alloc",
 ]
 hotpath-cpu = [
     "hotpath",
     "hotpath/hotpath-cpu",
-    "rustfs-checksums/hotpath-cpu",
     "rustfs-common/hotpath-cpu",
     "rustfs-concurrency/hotpath-cpu",
     "rustfs-config/hotpath-cpu",
@@ -112,9 +109,7 @@ hotpath-cpu = [
     "rustfs-rio/hotpath-cpu",
     "rustfs-rio-v2?/hotpath-cpu",
     "rustfs-s3-types/hotpath-cpu",
-    "rustfs-signer/hotpath-cpu",
     "rustfs-storage-api/hotpath-cpu",
-    "rustfs-tls-runtime/hotpath-cpu",
     "rustfs-utils/hotpath-cpu",
     "rustfs-crypto/hotpath-cpu",
 ]
@@ -129,27 +124,28 @@ rustfs-filemeta.workspace = true
 rustfs-utils = { workspace = true, features = ["full"] }
 rustfs-rio.workspace = true
 rustfs-rio-v2 = { workspace = true, optional = true }
-rustfs-signer.workspace = true
 rustfs-storage-api.workspace = true
-rustfs-tls-runtime.workspace = true
-rustfs-checksums.workspace = true
 rustfs-config = { workspace = true, features = ["notify", "audit", "server-config-model"] }
 rustfs-concurrency.workspace = true
 rustfs-credentials = { workspace = true }
 rustfs-common.workspace = true
+rustfs-heal-contracts.workspace = true
+rustfs-scanner-contracts.workspace = true
 rustfs-policy.workspace = true
 rustfs-protos.workspace = true
 rustfs-replication.workspace = true
 rustfs-lifecycle.workspace = true
+rustfs-s3-client = { workspace = true }
 rustfs-s3-types = { workspace = true }
 rustfs-data-usage.workspace = true
 rustfs-object-capacity.workspace = true
+rustfs-object-data-cache = { workspace = true, features = ["runtime-memory"] }
 arc-swap.workspace = true
 async-trait.workspace = true
 bytes = { workspace = true, features = ["serde"] }
 byteorder = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
-glob = { workspace = true }
+jiff = { workspace = true, features = ["serde"] }
 thiserror.workspace = true
 flatbuffers.workspace = true
 futures.workspace = true
@@ -160,7 +156,6 @@ serde = { workspace = true, features = ["derive"] }
 time = { workspace = true, features = ["parsing", "formatting", "macros", "serde"] }
 bytesize.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
-quick-xml = { workspace = true, features = ["serialize", "async-tokio"] }
 s3s = { workspace = true, features = ["minio"] }
 http.workspace = true
 opentelemetry.workspace = true
@@ -179,9 +174,8 @@ path-absolutize = { workspace = true }
 rmp.workspace = true
 rmp-serde.workspace = true
 tokio-util = { workspace = true, features = ["io", "compat"] }
-base64 = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }
 hmac = { workspace = true }
-sha1 = { workspace = true }
 sha2 = { workspace = true }
 hex-simd = { workspace = true }
 tempfile.workspace = true
@@ -196,7 +190,6 @@ tonic = { workspace = true, features = ["gzip", "deflate"] }
 xxhash-rust = { workspace = true, features = ["xxh64", "xxh3"] }
 tower = { workspace = true, features = ["timeout"] }
 async-channel.workspace = true
-enumset = { workspace = true }
 num_cpus = { workspace = true }
 rand = { workspace = true, features = ["serde"] }
 pin-project-lite.workspace = true
@@ -221,7 +214,6 @@ base64-simd.workspace = true
 serde_urlencoded.workspace = true
 google-cloud-storage = { workspace = true }
 google-cloud-auth = { workspace = true }
-aws-config = { workspace = true }
 faster-hex = { workspace = true }
 ratelimit = { workspace = true }
 aws-smithy-http-client = { workspace = true, default-features = false, features = ["rustls-aws-lc"] }
@@ -237,7 +229,19 @@ rustfs-uring = "0.2.1"
 
 [target.'cfg(windows)'.dependencies]
 winapi-util.workspace = true
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows-sys = { workspace = true, features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_SystemServices",
+    "Win32_System_WindowsProgramming",
+] }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_Ioctl"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util", "fs"] }
@@ -248,11 +252,13 @@ tracing-subscriber = { workspace = true, features = ["json", "env-filter", "time
 # dispatcher to keep tracing's process-global callsite-interest cache honest.
 tracing-core = { workspace = true }
 serial_test = { workspace = true }
+metrics-util = { workspace = true, features = ["debugging"] }
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
 proptest = "1"
 rcgen.workspace = true
 insta = { workspace = true, features = ["yaml", "json"] }
 rustfs-crypto = { workspace = true }
+tonic-prost = { workspace = true }
 
 [build-dependencies]
 shadow-rs = { workspace = true, default-features = false, features = ["build", "metadata"] }

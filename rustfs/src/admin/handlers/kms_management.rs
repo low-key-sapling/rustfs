@@ -16,13 +16,12 @@
 
 use super::kms_dynamic::current_kms_config_fingerprint;
 use super::kms_keys::{CreateKeyHandler, DescribeKeyHandler, GenerateDataKeyHandler, ListKeysHandler};
-use crate::admin::auth::validate_admin_request;
+use crate::admin::auth::authorize_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{
     current_kms_runtime_service_manager, current_notification_system, current_or_init_kms_runtime_service_manager,
 };
-use crate::auth::{check_key_valid, get_session_token};
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::server::ADMIN_PREFIX;
 use hyper::{HeaderMap, Method, StatusCode};
 use matchit::Params;
 use rustfs_kms::KmsBackend;
@@ -67,6 +66,30 @@ fn kms_configure_actions() -> Vec<Action> {
 
 fn kms_clear_cache_actions() -> Vec<Action> {
     vec![Action::KmsAction(KmsAction::ClearCacheAction)]
+}
+
+/// Admin gate for the KMS management endpoints, none of which act on a key.
+///
+/// The pre-check keeps these endpoints' historical missing-credentials message;
+/// the shared gate reports "get cred failed".
+async fn authorize_kms_management_request(req: &S3Request<Body>, actions: Vec<Action>) -> S3Result<()> {
+    if req.credentials.is_none() {
+        return Err(s3_error!(InvalidRequest, "authentication required"));
+    }
+    authorize_admin_request(req, actions).await?;
+    Ok(())
+}
+
+/// Response of `POST /kms/clear-cache`.
+///
+/// Declared rather than built inline so the shape the console already depends
+/// on is pinned by a type and a snapshot instead of by a `json!` literal that
+/// any edit can silently reshape. The field names and values are exactly what
+/// the inline literal produced.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct KmsClearCacheResponse {
+    pub status: String,
+    pub message: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -248,22 +271,7 @@ pub struct KmsStatusHandler {}
 #[async_trait::async_trait]
 impl Operation for KmsStatusHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(cred) = req.credentials else {
-            return Err(s3_error!(InvalidRequest, "authentication required"));
-        };
-
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            kms_service_control_actions(),
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_kms_management_request(&req, kms_service_control_actions()).await?;
 
         let Some(service) = kms_encryption_service_from_context().await else {
             return Err(s3_error!(InternalError, "KMS service not initialized"));
@@ -314,22 +322,7 @@ pub struct KmsConfigHandler {}
 #[async_trait::async_trait]
 impl Operation for KmsConfigHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(cred) = req.credentials else {
-            return Err(s3_error!(InvalidRequest, "authentication required"));
-        };
-
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            kms_configure_actions(),
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_kms_management_request(&req, kms_configure_actions()).await?;
 
         let Some(service) = kms_encryption_service_from_context().await else {
             return Err(s3_error!(InternalError, "KMS service not initialized"));
@@ -363,22 +356,7 @@ pub struct KmsClearCacheHandler {}
 #[async_trait::async_trait]
 impl Operation for KmsClearCacheHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(cred) = req.credentials else {
-            return Err(s3_error!(InvalidRequest, "authentication required"));
-        };
-
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            kms_clear_cache_actions(),
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_kms_management_request(&req, kms_clear_cache_actions()).await?;
 
         let Some(service) = kms_encryption_service_from_context().await else {
             return Err(s3_error!(InternalError, "KMS service not initialized"));
@@ -387,10 +365,10 @@ impl Operation for KmsClearCacheHandler {
         match service.clear_cache().await {
             Ok(()) => {
                 info!("KMS cache cleared successfully");
-                let response = serde_json::json!({
-                    "status": "success",
-                    "message": "cache cleared successfully"
-                });
+                let response = KmsClearCacheResponse {
+                    status: "success".to_string(),
+                    message: "cache cleared successfully".to_string(),
+                };
 
                 let data =
                     serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
@@ -410,8 +388,14 @@ impl Operation for KmsClearCacheHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{kms_clear_cache_actions, kms_configure_actions, kms_service_control_actions};
+    use super::{
+        KmsClearCacheResponse, authorize_kms_management_request, kms_clear_cache_actions, kms_configure_actions,
+        kms_service_control_actions,
+    };
+    use crate::admin::handlers::kms_keys::stable_json_value;
+    use hyper::HeaderMap;
     use rustfs_policy::policy::action::{Action, AdminAction, KmsAction};
+    use s3s::{Body, S3Request};
 
     fn assert_has_action(actions: &[Action], action: Action) {
         assert!(actions.contains(&action), "expected action list to contain {action:?}");
@@ -421,11 +405,96 @@ mod tests {
         assert!(!actions.contains(&action), "expected action list not to contain {action:?}");
     }
 
+    /// These endpoints authorize through the shared admin gate, which reports
+    /// "get cred failed" for a credential-less request. The pre-check keeps the
+    /// message these endpoints have always returned (rustfs/backlog#1829).
+    #[tokio::test]
+    async fn kms_management_gate_keeps_its_missing_credentials_message() {
+        let req = S3Request {
+            input: Body::from(String::new()),
+            method: http::Method::GET,
+            uri: "/rustfs/admin/v3/kms/status".parse().expect("uri should parse"),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        let err = authorize_kms_management_request(&req, kms_service_control_actions())
+            .await
+            .expect_err("a request without credentials must be rejected");
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("authentication required"));
+    }
+
+    /// Every management endpoint must reach the shared gate, each with its own
+    /// action set. The action lists are pinned above, but nothing else checks
+    /// which handler asks for which, and a handler that lost its gate entirely
+    /// would still serve its response.
+    #[test]
+    fn management_handlers_authorize_with_their_dedicated_actions() {
+        let src = include_str!("kms_management.rs");
+
+        for (handler, actions) in [
+            ("KmsStatusHandler", "kms_service_control_actions()"),
+            ("KmsConfigHandler", "kms_configure_actions()"),
+            ("KmsClearCacheHandler", "kms_clear_cache_actions()"),
+        ] {
+            let block = src
+                .split_once(&format!("impl Operation for {handler}"))
+                .unwrap_or_else(|| panic!("{handler} impl should exist"))
+                .1;
+            let end = block
+                .find("\nimpl Operation for")
+                .or_else(|| block.find("\n#[cfg(test)]"))
+                .unwrap_or(block.len());
+            assert!(
+                block[..end].contains(&format!("authorize_kms_management_request(&req, {actions})")),
+                "{handler} must authorize through the shared gate with {actions}"
+            );
+        }
+    }
+
     #[test]
     fn kms_management_auth_actions_use_dedicated_kms_actions() {
         assert_has_action(&kms_service_control_actions(), Action::KmsAction(KmsAction::ServiceControlAction));
         assert_has_action(&kms_configure_actions(), Action::KmsAction(KmsAction::ConfigureAction));
         assert_has_action(&kms_clear_cache_actions(), Action::KmsAction(KmsAction::ClearCacheAction));
+    }
+
+    /// The clear-cache body is a published client contract, so the shape is
+    /// pinned rather than left to whatever the handler happens to build.
+    #[test]
+    fn kms_clear_cache_response_has_a_stable_json_shape() {
+        insta::assert_json_snapshot!(
+            "kms_admin_clear_cache_response",
+            stable_json_value(KmsClearCacheResponse {
+                status: "success".to_string(),
+                message: "cache cleared successfully".to_string(),
+            })
+        );
+    }
+
+    /// The snapshot above pins the *type*; this pins that the handler actually
+    /// serves it. Without this, reverting the handler body to a `json!` literal
+    /// with any field names at all leaves the snapshot green — which is exactly
+    /// the silent reshaping the named type was introduced to prevent.
+    #[test]
+    fn the_clear_cache_handler_serves_the_named_response_type() {
+        let src = include_str!("kms_management.rs");
+        let marker = "impl Operation for KmsClearCacheHandler";
+        let block = src.split_once(marker).expect("clear-cache handler impl should exist").1;
+        let block = &block[..block.find("\n#[cfg(test)]").unwrap_or(block.len())];
+        assert!(
+            block.contains("KmsClearCacheResponse {"),
+            "the clear-cache handler must build its response from the named type"
+        );
+        assert!(
+            !block.contains("serde_json::json!"),
+            "the clear-cache handler must not rebuild its response as an inline literal"
+        );
     }
 
     #[test]

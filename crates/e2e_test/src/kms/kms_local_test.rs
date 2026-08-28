@@ -20,20 +20,15 @@
 //! - Complete encryption/decryption lifecycle
 
 use super::common::{
-    LocalKMSTestEnvironment, get_kms_status, skip_if_kms_admin_tool_unavailable, sse_customer_key_md5_base64,
+    LocalKMSTestEnvironment, SSE_C_KEY_MISMATCH_MESSAGE, assert_s3_error, get_kms_status, sse_customer_key_md5_base64,
     test_kms_key_management, test_sse_c_encryption,
 };
 use crate::common::{TEST_BUCKET, init_logging};
-use serial_test::serial;
 use tracing::{error, info};
 
 #[tokio::test]
-#[serial]
 async fn test_local_kms_end_to_end() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    if skip_if_kms_admin_tool_unavailable("test_local_kms_end_to_end") {
-        return Ok(());
-    }
     info!("Starting Local KMS End-to-End Test");
 
     // Create LocalKMS test environment
@@ -48,7 +43,7 @@ async fn test_local_kms_end_to_end() -> Result<(), Box<dyn std::error::Error + S
         .expect("Failed to start RustFS with Local KMS");
 
     // Wait a moment for RustFS to fully start up and initialize KMS
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     info!("RustFS started with KMS auto-configuration, default_key_id: {}", default_key_id);
 
@@ -114,7 +109,6 @@ async fn test_local_kms_end_to_end() -> Result<(), Box<dyn std::error::Error + S
 }
 
 #[tokio::test]
-#[serial]
 async fn test_local_kms_key_isolation() {
     init_logging();
     info!("Starting Local KMS Key Isolation Test");
@@ -130,7 +124,7 @@ async fn test_local_kms_key_isolation() {
         .expect("Failed to start RustFS with Local KMS");
 
     // Wait a moment for RustFS to fully start up and initialize KMS
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await.expect("KMS ready");
 
     info!("RustFS started with KMS auto-configuration, default_key_id: {}", default_key_id);
 
@@ -144,8 +138,8 @@ async fn test_local_kms_key_isolation() {
     // Test that different SSE-C keys create isolated encrypted objects
     let key1 = "01234567890123456789012345678901";
     let key2 = "98765432109876543210987654321098";
-    let key1_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key1);
-    let key2_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key2);
+    let key1_b64 = base64_simd::STANDARD.encode_to_string(key1);
+    let key2_b64 = base64_simd::STANDARD.encode_to_string(key2);
     let key1_md5 = sse_customer_key_md5_base64(key1);
     let key2_md5 = sse_customer_key_md5_base64(key2);
 
@@ -203,7 +197,13 @@ async fn test_local_kms_key_isolation() {
         .send()
         .await;
 
-    assert!(wrong_key_result.is_err(), "Should not be able to decrypt object1 with key2");
+    assert_s3_error(
+        wrong_key_result,
+        400,
+        "InvalidRequest",
+        SSE_C_KEY_MISMATCH_MESSAGE,
+        "local SSE-C object GET with a wrong key must be rejected",
+    );
 
     kms_env
         .base_env
@@ -215,7 +215,6 @@ async fn test_local_kms_key_isolation() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_local_kms_large_file() {
     init_logging();
     info!("Starting Local KMS Large File Test");
@@ -231,7 +230,7 @@ async fn test_local_kms_large_file() {
         .expect("Failed to start RustFS with Local KMS");
 
     // Wait a moment for RustFS to fully start up and initialize KMS
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await.expect("KMS ready");
 
     info!("RustFS started with KMS auto-configuration, default_key_id: {}", default_key_id);
 
@@ -298,7 +297,6 @@ async fn test_local_kms_large_file() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_local_kms_multipart_upload() {
     init_logging();
     info!("Starting Local KMS Multipart Upload Test");
@@ -314,7 +312,7 @@ async fn test_local_kms_multipart_upload() {
         .expect("Failed to start RustFS with Local KMS");
 
     // Wait for KMS initialization
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await.expect("KMS ready");
 
     info!("RustFS started with KMS auto-configuration, default_key_id: {}", default_key_id);
 
@@ -567,7 +565,7 @@ async fn test_multipart_upload_with_sse_c(
 
     // SSE-C encryption key
     let encryption_key = "01234567890123456789012345678901";
-    let key_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, encryption_key);
+    let key_b64 = base64_simd::STANDARD.encode_to_string(encryption_key);
     let key_md5 = sse_customer_key_md5_base64(encryption_key);
 
     // Generate test data
@@ -652,7 +650,10 @@ async fn test_multipart_upload_with_sse_c(
 }
 
 /// Test large multipart upload to verify streaming encryption works correctly
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "parked behind the TODO in test_local_kms_multipart_upload until streaming encryption is fixed for large files (backlog#1823)"
+)]
 async fn test_large_multipart_upload(
     s3_client: &aws_sdk_s3::Client,
     bucket: &str,

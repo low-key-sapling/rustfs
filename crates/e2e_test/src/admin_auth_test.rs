@@ -31,14 +31,9 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::common::{RustFSTestEnvironment, init_logging, local_http_client, rustfs_binary_path};
-    use aws_sdk_s3::config::{Credentials, Region};
-    use aws_sdk_s3::{Client, Config};
-    use http::header::HOST;
-    use rustfs_signer::constants::UNSIGNED_PAYLOAD;
-    use rustfs_signer::sign_v4;
-    use s3s::Body;
-    use serial_test::serial;
+    use crate::common::{RustFSTestEnvironment, init_logging, rustfs_binary_path};
+    use aws_sdk_s3::Client;
+    use aws_sdk_s3::error::ProvideErrorMetadata;
     use std::error::Error;
     use std::io::Read;
     use std::process::{Command, Stdio};
@@ -87,10 +82,10 @@ mod tests {
     }
 
     /// Send a SigV4-signed request to `path` (optionally with a JSON `body`) and
-    /// return `(status, body)`. Uses the `UNSIGNED_PAYLOAD` content hash so a
-    /// request body can be attached without the caller pre-hashing it — the
-    /// server verifies the signature against the same sentinel, exactly as the
-    /// AWS SDKs / MinIO client do for streaming/unsigned payloads.
+    /// return `(status, body)`.
+    ///
+    /// Thin wrapper over [`crate::common::admin_request`], kept local so the
+    /// call sites below keep their `Option<&str>` body shape.
     async fn signed_request(
         base_url: &str,
         method: http::Method,
@@ -99,47 +94,13 @@ mod tests {
         access_key: &str,
         secret_key: &str,
     ) -> Result<(reqwest::StatusCode, String), Box<dyn Error + Send + Sync>> {
-        let url = format!("{base_url}{path}");
-        let uri = url.parse::<http::Uri>()?;
-        let authority = uri.authority().ok_or("missing authority")?.to_string();
-        let body_bytes = body.map(|b| b.as_bytes().to_vec()).unwrap_or_default();
-
-        // The signature is computed over `UNSIGNED_PAYLOAD`, so the body bytes do
-        // not participate in the SigV4 hash — sign over an empty body and attach
-        // the real payload to the wire request below.
-        let request = http::Request::builder()
-            .method(method.clone())
-            .uri(uri)
-            .header(HOST, authority)
-            .header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
-        let signed = sign_v4(request.body(Body::empty())?, 0, access_key, secret_key, "", "us-east-1");
-
-        let client = local_http_client();
-        let mut rb = client.request(method, url.as_str());
-        for (name, value) in signed.headers() {
-            rb = rb.header(name, value);
-        }
-        if !body_bytes.is_empty() {
-            rb = rb.body(body_bytes);
-        }
-        let resp = rb.send().await?;
-        let status = resp.status();
-        let text = resp.text().await?;
-        Ok((status, text))
+        crate::common::admin_request(base_url, method, path, body.map(str::to_string), access_key, secret_key).await
     }
 
     /// Build an S3 client bound to explicit credentials (used to exercise the S3
     /// data plane with rotated / stale root credentials).
     fn s3_client_with(env: &RustFSTestEnvironment, access_key: &str, secret_key: &str) -> Client {
-        let credentials = Credentials::new(access_key, secret_key, None, None, "sec4-admin-auth");
-        let config = Config::builder()
-            .credentials_provider(credentials)
-            .region(Region::new("us-east-1"))
-            .endpoint_url(&env.url)
-            .force_path_style(true)
-            .behavior_version_latest()
-            .build();
-        Client::from_conf(config)
+        env.create_s3_client_with_credentials(access_key, secret_key)
     }
 
     /// Create a non-admin IAM user via the admin `add-user` API using the root
@@ -151,18 +112,12 @@ mod tests {
         access_key: &str,
         secret_key: &str,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let path = format!("/rustfs/admin/v3/add-user?accessKey={access_key}");
-        let body = serde_json::json!({ "secretKey": secret_key, "status": "enabled" }).to_string();
-        let (status, resp) =
-            signed_request(&env.url, http::Method::PUT, &path, Some(&body), &env.access_key, &env.secret_key).await?;
-        assert!(status.is_success(), "add-user should succeed (status={status}, body={resp})");
-        Ok(())
+        crate::common::admin_create_user(env, access_key, secret_key).await
     }
 
     /// A fully authenticated but non-admin credential must be rejected with
     /// `403 AccessDenied` on an admin API, while the root credential succeeds.
     #[tokio::test(flavor = "multi_thread")]
-    #[serial]
     async fn non_admin_credential_denied_on_admin_api() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
         let mut env = RustFSTestEnvironment::new().await?;
@@ -198,7 +153,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[serial]
     async fn non_admin_credential_denied_on_manual_transition_run() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
         let mut env = RustFSTestEnvironment::new().await?;
@@ -326,7 +280,6 @@ mod tests {
     /// credential is accepted and the old one is rejected, on both the S3 data
     /// plane and the admin plane.
     #[tokio::test(flavor = "multi_thread")]
-    #[serial]
     async fn root_credential_rotation_takes_effect() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
         let mut env = RustFSTestEnvironment::new().await?;
@@ -372,10 +325,15 @@ mod tests {
             reqwest::StatusCode::FORBIDDEN,
             "stale root must be rejected on the admin API after rotation, body: {body}"
         );
-        let s3_old = s3_client_with(&env, &old_ak, &old_sk).list_buckets().send().await;
-        assert!(
-            s3_old.is_err(),
-            "stale root must be rejected on the S3 plane after rotation, got: {s3_old:?}"
+        let s3_old = s3_client_with(&env, &old_ak, &old_sk)
+            .list_buckets()
+            .send()
+            .await
+            .expect_err("stale root must be rejected on the S3 plane after rotation");
+        assert_eq!(
+            s3_old.as_service_error().and_then(ProvideErrorMetadata::code),
+            Some("InvalidAccessKeyId"),
+            "stale root must receive InvalidAccessKeyId after rotation: {s3_old:?}"
         );
 
         env.stop_server();
@@ -389,7 +347,6 @@ mod tests {
     /// runtime. We capture the child's stdout/stderr directly (the shared
     /// harness inherits stdio) and poll for the warning until it appears.
     #[tokio::test(flavor = "multi_thread")]
-    #[serial]
     async fn default_credentials_emit_startup_warning() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
 

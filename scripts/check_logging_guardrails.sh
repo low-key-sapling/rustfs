@@ -6,19 +6,38 @@ cd "$repo_root"
 
 checked_files=(
   "rustfs/src/main.rs"
+  "rustfs/src/startup_entrypoint.rs"
   "rustfs/src/init.rs"
   "rustfs/src/profiling.rs"
   "rustfs/src/startup_iam.rs"
   "rustfs/src/auth.rs"
   "rustfs/src/protocols/client.rs"
   "rustfs/src/admin/router.rs"
-  "rustfs/src/admin/handlers/table_catalog.rs"
+  "rustfs/src/admin/handlers/table_catalog/config.rs"
+  "rustfs/src/admin/handlers/table_catalog/credentials.rs"
+  "rustfs/src/admin/handlers/table_catalog/maintenance.rs"
+  "rustfs/src/admin/handlers/table_catalog/mod.rs"
+  "rustfs/src/admin/handlers/table_catalog/namespace.rs"
+  "rustfs/src/admin/handlers/table_catalog/refs.rs"
+  "rustfs/src/admin/handlers/table_catalog/routes.rs"
+  "rustfs/src/admin/handlers/table_catalog/table.rs"
+  "rustfs/src/admin/handlers/table_catalog/tests.rs"
+  "rustfs/src/admin/handlers/table_catalog/view.rs"
   "rustfs/src/admin/handlers/service_account.rs"
   "rustfs/src/admin/handlers/kms_audit.rs"
   "rustfs/src/admin/handlers/kms_dynamic.rs"
   "rustfs/src/admin/handlers/kms_keys.rs"
   "rustfs/src/admin/handlers/kms_key_lifecycle.rs"
   "rustfs/src/admin/handlers/site_replication.rs"
+  "rustfs/src/site_replication/mod.rs"
+  "rustfs/src/site_replication/identity.rs"
+  "rustfs/src/site_replication/state_lock.rs"
+  "rustfs/src/site_replication/state.rs"
+  "rustfs/src/site_replication/transport.rs"
+  "rustfs/src/site_replication/retry.rs"
+  "rustfs/src/site_replication/repair.rs"
+  "rustfs/src/site_replication/hooks.rs"
+  "rustfs/src/site_replication/tests.rs"
   "rustfs/src/admin/handlers/group.rs"
   "rustfs/src/admin/handlers/quota.rs"
   "rustfs/src/admin/handlers/rebalance.rs"
@@ -50,7 +69,7 @@ checked_files=(
   "crates/targets/src/target/webhook.rs"
   "crates/ecstore/src/store/peer.rs"
   "crates/ecstore/src/store/init.rs"
-  "crates/ecstore/src/client/transition_api.rs"
+  "crates/s3-client/src/transition_api.rs"
   "crates/ecstore/src/services/tier/tier.rs"
   "crates/heal/src/heal/manager.rs"
   "crates/heal/src/heal/storage.rs"
@@ -105,6 +124,8 @@ checked_files=(
   "crates/obs/src/telemetry/dial9/enabled.rs"
   "crates/obs/src/telemetry/local.rs"
   "crates/obs/src/telemetry/otel.rs"
+  "crates/obs/src/telemetry/guard.rs"
+  "crates/obs/src/telemetry/rolling.rs"
   "crates/obs/src/metrics/scheduler.rs"
   "crates/obs/src/cleaner/core.rs"
   "crates/obs/src/cleaner/compress.rs"
@@ -142,17 +163,17 @@ forbidden_patterns=(
   'debug!("http_client headers: {:?}"'
   'warn!("err_body: {}"'
   'debug!("config: {:?}"'
-  'warn!("No audit targets configured for dispatch"'
-  'warn!("No audit targets configured for batch dispatch"'
-  'info!("Event stream processing for target {} is started successfully"'
-  'info!("Target {} has no replay worker to start"'
-  'info!("Sending event to targets: {:?}"'
-  'info!("Event processing initiated for {} targets for bucket: {}"'
+  '"No audit targets configured for dispatch"'
+  '"No audit targets configured for batch dispatch"'
+  '"Event stream processing for target {} is started successfully"'
+  '"Target {} has no replay worker to start"'
+  '"Sending event to targets: {:?}"'
+  '"Event processing initiated for {} targets for bucket: {}"'
   'warn!("{}", notify_configuration_hint())'
-  'info!("Available ARNs: {:?}"'
-  'info!("Loaded notification config for bucket: {}"'
-  'info!("Updated notification rules for bucket: {}"'
-  'info!("Removed all notification rules for bucket: {}"'
+  '"Available ARNs: {:?}"'
+  '"Loaded notification config for bucket: {}"'
+  '"Updated notification rules for bucket: {}"'
+  '"Removed all notification rules for bucket: {}"'
   'info!(event = EVENT_NOTIFY_RUNTIME_LIFECYCLE,'
   'info!("Notification system instance is being dropped"'
   'info!("Notification shutdown metric snapshot"'
@@ -172,9 +193,9 @@ forbidden_patterns=(
   'info!(target_id = %self.id, "MQTT target close method finished.")'
   'debug!("Wrote event to store: {}"'
   'debug!("Deleted event from store: {}"'
-  'info!("Audit configuration reloaded"'
-  'info!("Audit system started"'
-  'info!("Audit metrics reset"'
+  '"Audit configuration reloaded"'
+  '"Audit system started"'
+  '"Audit metrics reset"'
   'error!("Failed to set global observability guard: {}"'
   'error!("Failed to initialize TLS from {}: {}"'
   'error!("Server encountered an error and is shutting down: {}"'
@@ -659,12 +680,196 @@ forbidden_patterns=(
   'error!("{} cache write lock poisoned: {}"'
   'error!("metrics_metadata lock poisoned: {}"'
   'warn!("Could not get GPU stats, recording 0 for GPU memory usage"'
+  # Migrated from the retired source-text tests in crates/obs/src/logging.rs
+  # (rustfs/backlog#1884): unmasked access-key interpolation, retired startup
+  # noise, and stderr prints that were converted to tracing events.
+  'access_key: {access_key}'
+  '"Successfully sent audit entry, target: {}, key: {}"'
+  '"Target {} not connected, retrying..."'
+  '"Timeout sending to target {}, retrying..."'
+  '"[WARN] Failed to initialize file observability logging'
+  '"Falling back to stdout logging.'
+  'eprintln!("Tracer shutdown error: {err:?}")'
+  'eprintln!("Meter shutdown error: {err:?}")'
+  'eprintln!("Logger shutdown error: {err:?}")'
+  'eprintln!("Log cleanup task stopped")'
+  'eprintln!("Tracing guard dropped, flushing logs.")'
+  'eprintln!("Stdout guard dropped, flushing logs.")'
 )
 
 for pattern in "${forbidden_patterns[@]}"; do
   if rg -n -F -- "$pattern" "${checked_files[@]}" >/dev/null; then
     echo "❌ logging guardrail violation: found forbidden pattern '$pattern'" >&2
     rg -n -F -- "$pattern" "${checked_files[@]}" >&2
+    exit 1
+  fi
+done
+
+# Positive structure guards migrated from the retired source-text tests in
+# crates/obs/src/logging.rs (rustfs/backlog#1884). Each pattern below must keep
+# existing: the single fatal-stderr formatter used before observability is up,
+# the structured tracing fields that replaced eprintln! in telemetry
+# fallback/shutdown paths, and the explicit stderr exceptions in the low-level
+# rolling appender (which cannot log through the sink it implements).
+require_patterns() {
+  local file="$1"
+  shift
+  for pattern in "$@"; do
+    if ! rg -n -F -- "$pattern" "$file" >/dev/null; then
+      echo "❌ logging guardrail violation: required pattern '$pattern' is missing from $file" >&2
+      exit 1
+    fi
+  done
+}
+
+require_patterns "rustfs/src/startup_entrypoint.rs" \
+  'fn format_fatal_stderr_message(context: &str, error: impl std::fmt::Display) -> String' \
+  'fn emit_fatal_stderr(context: &str, error: impl std::fmt::Display)' \
+  'emit_fatal_stderr("Server runtime failed", e)' \
+  'emit_fatal_stderr("Configuration bootstrap failed", error)' \
+  'emit_fatal_stderr("Observability initialization failed", err)'
+
+require_patterns "crates/obs/src/telemetry/local.rs" \
+  'warn!(' \
+  'state = "fallback_to_stdout"' \
+  'failed_sink = "file"' \
+  'sink = "stdout"'
+
+require_patterns "crates/obs/src/telemetry/guard.rs" \
+  'EVENT_OBS_GUARD_SHUTDOWN' \
+  'resource = "tracer_provider"' \
+  'resource = "meter_provider"' \
+  'resource = "logger_provider"' \
+  'resource = "log_cleaner"' \
+  'resource = "tracing_guard"' \
+  'resource = "stdout_guard"'
+
+require_patterns "crates/obs/src/telemetry/rolling.rs" \
+  'Failed to flush log file before rotation' \
+  'RollingAppender: Failed to rotate log file after' \
+  'RollingAppender: failed to rotate log file'
+
+if rg -n -F -- 'warn!(name = %MaskedAccessKey(name), user_type = ?user_type, "IAM user identity missing")' crates/iam/src/store/object.rs >/dev/null; then
+  echo "❌ logging guardrail violation: missing IAM identity is an expected debug event, not a warning" >&2
+  exit 1
+fi
+
+unmasked_iam_identity_logs="$(rg -n 'IAM (user identity|JWT claim)' crates/iam/src/store/object.rs | rg -v 'MaskedAccessKey' || true)"
+if [[ -n "$unmasked_iam_identity_logs" ]]; then
+  echo "❌ logging guardrail violation: IAM identity log omits MaskedAccessKey" >&2
+  echo "$unmasked_iam_identity_logs" >&2
+  exit 1
+fi
+
+unmasked_revoke_fields="$(rg -n '(access_key\s*=\s*%\s*&?sts\.access_key|target_user\s*=\s*%\s*&?target_user)' rustfs/src/admin/handlers/idp_compat.rs || true)"
+if [[ -n "$unmasked_revoke_fields" ]]; then
+  echo "❌ logging guardrail violation: revoke-tokens log exposes an unmasked credential identifier" >&2
+  echo "$unmasked_revoke_fields" >&2
+  exit 1
+fi
+
+# STS claims carry caller-supplied identity material (parent user, session policy, JWT
+# fields). Interpolating the claims map into any log or error repeats the
+# GHSA-r54g-49rx-98cr / GHSA-8cm2-h255-v749 credential-leak class. Only derived metadata
+# such as claims.len() may be logged (see trace_assume_role_claims in sts.rs).
+sts_claims_content_logs="$(rg -n '\{:\?\}.*claims|claims.*\{:\?\}|\{&?claims:\?\}|[?%]\s*&?claims\b' rustfs/src/admin/handlers/sts.rs || true)"
+if [[ -n "$sts_claims_content_logs" ]]; then
+  echo "❌ logging guardrail violation: STS handlers must not interpolate JWT claims into logs or errors (GHSA-r54g-49rx-98cr / GHSA-8cm2-h255-v749 class); log derived metadata such as claims.len() instead" >&2
+  echo "$sts_claims_content_logs" >&2
+  exit 1
+fi
+
+heal_hotpath_files=(
+  "crates/ecstore/src/store/heal.rs"
+  "crates/ecstore/src/store/mod.rs"
+  "crates/ecstore/src/core/sets.rs"
+  "crates/ecstore/src/set_disk/ops/heal.rs"
+)
+
+heal_function_pattern='async fn (handle_)?heal_object(_dir)?\('
+trace_heal_instrumentation_pattern='#\[(tracing::)?instrument\(\s*level\s*=\s*"trace"[^]]*\)\]\s*(pub(\([^)]*\))?\s+)?async fn (handle_)?heal_object(_dir)?\('
+heal_function_count="$(rg -n "$heal_function_pattern" "${heal_hotpath_files[@]}" | wc -l | tr -d ' ')"
+trace_heal_instrumentation_count="$(
+  rg -U -o "$trace_heal_instrumentation_pattern" "${heal_hotpath_files[@]}" |
+    rg -c 'async fn (handle_)?heal_object' || true
+)"
+if [[ "$heal_function_count" != "$trace_heal_instrumentation_count" ]]; then
+  echo "❌ logging guardrail violation: per-object heal instrumentation must be TRACE-only" >&2
+  echo "found $heal_function_count per-object heal functions but $trace_heal_instrumentation_count TRACE spans" >&2
+  exit 1
+fi
+
+unexpected_heal_info="$(
+  rg -n '\binfo!' crates/ecstore/src/set_disk/ops/heal.rs crates/ecstore/src/erasure/coding/heal.rs || true
+)"
+if [[ -n "$unexpected_heal_info" ]]; then
+  echo "❌ logging guardrail violation: per-object set-disk heal events must not be emitted at INFO" >&2
+  echo "$unexpected_heal_info" >&2
+  exit 1
+fi
+
+heal_info_event_pattern='info!\([^;]*(EVENT_HEAL_OBJECT_STARTED|state\s*=\s*"(metadata_corrupt|metadata_invalid|erasure_distribution_mismatch)"|disks_with_all_partsv2: metadata is corrupted|disks_with_all_partsv2: metadata is not valid|disks_with_all_partsv2: erasure distribution is not the same as onlineDisks)[^;]*\);'
+if rg -n -U "$heal_info_event_pattern" crates/ecstore/src/store/heal.rs crates/ecstore/src/set_disk/mod.rs >/dev/null; then
+  echo "❌ logging guardrail violation: per-object heal diagnostics must not be emitted at INFO" >&2
+  rg -n -U "$heal_info_event_pattern" crates/ecstore/src/store/heal.rs crates/ecstore/src/set_disk/mod.rs >&2
+  exit 1
+fi
+
+raw_heal_metadata_pattern='(\?(parts_metadata|online_disks|out_dated_disks|latest_meta|meta)\b|(parts_metadata|online_disks|out_dated_disks|latest_meta|meta)\s*=\s*\?|(?:latest_meta|meta)\s*:\s*\{:#?\?\}|\{(parts_metadata|online_disks|out_dated_disks|latest_meta|meta):#?\?\}|\{:#?\?\}[^;]*(parts_metadata|online_disks|out_dated_disks|latest_meta|meta)\b|unexpected file distribution \(\{:#?\?\}\))'
+if rg -n -U "$raw_heal_metadata_pattern" crates/ecstore/src/set_disk/ops/heal.rs crates/ecstore/src/set_disk/mod.rs >/dev/null; then
+  echo "❌ logging guardrail violation: heal logs must not dump raw object or disk metadata" >&2
+  rg -n -U "$raw_heal_metadata_pattern" crates/ecstore/src/set_disk/ops/heal.rs crates/ecstore/src/set_disk/mod.rs >&2
+  exit 1
+fi
+
+# Keep the matchers honest. These unsafe equivalents previously bypassed the
+# guard when attributes/macros were multiline, long, or used structured Debug.
+for fixture in \
+  $'#[tracing::instrument(\n    level = "info",\n    skip(self),\n)]\nasync fn heal_object(' \
+  $'#[instrument(skip(self), fields(level = "trace"))]\nasync fn heal_object('; do
+  fixture_function_count="$(printf '%s\n' "$fixture" | rg -c "$heal_function_pattern" || true)"
+  fixture_trace_count="$(
+    printf '%s\n' "$fixture" |
+      rg -U -o "$trace_heal_instrumentation_pattern" |
+      rg -c 'async fn (handle_)?heal_object' || true
+  )"
+  if [[ "$fixture_function_count" == "$fixture_trace_count" ]]; then
+    echo "❌ logging guardrail self-test failed: unsafe heal span was accepted" >&2
+    echo "$fixture" >&2
+    exit 1
+  fi
+done
+
+printf -v heal_info_padding '%*s' 600 ''
+long_info_event_fixture="info!(${heal_info_padding} event = EVENT_HEAL_OBJECT_STARTED);"
+if ! printf '%s\n' "$long_info_event_fixture" | rg -U "$heal_info_event_pattern" >/dev/null; then
+  echo "❌ logging guardrail self-test failed: long per-object INFO event was not detected" >&2
+  exit 1
+fi
+
+for fixture in \
+  'info!("disks_with_all_partsv2: metadata is corrupted, object_name={}", object);' \
+  'info!("disks_with_all_partsv2: metadata is not valid, object_name={}", object);' \
+  'info!("disks_with_all_partsv2: erasure distribution is not the same as onlineDisks");'; do
+  if ! printf '%s\n' "$fixture" | rg -U "$heal_info_event_pattern" >/dev/null; then
+    echo "❌ logging guardrail self-test failed: retired per-object INFO event was not detected" >&2
+    echo "$fixture" >&2
+    exit 1
+  fi
+done
+
+for fixture in \
+  'debug!(latest_meta = ?latest_meta, "raw metadata")' \
+  'trace!("latest_meta: {:#?}", latest_meta)' \
+  'warn!("available disks: {:?}", online_disks)' \
+  'debug!("{:#?}", parts_metadata)' \
+  'debug!("raw metadata: {latest_meta:?}")' \
+  'trace!("raw metadata: {meta:#?}")' \
+  'warn!("raw disks: {online_disks:?}")' \
+  'warn!("unexpected file distribution ({:?})", online_disks)'; do
+  if ! printf '%s\n' "$fixture" | rg -U "$raw_heal_metadata_pattern" >/dev/null; then
+    echo "❌ logging guardrail self-test failed: raw heal metadata fixture was not detected" >&2
+    echo "$fixture" >&2
     exit 1
   fi
 done
@@ -715,6 +920,90 @@ for file in "${disk_logging_files[@]}"; do
   fi
 done
 
+# `set_disks` expands every Disk through Debug, including raw format bytes and
+# the full per-operation metrics ring. Keep it out of the INFO scanner span.
+scanner_disk_skip_pattern='#\[(tracing::)?instrument\([^]]*skip\([^)]*\bset_disks\b[^)]*\)[^]]*\)\][[:space:]]*async fn nsscanner_disk\b'
+# nsscanner_disk lives in the scanner_io/io_disk.rs child module since the
+# scanner_io module-tree split.
+if ! rg -U "$scanner_disk_skip_pattern" crates/scanner/src/scanner_io/io_disk.rs >/dev/null; then
+  echo "❌ logging guardrail violation: nsscanner_disk must skip set_disks in its tracing instrumentation" >&2
+  exit 1
+fi
+
+for fixture in \
+  $'#[tracing::instrument(skip(self, budget, updates, cache, set_disks))]\nasync fn nsscanner_disk('; do
+  if ! printf '%s\n' "$fixture" | rg -U "$scanner_disk_skip_pattern" >/dev/null; then
+    echo "❌ logging guardrail self-test failed: safe nsscanner_disk span was rejected" >&2
+    echo "$fixture" >&2
+    exit 1
+  fi
+done
+
+for fixture in \
+  $'#[tracing::instrument(skip(self, budget, updates, cache))]\nasync fn nsscanner_disk(' \
+  $'#[tracing::instrument(skip(self, budget, updates, cache), fields(set_disks = set_disks.len()))]\nasync fn nsscanner_disk(' \
+  $'#[tracing::instrument(skip(self, budget, updates, cache, set_disks_count))]\nasync fn nsscanner_disk('; do
+  if printf '%s\n' "$fixture" | rg -U "$scanner_disk_skip_pattern" >/dev/null; then
+    echo "❌ logging guardrail self-test failed: unsafe nsscanner_disk span was accepted" >&2
+    echo "$fixture" >&2
+    exit 1
+  fi
+done
+
+# `forbidden_patterns` above only retires log lines that already shipped, so a
+# newly written sentence-style log passes every check in this script — which is
+# how one reaches review in the first place (PR #5822 added
+# `warn!("heal rename_data: purging ... {:?} failed: {}", ...)` to
+# disk/local.rs with CI green). Assert the RustFS event shape positively on the
+# file sets already governed here: error!/warn!/info! must open with fields
+# (`event = ...`) or a `target:`, never with a bare message string. debug! and
+# trace! stay out of scope — they are targeted diagnostics, not operator
+# events. Extend this list as more files are converted; it is deliberately
+# narrower than `checked_files`, which is only a blocklist surface.
+structured_event_files=(
+  "crates/ecstore/src/disk/mod.rs"
+  "crates/ecstore/src/disk/local.rs"
+  "crates/ecstore/src/cluster/rpc/remote_disk.rs"
+)
+
+# The leading class rejects `my_info!(` while still matching `tracing::warn!(`.
+sentence_style_log_pattern='(?:^|[^A-Za-z0-9_])(?:error|warn|info)!\(\s*"'
+
+for file in "${structured_event_files[@]}"; do
+  # Commented-out macros are dead code, not emitted events.
+  sentence_style_logs="$(rg -n -U "$sentence_style_log_pattern" "$file" | rg -v '^[0-9]+:\s*//' || true)"
+  if [[ -n "$sentence_style_logs" ]]; then
+    echo "❌ logging guardrail violation: error!/warn!/info! must lead with structured fields (event/component/subsystem) in $file" >&2
+    echo "$sentence_style_logs" >&2
+    exit 1
+  fi
+done
+
+# Keep the matcher honest in both directions.
+for fixture in \
+  'warn!("heal rename_data: purging stale destination data dir {:?} failed: {}", dst_data_path, err);' \
+  $'warn!(\n    "rename_data commit failed: {}",\n    err\n);' \
+  'tracing::warn!("conv_part_err_to_int: unknown error: {err:?}");' \
+  'info!("disk scan finished");'; do
+  if ! printf '%s\n' "$fixture" | rg -U "$sentence_style_log_pattern" >/dev/null; then
+    echo "❌ logging guardrail self-test failed: sentence-style log was accepted" >&2
+    echo "$fixture" >&2
+    exit 1
+  fi
+done
+
+for fixture in \
+  $'info!(\n    event = EVENT_DISK_LOCAL_RENAME_REJECTED,\n    component = LOG_COMPONENT_ECSTORE,\n    reason = "rename_all_data_path_failed",\n    "Disk local rename flow failed"\n);' \
+  'warn!(target: "rustfs::heal::manager", event = EVENT_HEAL_RETRY, "Heal retry admission decided");' \
+  'my_info!("not a tracing macro");' \
+  'debug!("list_dir raw {:?}", entries);'; do
+  if printf '%s\n' "$fixture" | rg -U "$sentence_style_log_pattern" >/dev/null; then
+    echo "❌ logging guardrail self-test failed: structured event was rejected" >&2
+    echo "$fixture" >&2
+    exit 1
+  fi
+done
+
 if rg -n -U 'debug!\([\s\S]{0,600}"Remote disk RPC started"' crates/ecstore/src/cluster/rpc/remote_disk.rs >/dev/null; then
   echo "❌ logging guardrail violation: successful remote disk RPC events must not be emitted at DEBUG" >&2
   exit 1
@@ -728,6 +1017,89 @@ fi
 stdout_sink_calls="$(rg -n -F 'validate_stdout_sink(&file_appender)' crates/obs/src/telemetry/local.rs crates/obs/src/telemetry/otel.rs | wc -l | tr -d ' ')"
 if [[ "$stdout_sink_calls" != "2" ]]; then
   echo "❌ logging guardrail violation: local and OTLP file logging must both validate stdout sink ownership" >&2
+  exit 1
+fi
+
+# Heal log amplification guards (rustfs/rustfs#5716 follow-up): per-object heal
+# work (Object/Metadata/MRF/ECDecode tasks queued by MRF/autoheal/scanner loops)
+# must not emit info!/warn!/error! lines per object during mass recovery.
+# The 1000-char window covers the measured 541-710 chars of structured fields
+# between the macro open and the message at every retry-admission site.
+if rg -n -U '(info|warn)!\(\s*target: "rustfs::heal::manager",[\s\S]{0,1000}"Heal retry admission decided"' crates/heal/src/heal/manager.rs >/dev/null; then
+  echo "❌ logging guardrail violation: heal retry admission decisions repeat per retrying task (per-object under MRF retry storms) and must stay at DEBUG" >&2
+  exit 1
+fi
+
+if rg -n -U 'info!\([\s\S]{0,1000}"GetObject streaming body resumed from a reopened object read"' rustfs/src/app/object >/dev/null; then
+  echo "❌ logging guardrail violation: successful per-object GetObject resume events must stay below INFO" >&2
+  exit 1
+fi
+
+demoted_task_sites="$(rg -c -F 'demote_to_debug_when!(self.heal_type.is_per_object()' crates/heal/src/heal/task.rs || echo 0)"
+if [[ "$demoted_task_sites" -lt 4 ]]; then
+  echo "❌ logging guardrail violation: per-object heal task lifecycle/failure logs must stay demoted to DEBUG via demote_to_debug_when! (expected >= 4 sites in crates/heal/src/heal/task.rs, found $demoted_task_sites)" >&2
+  exit 1
+fi
+
+# task.rs and its task/ child modules are one logical module tree since the
+# per-heal-kind split; count the demoted sites across the whole tree.
+demoted_task_total_sites="$(cat crates/heal/src/heal/task.rs crates/heal/src/heal/task/*.rs 2>/dev/null | rg -c -F 'demote_to_debug_when!(' || echo 0)"
+if [[ "$demoted_task_total_sites" -lt 5 ]]; then
+  echo "❌ logging guardrail violation: the background-source missing-object warn in crates/heal/src/heal/task.rs must stay level-split via demote_to_debug_when! (expected >= 5 total sites in the task module tree, found $demoted_task_total_sites)" >&2
+  exit 1
+fi
+
+erasure_sampled_sites="$(rg -c -F 'take_failure_log_sample(' crates/heal/src/heal/erasure_healer.rs || echo 0)"
+if [[ "$erasure_sampled_sites" -lt 2 ]]; then
+  echo "❌ logging guardrail violation: erasure-set per-object failure/skip warns must stay sample-capped via take_failure_log_sample (expected >= 2 sites in crates/heal/src/heal/erasure_healer.rs, found $erasure_sampled_sites)" >&2
+  exit 1
+fi
+
+# Object-read request fan-out crosses several thin wrappers. These spans are
+# useful for opt-in latency attribution, but default INFO turns one S3 request
+# into many redundant span-close records. Keep only the measured hot wrappers
+# TRACE-only; write, heal, rebalance, and admin operations are intentionally not
+# included here.
+trace_hot_spans=(
+  "crates/ecstore/src/set_disk/ops/locking.rs:new_ns_lock"
+  "crates/ecstore/src/store/rebalance.rs:handle_new_ns_lock"
+  "crates/ecstore/src/store/object.rs:handle_get_object_info"
+  "crates/ecstore/src/set_disk/ops/object.rs:get_object_info"
+  "crates/ecstore/src/store/mod.rs:list_objects_v2"
+  # The ECStore handle_list_objects_v2 forwarder was folded into the trait impl
+  # above, so store/mod.rs now carries this hot path's TRACE requirement
+  # directly (backlog#1821).
+  "crates/ecstore/src/core/sets.rs:list_objects_v2"
+  "crates/ecstore/src/set_disk/ops/list.rs:list_objects_v2"
+  "rustfs/src/app/bucket_usecase.rs:execute_list_objects_v2"
+  "rustfs/src/app/object:execute_get_object"
+)
+
+for hot_span in "${trace_hot_spans[@]}"; do
+  file="${hot_span%%:*}"
+  function="${hot_span##*:}"
+  trace_span_pattern="#\\[(tracing::)?instrument\\([^]]*level = \\\"trace\\\"[^]]*\\)\\]([[:space:]]+#\\[[^]]+\\])*[[:space:]]+(pub(\\([^)]*\\))?[[:space:]]+)?(super[[:space:]]+)?async fn ${function}\\b"
+  if ! rg -U "$trace_span_pattern" "$file" >/dev/null; then
+    echo "❌ logging guardrail violation: $file::$function must remain TRACE-only" >&2
+    exit 1
+  fi
+done
+
+if ! rg -U 'info!\([[:space:]]+target: HTTP_SERVER_LOG_TARGET,[[:space:]]+event = HTTP_REQUEST_COMPLETED_EVENT' rustfs/src/server/layer.rs >/dev/null; then
+  echo "❌ logging guardrail violation: successful HTTP completion events must use HTTP_SERVER_LOG_TARGET" >&2
+  exit 1
+fi
+
+if rg -n -F 'target: "rustfs::server::http"' rustfs/src/server/layer.rs >/dev/null; then
+  echo "❌ logging guardrail violation: HTTP request log target must use HTTP_SERVER_LOG_TARGET" >&2
+  exit 1
+fi
+
+# manager.rs and its manager/ child modules are one logical module tree since
+# the queue/scheduler split; count the demoted sites across the whole tree.
+demoted_admission_sites="$(cat crates/heal/src/heal/manager.rs crates/heal/src/heal/manager/*.rs 2>/dev/null | rg -c -F 'demote_to_debug_when!(' || echo 0)"
+if [[ "$demoted_admission_sites" -lt 6 ]]; then
+  echo "❌ logging guardrail violation: heal queue admission/scheduler warns for per-object requests must stay level-split via demote_to_debug_when! (expected >= 6 total sites in the manager module tree, found $demoted_admission_sites)" >&2
   exit 1
 fi
 

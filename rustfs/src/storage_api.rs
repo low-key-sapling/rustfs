@@ -23,6 +23,16 @@ pub(crate) mod capacity {
     }
 }
 
+/// Offline bucket-metadata inspection (`rustfs inspect bucket-meta`,
+/// backlog#1733): read-only shard verification and reconstruction without a
+/// running store.
+pub(crate) mod inspect {
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata as bucket_metadata;
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::utils::check_valid_bucket_name_strict;
+    pub(crate) use crate::storage::storage_api::ecstore_erasure::{BitrotReader, Erasure};
+    pub(crate) use crate::storage::storage_api::ecstore_set_disk::file_info_quorum_hash;
+}
+
 pub(crate) mod cluster {
     pub(crate) mod contract {
         pub(crate) mod capability {
@@ -77,9 +87,19 @@ pub(crate) mod kms {
         pub(crate) mod bucket {
             pub(crate) use super::super::super::storage_contracts::{BucketOperations, BucketOptions};
         }
+
+        pub(crate) mod list {
+            pub(crate) use super::super::super::storage_contracts::ListOperations;
+        }
+
+        pub(crate) mod object {
+            pub(crate) use super::super::super::storage_contracts::ObjectOperations;
+        }
     }
 
     pub(crate) use crate::storage::storage_api::{ECStore, StorageError};
+    pub(crate) type StorageObjectOptions = crate::storage::storage_api::StorageObjectOptions;
+    pub(crate) use crate::storage::storage_api::{ObjectDekRewrapOutcome, rewrap_object_encryption_metadata};
 
     /// Bucket SSE configuration for the KMS deletion reference gate;
     /// `Err(StorageError::ConfigNotFound)` when the bucket has none.
@@ -116,7 +136,7 @@ pub(crate) mod server {
     pub(crate) mod http {
         pub(crate) use crate::storage::storage_api::{
             ServerContextSlot, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, tonic_boot_epoch_challenge,
-            tonic_boot_epoch_response_headers, verify_tonic_rpc_signature_with_bootstrap,
+            tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason, verify_tonic_rpc_signature_with_bootstrap,
         };
 
         pub(crate) fn try_current_local_node_name() -> Option<String> {
@@ -196,6 +216,60 @@ pub(crate) mod server {
     }
 }
 
+/// Storage surface of the site-replication service module
+/// (`crate::site_replication`, backlog#1840): bucket metadata, bucket
+/// targets, replication-config primitives, and the config-object lock
+/// helpers its state transaction runs on.
+pub(crate) mod site_replication {
+    pub(crate) use super::storage_contracts::{BucketOperations, BucketOptions};
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::bucket_target_sys::BucketTargetSys;
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata::{
+        BUCKET_REPLICATION_CONFIG, BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, BucketMetadata,
+    };
+
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::replication::merge_incoming_replication_config;
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::replication::{
+        OperatorRuleContract, assign_site_replication_rule_priorities, is_site_replication_role,
+        replication_target_arn_deployment_id, site_replication_rule_deployment_id,
+    };
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::target::{
+        ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials,
+    };
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::utils::{deserialize, serialize};
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::versioning::VersioningApi;
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::ecstore_config::com::save_config;
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::{Endpoint, Endpoints, PoolEndpoints};
+
+    pub(crate) use crate::storage::storage_api::{
+        ECStore, EndpointServerPools, StorageError, delete_config_no_lock, lock_bucket_targets_metadata, read_config,
+        read_config_no_lock, save_config_no_lock, with_config_object_read_lock, with_config_object_write_lock,
+    };
+
+    pub(crate) mod metadata_sys {
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata_sys::{
+            capture_bucket_metadata_incarnation, get, get_replication_config, get_versioning_config, list_bucket_targets,
+            update_if_incarnation,
+        };
+    }
+
+    /// S3 wire types for the service module, funneled here so the module
+    /// itself stays off the direct s3s surface (s3s footprint ratchet).
+    pub(crate) mod s3 {
+        pub(crate) use s3s::dto::{
+            BucketLifecycleConfiguration, BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus,
+            DeleteReplication, DeleteReplicationStatus, Destination, ExistingObjectReplication, ExistingObjectReplicationStatus,
+            LifecycleRule, ReplicaModifications, ReplicaModificationsStatus, ReplicationConfiguration, ReplicationRule,
+            ReplicationRuleStatus, SourceSelectionCriteria, VersioningConfiguration,
+        };
+        #[cfg(test)]
+        pub(crate) use s3s::dto::{ExpirationStatus, LifecycleExpiration, Timestamp, Transition, TransitionStorageClass};
+        pub(crate) use s3s::{Body, S3Error, S3ErrorCode, S3Response, S3Result, s3_error};
+    }
+}
+
 pub(crate) mod startup {
     pub(crate) mod heal_control {
         #[cfg(test)]
@@ -204,7 +278,9 @@ pub(crate) mod startup {
     }
 
     pub(crate) mod background {
-        pub(crate) use crate::storage::storage_api::{ECStore, set_workload_admission_snapshot_provider};
+        pub(crate) use crate::storage::storage_api::{
+            BitrotSelfTestError, ECStore, bitrot_self_test, set_workload_admission_snapshot_provider,
+        };
     }
 
     pub(crate) mod bucket_metadata {
@@ -215,8 +291,8 @@ pub(crate) mod startup {
         }
 
         pub(crate) use crate::storage::storage_api::{
-            ECStore, init_bucket_metadata_sys, reconcile_bucket_resync_target_intents, try_migrate_bucket_metadata,
-            try_migrate_iam_config,
+            ECStore, Error, Result, get_global_replication_pool, init_bucket_metadata_sys,
+            reconcile_bucket_resync_target_intents, try_migrate_bucket_metadata, try_migrate_iam_config,
         };
     }
 
@@ -263,16 +339,18 @@ pub(crate) mod startup {
     }
 
     pub(crate) mod runtime_sources {
-        pub(crate) use crate::storage::storage_api::{DynReplicationPool, InstanceContext, set_global_rustfs_port};
+        pub(crate) use crate::storage::storage_api::{InstanceContext, set_global_rustfs_port};
     }
 
     pub(crate) mod services {
+        pub(crate) use super::super::storage_contracts::StorageAdminApi;
         pub(crate) use crate::storage::storage_api::{ECStore, EndpointServerPools, ServerContextSlot};
     }
 
     pub(crate) mod shutdown {
         pub(crate) use crate::storage::storage_api::{
-            shutdown_background_monitors, shutdown_background_services, store_compression_total_in_backend,
+            mark_get_metadata_read_version_coalescing_service_ready, shutdown_background_monitors, shutdown_background_services,
+            store_compression_total_in_backend,
         };
     }
 

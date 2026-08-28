@@ -34,20 +34,11 @@ pub enum Error {
     #[error("Configuration error: {0}")]
     Config(String),
 
-    #[error("Heal configuration error: {message}")]
-    ConfigurationError { message: String },
-
     #[error("Other error: {0}")]
     Other(String),
 
     #[error("Serialization error: {0}")]
     Serialization(String),
-
-    #[error("IO error: {0}")]
-    IO(String),
-
-    #[error("Not found: {0}")]
-    NotFound(String),
 
     #[error("Invalid checkpoint: {0}")]
     InvalidCheckpoint(String),
@@ -55,14 +46,8 @@ pub enum Error {
     #[error("Heal task not found: {task_id}")]
     TaskNotFound { task_id: String },
 
-    #[error("Heal task already exists: {task_id}")]
-    TaskAlreadyExists { task_id: String },
-
     #[error("Invalid heal client token")]
     InvalidClientToken,
-
-    #[error("Heal manager is not running")]
-    ManagerNotRunning,
 
     #[error("Heal task execution failed: {message}")]
     TaskExecutionFailed { message: String },
@@ -78,12 +63,6 @@ pub enum Error {
 
     #[error("Heal task timeout")]
     TaskTimeout,
-
-    #[error("Heal event processing failed: {message}")]
-    EventProcessingFailed { message: String },
-
-    #[error("Heal progress tracking failed: {message}")]
-    ProgressTrackingFailed { message: String },
 }
 
 /// A specialized Result type for heal operations
@@ -101,49 +80,88 @@ impl Error {
     }
 
     /// Whether a heal operation can be retried without changing its inputs.
+    ///
+    /// Typed-first (backlog#1845): the primary classification reads error
+    /// variants and typed helpers (`is_quorum_error`, `LockError::is_fatal`);
+    /// the substring fallback in [`is_recoverable_heal_error_message`] only
+    /// catches errors whose typed identity was destroyed upstream.
     pub(crate) fn is_recoverable_heal(&self) -> bool {
         match self {
-            Error::TaskCancelled => false,
-            Error::TaskTimeout | Error::TransientSkip { .. } => true,
+            Error::TaskCancelled | Error::TaskTimeout => false,
+            Error::TransientSkip { .. } => true,
+            // Lock failures classify by LockError's own taxonomy: only the
+            // fatal variants (ResourceNotFound / PermissionDenied /
+            // Configuration) are terminal - retrying cannot fix them - while
+            // contention and transport variants (Timeout, Network, Internal,
+            // AlreadyLocked, QuorumNotReached, InsufficientNodes, ...) stay
+            // recoverable, as the previous blanket `Lock(_) => true` treated
+            // them.
+            Error::Storage(EcstoreError::Lock(lock_err)) => !lock_err.is_fatal(),
             Error::Storage(err) => {
                 err.is_quorum_error()
-                    || matches!(err, EcstoreError::SlowDown | EcstoreError::OperationCanceled | EcstoreError::Lock(_))
+                    || matches!(
+                        err,
+                        EcstoreError::DiskNotFound
+                            | EcstoreError::VolumeNotFound
+                            | EcstoreError::SlowDown
+                            | EcstoreError::OperationCanceled
+                            | EcstoreError::RemoteClientUnavailable(_)
+                    )
                     || is_recoverable_heal_error_message(&err.to_string())
             }
             Error::Disk(err) => {
                 matches!(
                     err,
-                    DiskError::ErasureReadQuorum
+                    DiskError::DiskNotFound
+                        | DiskError::ErasureReadQuorum
                         | DiskError::ErasureWriteQuorum
                         | DiskError::Timeout
                         | DiskError::SourceStalled
                         | DiskError::FaultyRemoteDisk
                         | DiskError::FaultyDisk
+                        | DiskError::RemoteClientUnavailable(_)
                 ) || is_recoverable_heal_error_message(&err.to_string())
             }
-            Error::TaskExecutionFailed { message } | Error::IO(message) | Error::Other(message) => {
-                is_recoverable_heal_error_message(message)
-            }
+            Error::TaskExecutionFailed { message } | Error::Other(message) => is_recoverable_heal_error_message(message),
             Error::Io(err) => is_recoverable_heal_error_message(&err.to_string()),
             _ => false,
         }
     }
 }
 
+/// Documented substring fallback for errors that reach heal with their typed
+/// identity destroyed (stringified through `TaskExecutionFailed`/`Other`, or
+/// boxed into `Io`). Every needle is annotated with the producer that emits
+/// it; when a producer becomes typed end-to-end, delete its needle here
+/// (backlog#1845 - this list only shrinks).
 fn is_recoverable_heal_error_message(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     [
+        // set_disk/ops/locking.rs ns_loc lock failures rendered into messages.
         "failed to acquire read lock",
+        // ecstore cluster/rpc/remote_locker.rs "Lock acquisition failed on
+        // remote server" and lock/src local lock responses.
         "lock acquisition failed",
+        // lock/src/distributed_lock.rs + client/local.rs LockResponse::failure.
         "lock acquisition timeout",
+        // remote_locker.rs RPC deadline wrapper.
         "remote lock rpc timed out",
+        // tokio/tonic deadline rendering, reaches heal via stringified RPC errors.
         "deadline has elapsed",
+        // generic io/tonic timeout rendering.
         "timed out",
+        // tonic transport failure rendering.
         "transport error",
+        // LockError::Network display prefix.
         "network error",
+        // io::Error ConnectionRefused rendering.
         "connection refused",
+        // StorageError::OperationCanceled rendered through task messages.
         "operation canceled",
+        // LockError::QuorumNotReached display, when stringified before typing.
         "quorum not reached",
+        // set_disk/ops/heal.rs HEAL_RENAME_INCOMPLETE - the one needle with no
+        // typed variant yet; the producer formats it into a plain message.
         "heal rename incomplete",
     ]
     .iter()
@@ -159,7 +177,7 @@ impl From<Error> for std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::Error;
-    use crate::heal::EcstoreError;
+    use crate::heal::{DiskError, EcstoreError};
 
     #[test]
     fn incomplete_target_rename_is_recoverable() {
@@ -172,5 +190,82 @@ mod tests {
 
         assert!(task_error.is_recoverable_heal());
         assert!(storage_error.is_recoverable_heal());
+    }
+
+    #[test]
+    fn offline_disk_errors_are_recoverable() {
+        assert!(Error::Disk(DiskError::DiskNotFound).is_recoverable_heal());
+        assert!(Error::Storage(EcstoreError::DiskNotFound).is_recoverable_heal());
+        assert!(Error::Storage(EcstoreError::VolumeNotFound).is_recoverable_heal());
+    }
+
+    #[test]
+    fn task_timeout_is_terminal() {
+        assert!(!Error::TaskTimeout.is_recoverable_heal());
+    }
+
+    #[test]
+    fn lock_contention_and_transport_variants_stay_recoverable() {
+        use rustfs_lock::LockError;
+        for lock_err in [
+            LockError::Timeout {
+                resource: "bucket/object".to_string(),
+                timeout: std::time::Duration::from_secs(5),
+            },
+            LockError::Network {
+                message: "peer unreachable".to_string(),
+                source: Box::new(std::io::Error::other("reset")),
+            },
+            LockError::Internal {
+                message: "channel busy".to_string(),
+            },
+            LockError::AlreadyLocked {
+                resource: "bucket/object".to_string(),
+                owner: "node-2".to_string(),
+            },
+            LockError::QuorumNotReached {
+                required: 3,
+                achieved: 1,
+            },
+            LockError::InsufficientNodes {
+                required: 3,
+                available: 1,
+            },
+        ] {
+            assert!(
+                Error::Storage(EcstoreError::Lock(lock_err)).is_recoverable_heal(),
+                "contention/transport lock failures must stay retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn fatal_lock_variants_are_terminal() {
+        use rustfs_lock::LockError;
+        for lock_err in [
+            LockError::ResourceNotFound {
+                resource: "bucket/object".to_string(),
+            },
+            LockError::PermissionDenied {
+                reason: "acl".to_string(),
+            },
+            LockError::Configuration {
+                message: "bad quorum config".to_string(),
+            },
+        ] {
+            assert!(
+                !Error::Storage(EcstoreError::Lock(lock_err)).is_recoverable_heal(),
+                "fatal lock failures cannot be fixed by retrying"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_client_unavailable_is_recoverable_via_typed_variant() {
+        // The detail deliberately avoids every substring needle: the typed
+        // variant alone must classify these as retryable.
+        let detail = "auth interceptor rebuild".to_string();
+        assert!(Error::Disk(DiskError::RemoteClientUnavailable(detail.clone())).is_recoverable_heal());
+        assert!(Error::Storage(EcstoreError::RemoteClientUnavailable(detail)).is_recoverable_heal());
     }
 }

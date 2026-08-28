@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use crate::common::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, RustFSTestEnvironment};
-use serial_test::serial;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
@@ -42,13 +41,6 @@ async fn create_issue_3107_fixture(root: &Path) -> TestResult {
     Ok(())
 }
 
-fn mc_available() -> bool {
-    Command::new("mc")
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success())
-}
-
 fn run_mc(args: &[&str]) -> TestResult {
     let output = Command::new("mc").args(args).output()?;
     if !output.status.success() {
@@ -73,14 +65,10 @@ fn count_files(root: &Path) -> usize {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_mc_mirror_small_bucket_completes_without_list_timeout() -> TestResult {
     crate::common::init_logging();
     info!("Starting issue #3107 mc mirror regression test");
-    if !mc_available() {
-        info!("Skipping issue #3107 mc mirror regression test because mc is not installed");
-        return Ok(());
-    }
+    run_mc(&["--version"])?;
 
     let mut env = RustFSTestEnvironment::new().await?;
     env.start_rustfs_server(vec![]).await?;

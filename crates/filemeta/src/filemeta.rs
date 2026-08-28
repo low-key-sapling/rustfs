@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::replication::{
+    MAX_REPLICATION_TARGET_ARN_LEN, MAX_REPLICATION_TARGET_VERSION_ENTRIES, MAX_REPLICATION_TARGET_VERSION_ID_LEN,
+};
 use crate::{
     ErasureAlgo, ErasureInfo, Error, FileInfo, FileInfoVersions, InlineData, NULL_VERSION_ID, ObjectPartInfo, RawFileInfo,
     ReplicationState, ReplicationStatusType, Result, VersionPurgeStatusType, is_restored_object_on_disk,
@@ -25,13 +28,14 @@ use rustfs_utils::http::headers::{
 };
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX, SUFFIX_CRC, SUFFIX_DATA_MOV, SUFFIX_HEALING,
-    SUFFIX_PURGESTATUS, SUFFIX_REPLICA_STATUS, SUFFIX_REPLICA_TIMESTAMP, SUFFIX_REPLICATION_RESET, SUFFIX_REPLICATION_STATUS,
-    SUFFIX_REPLICATION_TIMESTAMP, SUFFIX_RESTORE_OPERATION_ID, contains_key_str, has_internal_suffix, insert_bytes,
-    is_internal_key, remove_bytes,
+    SUFFIX_PURGESTATUS, SUFFIX_REPLICA_STATUS, SUFFIX_REPLICA_TIMESTAMP, SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX,
+    SUFFIX_REPLICATION_RESET, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, SUFFIX_RESTORE_OPERATION_ID,
+    contains_key_str, has_internal_suffix, insert_bytes, is_internal_key, remove_bytes,
 };
 use s3s::header::X_AMZ_RESTORE;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::hash::Hasher;
 use std::io::{Read, Write};
@@ -86,6 +90,21 @@ fn legacy_data_key_for_version(version_id: Option<Uuid>) -> Option<String> {
 pub const TRANSITION_COMPLETE: &str = "complete";
 pub const TRANSITION_PENDING: &str = "pending";
 
+/// xl.meta key marking a tier free-version record.
+///
+/// A free version is a delete-marker-shaped cleanup hint appended by
+/// [`MetaObject::delete_version`] when a version whose remote transition
+/// completed is removed from xl.meta; it carries the remote tier identity for
+/// an idempotent remote delete and is never a user-visible version
+/// (`num_versions` excludes it). While the record exists it is consumed by the
+/// lifecycle free-version recovery scan and the usage scanner, which re-enqueue
+/// the pending remote delete, and by heal metadata walks. On S3 and lifecycle
+/// delete paths the same obligation is also carried by a committed tier-journal
+/// entry; deletes without such an entry (for example a removed version whose
+/// transition state decodes as unknown) rely on this record alone until the
+/// worker removes it after a successful remote delete. Decommission preserves
+/// the record and its remote identity on the target pool before source cleanup
+/// — see docs/architecture/decommission-compatibility.md.
 pub const FREE_VERSION: &str = "free-version";
 
 pub const TRANSITION_STATUS: &str = "transition-status";
@@ -139,6 +158,58 @@ fn cmp_shallow_versions_for_order(a: &FileMetaShallowVersion, b: &FileMetaShallo
 /// the reset state, and a rustfs-only key was invisible to MinIO-compatible
 /// readers (backlog#799 B16). Normalize every entry to the canonical
 /// `replication-reset-<arn>` suffix and write both prefixes.
+fn valid_target_delete_marker_version(arn: &str, version_id: &str) -> bool {
+    arn.starts_with("arn:")
+        && arn.len() <= MAX_REPLICATION_TARGET_ARN_LEN
+        && !version_id.is_empty()
+        && version_id.len() <= MAX_REPLICATION_TARGET_VERSION_ID_LEN
+}
+
+/// Merge-only, never destructive.
+///
+/// `ReplicationState::target_delete_marker_version_ids` is skipped by the
+/// positional `FileInfo` wire form, so a delete that arrives over internode RPC
+/// carries an empty map. Treating that as authoritative would let a remote disk
+/// erase an exact target version that the local disk still holds. The key is
+/// included in the quorum hash, so such a divergence does surface — but as a
+/// quorum failure on an otherwise healthy object, which is not a state worth
+/// reaching. Merge the RPC metadata carrier instead, and only ever insert.
+fn persist_target_delete_marker_versions(
+    meta_sys: &mut HashMap<String, Vec<u8>>,
+    versions: &HashMap<String, String>,
+    transport_metadata: &HashMap<String, String>,
+) {
+    let mut bounded = BTreeMap::new();
+    // A corrupt carrier means the dual internal prefixes disagreed. Do not merge
+    // anything derived from it: this helper only ever inserts, so declining to
+    // merge leaves whatever durable keys the object already carries untouched,
+    // which is strictly safer than committing a mapping we cannot trust.
+    let (transport_versions, transport_corrupt) = rustfs_utils::http::target_delete_marker_versions(transport_metadata);
+    if transport_corrupt {
+        warn!("delete-marker target version transport metadata is inconsistent; leaving the persisted mapping unchanged");
+        return;
+    }
+    for (arn, version_id) in transport_versions.iter().chain(versions.iter()) {
+        if !valid_target_delete_marker_version(arn, version_id)
+            || (bounded.len() >= MAX_REPLICATION_TARGET_VERSION_ENTRIES
+                && bounded.last_key_value().is_some_and(|(largest, _)| arn >= *largest))
+        {
+            continue;
+        }
+        bounded.insert(arn, version_id);
+        if bounded.len() > MAX_REPLICATION_TARGET_VERSION_ENTRIES {
+            bounded.pop_last();
+        }
+    }
+    for (arn, version_id) in bounded {
+        insert_bytes(
+            meta_sys,
+            &format!("{SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX}{arn}"),
+            version_id.as_bytes().to_vec(),
+        );
+    }
+}
+
 fn persist_reset_statuses(meta_sys: &mut HashMap<String, Vec<u8>>, reset_statuses_map: &HashMap<String, String>) {
     for (k, v) in reset_statuses_map {
         let suffix = k
@@ -150,11 +221,54 @@ fn persist_reset_statuses(meta_sys: &mut HashMap<String, Vec<u8>>, reset_statuse
     }
 }
 
+pub fn parse_replication_timestamp(value: &str) -> Option<OffsetDateTime> {
+    const DISPLAY_FORMAT: &[time::format_description::BorrowedFormatItem<'_>] = time::macros::format_description!(
+        "[year sign:automatic]-[month]-[day] [hour padding:none]:[minute]:[second].[subsecond] [offset_hour sign:mandatory]:[offset_minute]:[offset_second]"
+    );
+    OffsetDateTime::parse(value, &Rfc3339)
+        .or_else(|_| OffsetDateTime::parse(value, DISPLAY_FORMAT))
+        .ok()
+}
+
+fn format_replication_timestamp(value: Option<OffsetDateTime>) -> String {
+    let value = value.unwrap_or(OffsetDateTime::UNIX_EPOCH);
+    value
+        .to_offset(time::UtcOffset::UTC)
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| value.to_string())
+}
+
+fn persist_delete_marker_replication_state(meta_sys: &mut HashMap<String, Vec<u8>>, state: &ReplicationState) {
+    if !state.replica_status.is_empty() {
+        insert_bytes(meta_sys, SUFFIX_REPLICA_STATUS, state.replica_status.as_str().as_bytes().to_vec());
+        insert_bytes(
+            meta_sys,
+            SUFFIX_REPLICA_TIMESTAMP,
+            format_replication_timestamp(state.replica_timestamp).into_bytes(),
+        );
+    }
+    if let Some(status) = state.replication_status_internal.as_ref().filter(|status| !status.is_empty()) {
+        insert_bytes(meta_sys, SUFFIX_REPLICATION_STATUS, status.as_bytes().to_vec());
+        insert_bytes(
+            meta_sys,
+            SUFFIX_REPLICATION_TIMESTAMP,
+            format_replication_timestamp(state.replication_timestamp).into_bytes(),
+        );
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct FileMeta {
     pub versions: Vec<FileMetaShallowVersion>,
     pub data: InlineData,
     pub meta_ver: u8,
+}
+
+struct FileInfoDecodeOptions {
+    read_data: bool,
+    include_free_versions: bool,
+    all_parts: bool,
+    include_part_checksums: bool,
 }
 
 impl FileMeta {
@@ -348,6 +462,10 @@ impl FileMeta {
         };
 
         if let Some(fidx) = existing_idx {
+            let existing = self.versions[fidx].parse_version_meta()?;
+            if existing.free_version() != version.free_version() {
+                return Err(Error::other("cannot replace a free version with a non-free version"));
+            }
             return self.set_idx(fidx, version);
         }
 
@@ -455,53 +573,8 @@ impl FileMeta {
         }
 
         if fi.deleted {
-            if !fi.delete_marker_replication_status().is_empty()
-                && let Some(delete_marker) = ventry.delete_marker.as_mut()
-            {
-                if fi.delete_marker_replication_status() == ReplicationStatusType::Replica {
-                    insert_bytes(
-                        &mut delete_marker.meta_sys,
-                        SUFFIX_REPLICA_STATUS,
-                        fi.replication_state_internal
-                            .as_ref()
-                            .map(|v| v.replica_status.clone())
-                            .unwrap_or_default()
-                            .as_str()
-                            .as_bytes()
-                            .to_vec(),
-                    );
-                    insert_bytes(
-                        &mut delete_marker.meta_sys,
-                        SUFFIX_REPLICA_TIMESTAMP,
-                        fi.replication_state_internal
-                            .as_ref()
-                            .map(|v| v.replica_timestamp.unwrap_or(OffsetDateTime::UNIX_EPOCH).to_string())
-                            .unwrap_or_default()
-                            .as_bytes()
-                            .to_vec(),
-                    );
-                } else {
-                    insert_bytes(
-                        &mut delete_marker.meta_sys,
-                        SUFFIX_REPLICATION_STATUS,
-                        fi.replication_state_internal
-                            .as_ref()
-                            .map(|v| v.replication_status_internal.clone().unwrap_or_default())
-                            .unwrap_or_default()
-                            .as_bytes()
-                            .to_vec(),
-                    );
-                    insert_bytes(
-                        &mut delete_marker.meta_sys,
-                        SUFFIX_REPLICATION_TIMESTAMP,
-                        fi.replication_state_internal
-                            .as_ref()
-                            .map(|v| v.replication_timestamp.unwrap_or(OffsetDateTime::UNIX_EPOCH).to_string())
-                            .unwrap_or_default()
-                            .as_bytes()
-                            .to_vec(),
-                    );
-                }
+            if let (Some(delete_marker), Some(state)) = (ventry.delete_marker.as_mut(), fi.replication_state_internal.as_ref()) {
+                persist_delete_marker_replication_state(&mut delete_marker.meta_sys, state);
             }
 
             if !fi.version_purge_status().is_empty()
@@ -521,6 +594,11 @@ impl FileMeta {
                 && let Some(state) = fi.replication_state_internal.as_ref()
             {
                 persist_reset_statuses(&mut delete_marker.meta_sys, &state.reset_statuses_map);
+                persist_target_delete_marker_versions(
+                    &mut delete_marker.meta_sys,
+                    &state.target_delete_marker_version_ids,
+                    &fi.metadata,
+                );
             }
         }
 
@@ -548,55 +626,17 @@ impl FileMeta {
                         }
 
                         if let Some(delete_marker) = v.delete_marker.as_mut() {
-                            if !fi.delete_marker_replication_status().is_empty() {
-                                if fi.delete_marker_replication_status() == ReplicationStatusType::Replica {
-                                    insert_bytes(
-                                        &mut delete_marker.meta_sys,
-                                        SUFFIX_REPLICA_STATUS,
-                                        fi.replication_state_internal
-                                            .as_ref()
-                                            .map(|v| v.replica_status.clone())
-                                            .unwrap_or_default()
-                                            .as_str()
-                                            .as_bytes()
-                                            .to_vec(),
-                                    );
-                                    insert_bytes(
-                                        &mut delete_marker.meta_sys,
-                                        SUFFIX_REPLICA_TIMESTAMP,
-                                        fi.replication_state_internal
-                                            .as_ref()
-                                            .map(|v| v.replica_timestamp.unwrap_or(OffsetDateTime::UNIX_EPOCH).to_string())
-                                            .unwrap_or_default()
-                                            .as_bytes()
-                                            .to_vec(),
-                                    );
-                                } else {
-                                    insert_bytes(
-                                        &mut delete_marker.meta_sys,
-                                        SUFFIX_REPLICATION_STATUS,
-                                        fi.replication_state_internal
-                                            .as_ref()
-                                            .map(|v| v.replication_status_internal.clone().unwrap_or_default())
-                                            .unwrap_or_default()
-                                            .as_bytes()
-                                            .to_vec(),
-                                    );
-                                    insert_bytes(
-                                        &mut delete_marker.meta_sys,
-                                        SUFFIX_REPLICATION_TIMESTAMP,
-                                        fi.replication_state_internal
-                                            .as_ref()
-                                            .map(|v| v.replication_timestamp.unwrap_or(OffsetDateTime::UNIX_EPOCH).to_string())
-                                            .unwrap_or_default()
-                                            .as_bytes()
-                                            .to_vec(),
-                                    );
-                                }
+                            if let Some(state) = fi.replication_state_internal.as_ref() {
+                                persist_delete_marker_replication_state(&mut delete_marker.meta_sys, state);
                             }
 
                             if let Some(state) = fi.replication_state_internal.as_ref() {
                                 persist_reset_statuses(&mut delete_marker.meta_sys, &state.reset_statuses_map);
+                                persist_target_delete_marker_versions(
+                                    &mut delete_marker.meta_sys,
+                                    &state.target_delete_marker_version_ids,
+                                    &fi.metadata,
+                                );
                             }
                         }
 
@@ -708,6 +748,47 @@ impl FileMeta {
         include_free_versions: bool,
         all_parts: bool,
     ) -> Result<FileInfo> {
+        self.to_fileinfo_with_part_checksums(
+            volume,
+            path,
+            version_id,
+            FileInfoDecodeOptions {
+                read_data,
+                include_free_versions,
+                all_parts,
+                include_part_checksums: true,
+            },
+        )
+    }
+
+    pub fn into_fileinfo_without_part_checksums(
+        &self,
+        volume: &str,
+        path: &str,
+        version_id: &str,
+        read_data: bool,
+        include_free_versions: bool,
+    ) -> Result<FileInfo> {
+        self.to_fileinfo_with_part_checksums(
+            volume,
+            path,
+            version_id,
+            FileInfoDecodeOptions {
+                read_data,
+                include_free_versions,
+                all_parts: true,
+                include_part_checksums: false,
+            },
+        )
+    }
+
+    fn to_fileinfo_with_part_checksums(
+        &self,
+        volume: &str,
+        path: &str,
+        version_id: &str,
+        opts: FileInfoDecodeOptions,
+    ) -> Result<FileInfo> {
         let vid = {
             if !version_id.is_empty() {
                 Uuid::parse_str(version_id)?
@@ -729,7 +810,7 @@ impl FileMeta {
 
             if header.free_version() {
                 non_free_versions -= 1;
-                if include_free_versions
+                if opts.include_free_versions
                     && found_free_version.is_none()
                     && let Ok(found_free_fi) = ver.parse_version_meta()
                     && found_free_fi.version_type != VersionType::Invalid
@@ -740,7 +821,8 @@ impl FileMeta {
                     // Known side effect: if a disk holds only free versions and they are
                     // corrupt, `into_fileinfo` falls through to `FileNotFound` (not
                     // `FileCorrupt`), so that disk is not enqueued for heal.
-                    match found_free_fi.into_fileinfo(volume, path, all_parts) {
+                    match found_free_fi.to_fileinfo_with_part_checksums(volume, path, opts.all_parts, opts.include_part_checksums)
+                    {
                         Ok(mut free_fi) => {
                             free_fi.is_latest = true;
                             found_free_version = Some(free_fi);
@@ -768,14 +850,14 @@ impl FileMeta {
 
             found = true;
 
-            let mut fi = ver.into_fileinfo(volume, path, all_parts)?;
+            let mut fi = ver.to_fileinfo_with_part_checksums(volume, path, opts.all_parts, opts.include_part_checksums)?;
             fi.is_latest = is_latest;
 
             if let Some(_d) = succ_mod_time {
                 fi.successor_mod_time = succ_mod_time;
             }
 
-            if read_data && fi.inline_data() {
+            if opts.read_data && fi.inline_data() {
                 fi.data = self.find_inline_data_for_version(fi.version_id)?.map(bytes::Bytes::from);
             }
 
@@ -784,7 +866,7 @@ impl FileMeta {
 
         if !found {
             if version_id.is_empty() {
-                if include_free_versions
+                if opts.include_free_versions
                     && non_free_versions == 0
                     && let Some(free_version) = found_free_version
                 {
@@ -949,6 +1031,83 @@ mod test {
     use crate::test_data::*;
     use proptest::collection::vec;
     use proptest::prelude::*;
+
+    /// A restore header meaning "restored copy is on disk until far in the future".
+    /// Format produced by `RestoreStatusOps::to_string` and consumed by
+    /// `parse_restore_obj_status` (fileinfo.rs).
+    const RESTORED_ON_DISK: &str = "ongoing-request=\"false\", expiry-date=\"9999-01-01T00:00:00Z\"";
+
+    /// backlog#1733 (P9-01 §4.3/§7.6, g-key-001): pin the five `s3s::header`
+    /// constants that double as **persisted metadata map keys**. They are not
+    /// just HTTP header names — they are stored inside xl.meta (`meta_user`)
+    /// and read back by fail-open code, so a silent drift produces zero
+    /// HTTP-visible errors while:
+    ///
+    /// 1. **WORM silently dissolves** — `get_object_retention_meta`
+    ///    (ecstore objectlock.rs) returns an empty retention when the lock keys
+    ///    are unreadable, making every compliance-locked object deletable.
+    /// 2. **Live data dirs can be reclaimed** — `MetaObject::uses_data_dir`
+    ///    falls back to `is_restored_object_on_disk`, which returns `false`
+    ///    when `x-amz-restore` is unreadable, so a restored object's data dir
+    ///    is judged unused.
+    ///
+    /// Any migration replacing these constants must keep the literals byte-stable.
+    #[test]
+    fn persisted_metadata_keys_are_byte_stable() {
+        use s3s::header::{
+            X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE,
+            X_AMZ_SERVER_SIDE_ENCRYPTION,
+        };
+        assert_eq!(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str(), "x-amz-object-lock-legal-hold");
+        assert_eq!(X_AMZ_OBJECT_LOCK_MODE.as_str(), "x-amz-object-lock-mode");
+        assert_eq!(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str(), "x-amz-object-lock-retain-until-date");
+        assert_eq!(X_AMZ_RESTORE.as_str(), "x-amz-restore");
+        assert_eq!(X_AMZ_SERVER_SIDE_ENCRYPTION.as_str(), "x-amz-server-side-encryption");
+    }
+
+    /// backlog#1733 g-key-003: a restored-to-local object must keep its data
+    /// dir. The restore marker lives under the pinned `x-amz-restore` key; if
+    /// the key ever drifts this flips to `false` and the data dir becomes
+    /// eligible for reclamation while the restored copy is still being served.
+    #[test]
+    fn restored_object_keeps_using_data_dir() {
+        let mut obj = MetaObject::default();
+        obj.meta_user
+            .insert("x-amz-restore".to_string(), RESTORED_ON_DISK.to_string());
+        assert!(obj.uses_data_dir(), "restored object's data dir must be considered in use");
+
+        // The same fail-open shape the pin protects against: without the marker
+        // the data dir is judged unused — exactly what a key drift would cause.
+        let bare = MetaObject::default();
+        assert!(!bare.uses_data_dir(), "object without restore marker reports data dir unused");
+    }
+
+    /// backlog#1733 g-key-004: a transition-complete object short-circuits to
+    /// `false` even when the restore marker is present — the existing
+    /// precedence must not change.
+    #[test]
+    fn transition_complete_object_does_not_use_data_dir() {
+        use rustfs_utils::http::{SUFFIX_TRANSITION_STATUS, insert_bytes};
+        let mut obj = MetaObject::default();
+        obj.meta_user
+            .insert("x-amz-restore".to_string(), RESTORED_ON_DISK.to_string());
+        insert_bytes(&mut obj.meta_sys, SUFFIX_TRANSITION_STATUS, TRANSITION_COMPLETE.as_bytes().to_vec());
+        assert!(!obj.uses_data_dir(), "transition-complete short-circuit must win over the restore marker");
+    }
+
+    /// The restore-header parser and the pinned key literal must agree: the
+    /// marker written under `x-amz-restore` is only meaningful if the parser
+    /// accepts it.
+    #[test]
+    fn restore_marker_roundtrips_through_parser() {
+        let mut meta = HashMap::new();
+        meta.insert(X_AMZ_RESTORE.as_str().to_string(), RESTORED_ON_DISK.to_string());
+        assert!(crate::is_restored_object_on_disk(&meta));
+
+        // An in-progress restore is not "on disk".
+        meta.insert(X_AMZ_RESTORE.as_str().to_string(), "ongoing-request=\"true\"".to_string());
+        assert!(!crate::is_restored_object_on_disk(&meta));
+    }
 
     /// backlog#580: RustFS parses real MinIO-written object xl.meta (inline,
     /// versioned, and multipart) into equivalent `FileInfo`. Object metadata is
@@ -1223,6 +1382,39 @@ mod test {
         assert!(fm.versions[0].header.sorts_before(&fm.versions[1].header));
     }
 
+    #[test]
+    fn add_version_filemata_rejects_free_and_ordinary_same_id_replacement() {
+        let version_id = Uuid::new_v4();
+        let mut free_meta_sys = HashMap::new();
+        insert_bytes(&mut free_meta_sys, rustfs_utils::http::SUFFIX_FREE_VERSION, Vec::new());
+        let free_version = FileMetaVersion {
+            version_type: VersionType::Delete,
+            delete_marker: Some(MetaDeleteMarker {
+                version_id: Some(version_id),
+                mod_time: Some(OffsetDateTime::now_utc()),
+                meta_sys: free_meta_sys,
+            }),
+            ..Default::default()
+        };
+        let ordinary_version = valid_object_version(version_id, vec![10, 20]);
+
+        for (existing, replacement) in [
+            (free_version.clone(), ordinary_version.clone()),
+            (ordinary_version, free_version),
+        ] {
+            let mut fm = FileMeta::new();
+            fm.add_version_filemata(existing).expect("seed same-id version");
+            let before = fm.marshal_msg().expect("serialize original metadata");
+
+            let err = fm
+                .add_version_filemata(replacement)
+                .expect_err("free and ordinary versions with the same ID must not replace each other");
+
+            assert!(err.to_string().contains("cannot replace a free version"));
+            assert_eq!(fm.marshal_msg().expect("serialize rejected metadata"), before);
+        }
+    }
+
     /// `add_version_filemata` positions an inserted version with
     /// `partition_point(sorts_before)`, which only yields the canonical slot when
     /// `versions` is already canonically ordered. Nothing establishes that
@@ -1279,6 +1471,90 @@ mod test {
     /// key (produced by `ObjectInfo::replication_state`) has no internal prefix,
     /// so read-back — which only recognizes prefixed keys — silently dropped it.
     #[test]
+    fn persist_target_delete_marker_versions_uses_bounded_dual_prefixed_keys() {
+        let arn = "arn:rustfs:replication::target:bucket";
+        let version_id = "opaque-target-version";
+        let suffix = format!("{SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX}{arn}");
+        let versions = HashMap::from([
+            (arn.to_string(), version_id.to_string()),
+            ("not-an-arn".to_string(), "ignored".to_string()),
+            ("arn:too-long".to_string(), "x".repeat(MAX_REPLICATION_TARGET_VERSION_ID_LEN + 1)),
+        ]);
+        let mut meta_sys = HashMap::new();
+
+        persist_target_delete_marker_versions(&mut meta_sys, &versions, &HashMap::new());
+
+        assert_eq!(
+            meta_sys.get(&format!("{RUSTFS_INTERNAL_PREFIX}{suffix}")).map(Vec::as_slice),
+            Some(version_id.as_bytes())
+        );
+        assert_eq!(
+            meta_sys.get(&format!("{MINIO_INTERNAL_PREFIX}{suffix}")).map(Vec::as_slice),
+            Some(version_id.as_bytes())
+        );
+        assert_eq!(meta_sys.len(), 2, "invalid or oversized mappings must not expand xl.meta");
+    }
+
+    #[test]
+    fn persist_target_delete_marker_versions_caps_target_count() {
+        let versions = (0..=MAX_REPLICATION_TARGET_VERSION_ENTRIES)
+            .map(|index| (format!("arn:rustfs:replication::target:{index:04}"), format!("version-{index}")))
+            .collect();
+        let mut meta_sys = HashMap::new();
+
+        persist_target_delete_marker_versions(&mut meta_sys, &versions, &HashMap::new());
+
+        assert_eq!(meta_sys.len(), MAX_REPLICATION_TARGET_VERSION_ENTRIES * 2);
+        let excluded_suffix = format!(
+            "{SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX}arn:rustfs:replication::target:{MAX_REPLICATION_TARGET_VERSION_ENTRIES:04}"
+        );
+        assert!(!meta_sys.contains_key(&format!("{RUSTFS_INTERNAL_PREFIX}{excluded_suffix}")));
+        assert!(!meta_sys.contains_key(&format!("{MINIO_INTERNAL_PREFIX}{excluded_suffix}")));
+    }
+
+    #[test]
+    fn persist_target_delete_marker_versions_preserves_existing_targets_on_empty_update() {
+        let stale_suffix = format!("{SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX}arn:rustfs:replication::target:stale");
+        let mut meta_sys = HashMap::from([
+            (format!("{RUSTFS_INTERNAL_PREFIX}{stale_suffix}"), b"stale-rustfs".to_vec()),
+            (format!("{MINIO_INTERNAL_PREFIX}{stale_suffix}"), b"stale-minio".to_vec()),
+            ("unrelated".to_string(), b"kept".to_vec()),
+        ]);
+
+        persist_target_delete_marker_versions(&mut meta_sys, &HashMap::new(), &HashMap::new());
+
+        assert_eq!(
+            meta_sys,
+            HashMap::from([
+                (format!("{RUSTFS_INTERNAL_PREFIX}{stale_suffix}"), b"stale-rustfs".to_vec()),
+                (format!("{MINIO_INTERNAL_PREFIX}{stale_suffix}"), b"stale-minio".to_vec()),
+                ("unrelated".to_string(), b"kept".to_vec()),
+            ])
+        );
+    }
+
+    #[test]
+    fn persist_target_delete_marker_versions_reads_rpc_transport_metadata() {
+        let arn = "arn:rustfs:replication::target:remote";
+        let version_id = "opaque-remote-version";
+        let suffix = format!("{SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX}{arn}");
+        let mut transport_metadata = HashMap::new();
+        rustfs_utils::http::insert_str(&mut transport_metadata, &suffix, version_id.to_string());
+        let mut meta_sys = HashMap::new();
+
+        persist_target_delete_marker_versions(&mut meta_sys, &HashMap::new(), &transport_metadata);
+
+        assert_eq!(
+            meta_sys.get(&format!("{RUSTFS_INTERNAL_PREFIX}{suffix}")).map(Vec::as_slice),
+            Some(version_id.as_bytes())
+        );
+        assert_eq!(
+            meta_sys.get(&format!("{MINIO_INTERNAL_PREFIX}{suffix}")).map(Vec::as_slice),
+            Some(version_id.as_bytes())
+        );
+    }
+
+    #[test]
     fn persist_reset_statuses_normalizes_to_dual_prefixed_keys() {
         let arn = "arn:rustfs:replication::target:bucket";
         let ts = "2026-06-30T00:00:00Z;reset-1";
@@ -1310,9 +1586,100 @@ mod test {
         assert_eq!(meta_sys2.len(), 2, "must not create a double-prefixed key");
     }
 
+    #[test]
+    fn persist_delete_marker_replication_state_keeps_replica_and_target_statuses() {
+        let replica_timestamp = OffsetDateTime::UNIX_EPOCH + time::Duration::SECOND;
+        let replication_timestamp = replica_timestamp + time::Duration::SECOND;
+        let state = ReplicationState {
+            replica_status: ReplicationStatusType::Replica,
+            replica_timestamp: Some(replica_timestamp),
+            replication_status_internal: Some("arn:target=COMPLETED;".to_string()),
+            replication_timestamp: Some(replication_timestamp),
+            ..Default::default()
+        };
+        let mut meta_sys = HashMap::new();
+        let replica_timestamp_string = replica_timestamp
+            .format(&Rfc3339)
+            .expect("timestamp should format as RFC3339");
+        let replication_timestamp_string = replication_timestamp
+            .format(&Rfc3339)
+            .expect("timestamp should format as RFC3339");
+
+        persist_delete_marker_replication_state(&mut meta_sys, &state);
+
+        assert_eq!(
+            rustfs_utils::http::get_bytes(&meta_sys, SUFFIX_REPLICA_STATUS).as_deref(),
+            Some(b"REPLICA".as_slice())
+        );
+        assert_eq!(
+            rustfs_utils::http::get_bytes(&meta_sys, SUFFIX_REPLICA_TIMESTAMP).as_deref(),
+            Some(replica_timestamp_string.as_bytes())
+        );
+        assert_eq!(
+            rustfs_utils::http::get_bytes(&meta_sys, SUFFIX_REPLICATION_STATUS).as_deref(),
+            Some(b"arn:target=COMPLETED;".as_slice())
+        );
+        assert_eq!(
+            rustfs_utils::http::get_bytes(&meta_sys, SUFFIX_REPLICATION_TIMESTAMP).as_deref(),
+            Some(replication_timestamp_string.as_bytes())
+        );
+    }
+
+    #[test]
+    fn persist_delete_marker_replication_timestamp_normalizes_second_offset_to_utc() {
+        let timestamp = OffsetDateTime::UNIX_EPOCH.to_offset(time::UtcOffset::from_hms(5, 30, 15).expect("valid offset"));
+        assert_eq!(parse_replication_timestamp(&timestamp.to_string()), Some(timestamp));
+        let state = ReplicationState {
+            replica_status: ReplicationStatusType::Replica,
+            replica_timestamp: Some(timestamp),
+            replication_status_internal: Some("arn:target=COMPLETED;".to_string()),
+            replication_timestamp: Some(timestamp),
+            ..Default::default()
+        };
+        let mut meta_sys = HashMap::new();
+
+        persist_delete_marker_replication_state(&mut meta_sys, &state);
+
+        for suffix in [SUFFIX_REPLICA_TIMESTAMP, SUFFIX_REPLICATION_TIMESTAMP] {
+            let persisted = rustfs_utils::http::get_bytes(&meta_sys, suffix).expect("timestamp must be persisted");
+            let persisted = std::str::from_utf8(&persisted).expect("timestamp must be UTF-8");
+            assert_eq!(parse_replication_timestamp(persisted), Some(timestamp));
+            assert_ne!(persisted, OffsetDateTime::UNIX_EPOCH.to_string());
+        }
+    }
+
     /// Regression test for rustfs/rustfs#2715: a corrupted version count in
     /// xl.meta must yield a decode error instead of sizing a huge allocation
     /// from the bogus count (which aborts the whole process).
+    /// A CRC mismatch means the bytes on disk are not the bytes that were
+    /// written — bitrot. It must surface as `Error::FileCorrupt` specifically:
+    /// that variant converts to `DiskError::FileCorrupt`, which is the only
+    /// corruption signal `should_heal_object_on_disk` recognises. As a generic
+    /// error the drive is skipped, the heal reports success, and the damaged
+    /// `xl.meta` is never rewritten.
+    #[test]
+    fn test_unmarshal_reports_file_corrupt_on_crc_mismatch() {
+        let mut fm = FileMeta::default();
+        let mut buf = fm.marshal_msg().expect("serialize default FileMeta");
+        // Flip one byte inside the meta blob: past the 8-byte XL2 header and
+        // the 5-byte bin32 length prefix, before the CRC trailer.
+        let idx = 8 + 5;
+        buf[idx] ^= 0xff;
+        let err = fm.unmarshal_msg(&buf).expect_err("corrupted meta must fail to decode");
+        assert_eq!(err, Error::FileCorrupt, "CRC mismatch must classify as FileCorrupt, got: {err}");
+    }
+
+    #[test]
+    fn test_is_indexed_meta_reports_file_corrupt_on_crc_mismatch() {
+        let fm = FileMeta::default();
+        let mut buf = fm.marshal_msg().expect("serialize default FileMeta");
+        let idx = 8 + 5;
+        buf[idx] ^= 0xff;
+
+        let err = FileMeta::is_indexed_meta(&buf).expect_err("corrupted indexed metadata must fail");
+        assert_eq!(err, Error::FileCorrupt, "indexed CRC mismatch must classify as FileCorrupt, got: {err}");
+    }
+
     #[test]
     fn test_unmarshal_rejects_absurd_version_count() {
         let mut meta = Vec::new();

@@ -155,7 +155,7 @@ impl RebalanceMeta {
         self.save_with_opts(store, ObjectOptions::default()).await
     }
 
-    pub async fn save_with_opts<S>(&self, store: Arc<S>, opts: ObjectOptions) -> Result<()>
+    pub async fn save_with_opts<S>(&self, store: Arc<S>, mut opts: ObjectOptions) -> Result<()>
     where
         S: ObjectIO<
                 Error = Error,
@@ -188,6 +188,14 @@ impl RebalanceMeta {
         let msg = rmp_serde::to_vec(self)?;
         data.extend(msg);
 
+        if self.stopped_at.is_none() && is_rebalance_conflicting_with_decommission(self) {
+            rustfs_utils::http::metadata_compat::insert_str(
+                &mut opts.user_defined,
+                rustfs_utils::http::metadata_compat::SUFFIX_REBALANCE_RUN_ID,
+                self.id.clone(),
+            );
+        }
+
         save_config_with_opts(store, REBAL_META_NAME, data, &opts).await?;
 
         Ok(())
@@ -204,6 +212,14 @@ pub(super) fn is_rebalance_pool_active(pool_stat: &RebalanceStats) -> bool {
 
 pub(super) fn is_rebalance_in_progress(meta: &RebalanceMeta) -> bool {
     meta.pool_stats.iter().any(is_rebalance_pool_active)
+}
+
+/// Persisted rebalance metadata requires worker activation only while it has
+/// not reached a durable terminal marker and at least one pool is still marked
+/// active. Merely finding `rebalance.bin` is not evidence that admission is
+/// required: terminal metadata is retained for status reporting.
+pub(crate) fn rebalance_requires_worker_activation(meta: &RebalanceMeta) -> bool {
+    meta.stopped_at.is_none() && is_rebalance_in_progress(meta)
 }
 
 pub(crate) fn is_rebalance_conflicting_with_decommission(meta: &RebalanceMeta) -> bool {
@@ -931,6 +947,9 @@ pub(super) fn stop_rebalance_meta_snapshot_for_id(
     }
 
     stop_rebalance_state(meta, now);
+    // The caller holds the activation writer after admission was cancelled,
+    // so all entry readers have drained and no later entry can be admitted.
+    mark_started_rebalance_pools_stopped(meta, now);
     meta.last_refreshed_at = Some(now);
     Ok(Some(meta.clone()))
 }
@@ -964,6 +983,7 @@ pub(super) fn rollback_rebalance_start_meta_snapshot_for_id(
     })
 }
 
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub(super) fn stop_rebalance_meta_snapshot(meta: Option<&mut RebalanceMeta>, now: OffsetDateTime) -> Option<RebalanceMeta> {
     let meta = meta?;
     stop_rebalance_state(meta, now);

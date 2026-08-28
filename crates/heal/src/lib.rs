@@ -12,15 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![recursion_limit = "256"]
+
 mod error;
 pub mod heal;
 
 pub use error::{Error, Result};
 pub use heal::{
     HealManager, HealOperationsSnapshot, HealOptions, HealPriority, HealPriorityCounts, HealRequest, HealSourceCounts, HealType,
-    channel::HealChannelProcessor, progress::HealProgress,
+    channel::HealChannelProcessor,
+    progress::{HealProgress, aggregate_heal_progress},
+    resume::{ReplacementRecoveryRecord, ReplacementRecoveryState, ResumeUtils},
 };
 use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -72,6 +77,17 @@ static GLOBAL_HEAL_RUNTIME: OnceCell<HealRuntime> = OnceCell::const_new();
 static GLOBAL_HEAL_RUNTIME_INIT: Mutex<()> = Mutex::const_new(());
 static GLOBAL_HEAL_ACTIVE_TASKS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_HEAL_QUEUE_LENGTH: AtomicU64 = AtomicU64::new(0);
+
+/// Local view of durable replacement recovery state. `definitive` only covers
+/// the local survivor-disk records; a distributed caller must additionally
+/// establish that every peer returned a compatible snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplacementRecoverySnapshot {
+    pub records: Vec<ReplacementRecoveryRecord>,
+    pub definitive: bool,
+    pub reason: Option<String>,
+}
 
 #[cfg(test)]
 #[derive(Default)]
@@ -144,6 +160,10 @@ pub async fn init_heal_manager_with_workload_provider(
             return Err(err);
         }
 
+        // Start the MRF intent consumer (error-path repair intents + durable
+        // journal replay) now that the manager can accept submissions.
+        heal::mrf_queue::spawn_mrf_consumer(heal_manager.clone());
+
         #[cfg(test)]
         test_hook_after_manager_start().await;
 
@@ -156,7 +176,7 @@ pub async fn init_heal_manager_with_workload_provider(
         let channel_receiver = if force_channel_failure {
             Err("forced heal channel initialization failure")
         } else {
-            rustfs_common::heal_channel::init_heal_channels()
+            rustfs_heal_contracts::heal_channel::init_heal_channels()
         };
         let (receiver, receipt_receiver) = match channel_receiver {
             Ok(receivers) => receivers,
@@ -243,6 +263,81 @@ pub async fn current_heal_progress_snapshot() -> Option<HealProgress> {
     }
 }
 
+/// Read all local survivor-disk replacement records without conflating an I/O
+/// failure or conflicting copies with successful completion.
+pub async fn current_replacement_recovery_snapshot() -> ReplacementRecoverySnapshot {
+    if !heal_runtime_initialized() {
+        return ReplacementRecoverySnapshot {
+            records: Vec::new(),
+            definitive: false,
+            reason: Some("heal runtime is not initialized".to_string()),
+        };
+    }
+
+    let disks = {
+        let local_disk_map = heal::local_disk_map_read().await;
+        local_disk_map.values().flatten().cloned().collect::<Vec<_>>()
+    };
+    if disks.is_empty() {
+        return ReplacementRecoverySnapshot {
+            records: Vec::new(),
+            definitive: false,
+            reason: Some("no local survivor disks are available".to_string()),
+        };
+    }
+
+    let mut records = BTreeMap::<String, ReplacementRecoveryRecord>::new();
+    let mut reason = None;
+    for disk in disks {
+        match ResumeUtils::get_replacement_recovery_records(&disk).await {
+            Ok(disk_records) => {
+                for record in disk_records {
+                    let task_id = record.task_id.clone();
+                    if matches!(record.state, ReplacementRecoveryState::Unknown) {
+                        reason.get_or_insert_with(|| "invalid durable replacement record".to_string());
+                    }
+                    match records.entry(task_id.clone()) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(record);
+                        }
+                        std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &record => {}
+                        std::collections::btree_map::Entry::Occupied(entry)
+                            if matches!(entry.get().state, ReplacementRecoveryState::CleanupPending)
+                                && matches!(record.state, ReplacementRecoveryState::Completed) => {}
+                        std::collections::btree_map::Entry::Occupied(mut entry)
+                            if matches!(entry.get().state, ReplacementRecoveryState::Completed)
+                                && matches!(record.state, ReplacementRecoveryState::CleanupPending) =>
+                        {
+                            entry.insert(record);
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut entry) => {
+                            entry.insert(ReplacementRecoveryRecord {
+                                task_id,
+                                state: ReplacementRecoveryState::Unknown,
+                                generation: None,
+                                set_disk_id: None,
+                                target_slots: Vec::new(),
+                                reason: Some("conflicting durable replacement records across survivor disks".to_string()),
+                                verified_at: None,
+                            });
+                            reason.get_or_insert_with(|| "conflicting durable replacement records".to_string());
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                reason.get_or_insert_with(|| format!("failed to read local replacement recovery records: {error}"));
+            }
+        }
+    }
+
+    ReplacementRecoverySnapshot {
+        records: records.into_values().collect(),
+        definitive: reason.is_none(),
+        reason,
+    }
+}
+
 fn usize_to_u64_saturated(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
@@ -259,11 +354,11 @@ pub(crate) fn set_heal_queue_length(count: usize) {
 mod tests {
     use super::{
         Error, HEAL_RUNTIME_INIT_TEST_HOOK, HealRuntimeInitTestHook, get_heal_channel_processor, get_heal_manager,
-        heal::DiskStore, heal::Endpoint, heal::manager::HealConfig, heal::storage::DiskStatus, heal::storage::HealListItem,
-        heal::storage::HealObjectInfo, heal::storage::HealStorageAPI, init_heal_manager, run_owned_initialization,
+        heal::DiskStore, heal::manager::HealConfig, heal::storage::HealListItem, heal::storage::HealObjectInfo,
+        heal::storage::HealStorageAPI, init_heal_manager, run_owned_initialization,
     };
     use crate::heal::storage_api::status::BucketInfo;
-    use rustfs_common::heal_channel::HealOpts;
+    use rustfs_heal_contracts::heal_channel::HealOpts;
     use rustfs_madmin::heal_commands::HealResultItem;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -277,40 +372,12 @@ mod tests {
             Ok(None)
         }
 
-        async fn get_object_data(&self, _bucket: &str, _object: &str) -> Result<Option<Vec<u8>>, Error> {
-            Ok(None)
-        }
-
-        async fn put_object_data(&self, _bucket: &str, _object: &str, _data: &[u8]) -> Result<(), Error> {
-            Ok(())
-        }
-
-        async fn delete_object(&self, _bucket: &str, _object: &str) -> Result<(), Error> {
-            Ok(())
-        }
-
-        async fn verify_object_integrity(&self, _bucket: &str, _object: &str) -> Result<bool, Error> {
-            Ok(true)
-        }
-
         async fn ec_decode_rebuild(&self, _bucket: &str, _object: &str) -> Result<Vec<u8>, Error> {
             Ok(Vec::new())
         }
 
-        async fn get_disk_status(&self, _endpoint: &Endpoint) -> Result<DiskStatus, Error> {
-            Ok(DiskStatus::Ok)
-        }
-
-        async fn format_disk(&self, _endpoint: &Endpoint) -> Result<(), Error> {
-            Ok(())
-        }
-
         async fn get_bucket_info(&self, _bucket: &str) -> Result<Option<BucketInfo>, Error> {
             Ok(None)
-        }
-
-        async fn heal_bucket_metadata(&self, _bucket: &str) -> Result<(), Error> {
-            Ok(())
         }
 
         async fn list_buckets(&self) -> Result<Vec<BucketInfo>, Error> {
@@ -319,14 +386,6 @@ mod tests {
 
         async fn object_exists(&self, _bucket: &str, _object: &str) -> Result<bool, Error> {
             Ok(false)
-        }
-
-        async fn get_object_size(&self, _bucket: &str, _object: &str) -> Result<Option<u64>, Error> {
-            Ok(None)
-        }
-
-        async fn get_object_checksum(&self, _bucket: &str, _object: &str) -> Result<Option<String>, Error> {
-            Ok(None)
         }
 
         async fn heal_object(
@@ -347,15 +406,12 @@ mod tests {
             Ok((HealResultItem::default(), None))
         }
 
-        async fn list_objects_for_heal(&self, _bucket: &str, _prefix: &str) -> Result<Vec<HealListItem>, Error> {
-            Ok(Vec::new())
-        }
-
         async fn list_objects_for_heal_page(
             &self,
             _bucket: &str,
             _prefix: &str,
             _continuation_token: Option<&str>,
+            _include_lifecycle_object_info: bool,
         ) -> Result<(Vec<HealListItem>, Option<String>, bool), Error> {
             Ok((Vec::new(), None, false))
         }

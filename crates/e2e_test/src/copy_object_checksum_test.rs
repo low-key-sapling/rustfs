@@ -27,10 +27,8 @@ mod tests {
         VersioningConfiguration,
     };
     use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
-    use base64::Engine as _;
-    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64_simd::STANDARD as BASE64;
     use rustfs_rio::{Checksum, ChecksumType as RioChecksumType};
-    use serial_test::serial;
     use sha2::{Digest, Sha256};
     use tracing::info;
 
@@ -114,7 +112,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_copy_supports_all_checksum_algorithms() {
         init_logging();
 
@@ -196,7 +193,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_copy_without_algorithm_preserves_every_supported_source_checksum() {
         init_logging();
 
@@ -262,7 +258,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_copy_without_algorithm_preserves_composite_checksum_type() {
         init_logging();
 
@@ -352,7 +347,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_copy_rejects_unknown_algorithm_without_destination_mutation() {
         init_logging();
 
@@ -453,7 +447,6 @@ mod tests {
     /// bytes, return it in `CopyObjectResult.ChecksumSHA256`, and persist it so a checksum-mode
     /// HEAD on the destination returns the identical value.
     #[tokio::test]
-    #[serial]
     async fn test_copy_with_checksum_algorithm_returns_and_persists_sha256() {
         init_logging();
         info!("Issue #4996: CopyObject with ChecksumAlgorithm=SHA256 must return and persist the checksum");
@@ -471,7 +464,7 @@ mod tests {
         create_versioned_bucket(&client, dst_bucket).await;
 
         let content = b"deterministic synthetic payload for copy-object checksum #4996";
-        let expected_sha256 = BASE64.encode(Sha256::digest(content));
+        let expected_sha256 = BASE64.encode_to_string(Sha256::digest(content));
 
         client
             .put_object()
@@ -523,7 +516,6 @@ mod tests {
     /// No algorithm requested: when the source object already carries a checksum, the copy must
     /// preserve it on the destination (AWS default), visible via a checksum-mode HEAD.
     #[tokio::test]
-    #[serial]
     async fn test_copy_without_algorithm_preserves_source_checksum() {
         init_logging();
         info!("Issue #4996: CopyObject without ChecksumAlgorithm must preserve the source object's checksum");
@@ -541,7 +533,7 @@ mod tests {
         create_versioned_bucket(&client, dst_bucket).await;
 
         let content = b"another deterministic payload whose source checksum must survive the copy";
-        let expected_sha256 = BASE64.encode(Sha256::digest(content));
+        let expected_sha256 = BASE64.encode_to_string(Sha256::digest(content));
 
         // Store the source WITH a SHA-256 checksum so it has one to preserve.
         let put_src = client
@@ -603,7 +595,6 @@ mod tests {
     /// checksum-not-inherited path, and exercises the CRC32 code path (a different branch of
     /// ChecksumType::from_string than SHA256).
     #[tokio::test]
-    #[serial]
     async fn test_copy_requested_algorithm_overrides_source_checksum() {
         init_logging();
         info!("Issue #4996: a requested CopyObject checksum algorithm must override the source object's algorithm");
@@ -622,7 +613,7 @@ mod tests {
         create_versioned_bucket(&client, dst_bucket).await;
 
         let content = b"payload whose copy must be re-checksummed with a different algorithm";
-        let expected_sha256 = BASE64.encode(Sha256::digest(content));
+        let expected_sha256 = BASE64.encode_to_string(Sha256::digest(content));
 
         // Source is stored WITH a SHA-256 checksum.
         client

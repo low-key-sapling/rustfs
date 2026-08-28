@@ -24,8 +24,20 @@ use std::time::Duration;
 use url::Url;
 
 pub const ENV_KMS_ALLOW_INSECURE_DEV_DEFAULTS: &str = "RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS";
+/// Write-side switch for binding the encryption context into DEK envelopes as
+/// AES-GCM additional data. Read-side support is unconditional; see
+/// [`crate::encryption::dek::envelope_aad_write_enabled`] for the rollout
+/// constraint that keeps this default-off for one release.
+pub const ENV_KMS_ENVELOPE_AAD: &str = "RUSTFS_KMS_ENVELOPE_AAD";
 pub const ENV_KMS_ALLOW_IMMEDIATE_DELETION: &str = "RUSTFS_KMS_ALLOW_IMMEDIATE_DELETION";
+pub const ENV_KMS_VAULT_ADDRESS: &str = "RUSTFS_KMS_VAULT_ADDRESS";
+pub const ENV_KMS_VAULT_TOKEN: &str = "RUSTFS_KMS_VAULT_TOKEN";
+pub const ENV_KMS_VAULT_NAMESPACE: &str = "RUSTFS_KMS_VAULT_NAMESPACE";
+pub const ENV_KMS_VAULT_MOUNT_PATH: &str = "RUSTFS_KMS_VAULT_MOUNT_PATH";
 pub const ENV_KMS_VAULT_SKIP_TLS_VERIFY: &str = "RUSTFS_KMS_VAULT_SKIP_TLS_VERIFY";
+pub const ENV_KMS_VAULT_CA_CERT: &str = "RUSTFS_KMS_VAULT_CA_CERT";
+pub const ENV_KMS_VAULT_CLIENT_CERT: &str = "RUSTFS_KMS_VAULT_CLIENT_CERT";
+pub const ENV_KMS_VAULT_CLIENT_KEY: &str = "RUSTFS_KMS_VAULT_CLIENT_KEY";
 pub const ENV_KMS_VAULT_TRANSIT_METADATA_KV_MOUNT: &str = "RUSTFS_KMS_VAULT_TRANSIT_METADATA_KV_MOUNT";
 pub const ENV_KMS_VAULT_TRANSIT_METADATA_PREFIX: &str = "RUSTFS_KMS_VAULT_TRANSIT_METADATA_PREFIX";
 pub const ENV_KMS_STATIC_SECRET_KEY: &str = "RUSTFS_KMS_STATIC_SECRET_KEY";
@@ -35,11 +47,22 @@ pub const ENV_KMS_VAULT_APPROLE_SECRET_ID: &str = "RUSTFS_KMS_VAULT_APPROLE_SECR
 pub const ENV_KMS_VAULT_APPROLE_SECRET_ID_FILE: &str = "RUSTFS_KMS_VAULT_APPROLE_SECRET_ID_FILE";
 pub const ENV_KMS_VAULT_APPROLE_MOUNT: &str = "RUSTFS_KMS_VAULT_APPROLE_MOUNT";
 pub const ENV_KMS_VAULT_TOKEN_FILE: &str = "RUSTFS_KMS_VAULT_TOKEN_FILE";
+pub const ENV_KMS_VAULT_KUBERNETES_ROLE: &str = "RUSTFS_KMS_VAULT_KUBERNETES_ROLE";
+pub const ENV_KMS_VAULT_KUBERNETES_MOUNT: &str = "RUSTFS_KMS_VAULT_KUBERNETES_MOUNT";
+pub const ENV_KMS_VAULT_KUBERNETES_JWT_PATH: &str = "RUSTFS_KMS_VAULT_KUBERNETES_JWT_PATH";
 pub const ENV_KMS_AWS_REGION: &str = "RUSTFS_KMS_AWS_REGION";
 pub const ENV_KMS_AWS_ENDPOINT_URL: &str = "RUSTFS_KMS_AWS_ENDPOINT_URL";
+/// Age in whole seconds beyond which a key is reported as due for rotation;
+/// unset leaves rotation readiness unreported. Read once when the manager is
+/// built, by [`crate::manager::KmsManager`].
+pub const ENV_KMS_ROTATION_MAX_AGE_SECS: &str = "RUSTFS_KMS_ROTATION_MAX_AGE_SECS";
+pub const ENV_KMS_ROTATION_MAX_WRAPS: &str = "RUSTFS_KMS_ROTATION_MAX_WRAPS";
 pub const DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT: &str = "secret";
 pub const DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX: &str = "rustfs/kms/transit-metadata";
 pub const DEFAULT_VAULT_APPROLE_MOUNT: &str = "approle";
+pub const DEFAULT_VAULT_KUBERNETES_MOUNT: &str = "kubernetes";
+/// Where the kubelet projects a pod's ServiceAccount token by default.
+pub const DEFAULT_VAULT_KUBERNETES_JWT_PATH: &str = "/var/run/secrets/kubernetes.io/serviceaccount/token";
 
 /// Upper bound applied to `KmsConfig::timeout` when deriving backend behavior.
 ///
@@ -77,6 +100,14 @@ fn default_vault_kv2_mount_path() -> String {
 
 fn default_vault_approle_mount() -> String {
     DEFAULT_VAULT_APPROLE_MOUNT.to_string()
+}
+
+fn default_vault_kubernetes_mount() -> String {
+    DEFAULT_VAULT_KUBERNETES_MOUNT.to_string()
+}
+
+fn default_vault_kubernetes_jwt_path() -> PathBuf {
+    PathBuf::from(DEFAULT_VAULT_KUBERNETES_JWT_PATH)
 }
 
 pub const KMS_CONFIG_REDACTION_RULES: &[RedactionRule] = &[
@@ -336,9 +367,8 @@ impl StaticConfig {
     /// Decode the base64-encoded secret key into raw bytes.
     /// Returns an error if the key is not valid base64 or is not exactly 32 bytes.
     pub fn decode_key(&self) -> Result<[u8; 32]> {
-        use base64::Engine as _;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&self.secret_key)
+        let bytes = base64_simd::STANDARD
+            .decode_to_vec(&self.secret_key)
             .map_err(|e| KmsError::configuration_error(format!("Static KMS secret key is not valid base64: {e}")))?;
         if bytes.len() != 32 {
             return Err(KmsError::configuration_error(format!(
@@ -485,6 +515,23 @@ pub enum VaultAuthMethod {
         #[serde(default)]
         refresh_safety_window_secs: Option<u64>,
     },
+    /// Kubernetes authentication: the pod's ServiceAccount token is exchanged
+    /// for a lease-bound Vault token that is renewed in the background.
+    Kubernetes {
+        /// Vault role bound to this ServiceAccount.
+        role: String,
+        /// Kubernetes auth engine mount path.
+        #[serde(default = "default_vault_kubernetes_mount")]
+        mount: String,
+        /// Projected ServiceAccount token to present. Re-read on every login so
+        /// a token the kubelet rotates is picked up without a restart.
+        #[serde(default = "default_vault_kubernetes_jwt_path")]
+        jwt_path: PathBuf,
+        /// Fail-closed margin in seconds, as on `AppRole`. Defaults to the
+        /// per-attempt timeout.
+        #[serde(default)]
+        refresh_safety_window_secs: Option<u64>,
+    },
     /// Agent-managed token file (for example a Vault Agent auto-auth sink):
     /// the token is read from `path` and re-read periodically so a token
     /// rotated by the agent is picked up without a restart.
@@ -515,6 +562,16 @@ impl VaultAuthMethod {
         }
     }
 
+    /// Kubernetes authentication with the default mount and projected token path.
+    pub fn kubernetes(role: String) -> Self {
+        Self::Kubernetes {
+            role,
+            mount: default_vault_kubernetes_mount(),
+            jwt_path: default_vault_kubernetes_jwt_path(),
+            refresh_safety_window_secs: None,
+        }
+    }
+
     /// Agent-managed token file with the default poll interval.
     pub fn token_file(path: PathBuf) -> Self {
         Self::TokenFile {
@@ -541,6 +598,20 @@ impl fmt::Debug for VaultAuthMethod {
                 .field("secret_id", &redacted_secret(secret_id))
                 .field("secret_id_file", secret_id_file)
                 .field("mount", mount)
+                .field("refresh_safety_window_secs", refresh_safety_window_secs)
+                .finish(),
+            // No redaction: the role and mount name a Vault binding, and the
+            // ServiceAccount token itself is never held on this type.
+            Self::Kubernetes {
+                role,
+                mount,
+                jwt_path,
+                refresh_safety_window_secs,
+            } => f
+                .debug_struct("Kubernetes")
+                .field("role", role)
+                .field("mount", mount)
+                .field("jwt_path", jwt_path)
                 .field("refresh_safety_window_secs", refresh_safety_window_secs)
                 .finish(),
             Self::TokenFile {
@@ -864,15 +935,26 @@ impl KmsConfig {
                 // `mount_path` is deprecated and unused by this backend, so an empty value
                 // is deliberately not an error.
 
+                // `kv_mount` is: it is the mount every read, write and listing is
+                // routed through, and an empty one produces a path Vault has no
+                // handler for. Rejecting it here names the setting; letting it
+                // through spends a round-trip to report an unroutable path.
+                if config.kv_mount.is_empty() {
+                    return Err(KmsError::configuration_error("Vault KV2 mount cannot be empty"));
+                }
+
+                if let Some(ref tls) = config.tls {
+                    validate_vault_tls_pairing(tls)?;
+                }
+
                 // Validate TLS configuration if using HTTPS
                 if config.address.starts_with("https://")
                     && let Some(ref tls) = config.tls
                     && !tls.skip_verify
+                    && tls.ca_cert_path.is_none()
+                    && tls.client_cert_path.is_none()
                 {
-                    // In production, we should have proper TLS configuration
-                    if tls.ca_cert_path.is_none() && tls.client_cert_path.is_none() {
-                        tracing::warn!("Using HTTPS without custom TLS configuration - relying on system CA");
-                    }
+                    tracing::warn!("Using HTTPS without custom TLS configuration - relying on system CA");
                 }
             }
             BackendConfig::VaultTransit(config) => {
@@ -901,6 +983,10 @@ impl KmsConfig {
 
                 if config.metadata_key_prefix.is_empty() {
                     return Err(KmsError::configuration_error("Vault Transit metadata key prefix cannot be empty"));
+                }
+
+                if let Some(ref tls) = config.tls {
+                    validate_vault_tls_pairing(tls)?;
                 }
 
                 if config.address.starts_with("https://")
@@ -1015,50 +1101,12 @@ impl KmsConfig {
                 });
             }
             KmsBackend::VaultKv2 => {
-                let address = get_env_str("RUSTFS_KMS_VAULT_ADDRESS", "http://localhost:8200");
-                let auth_method = vault_auth_method_from_env()?;
-                let skip_tls_verify = get_env_bool(ENV_KMS_VAULT_SKIP_TLS_VERIFY, false);
-
-                let mount_path = match get_env_opt_str("RUSTFS_KMS_VAULT_MOUNT_PATH") {
-                    Some(path) => {
-                        tracing::warn!(
-                            "RUSTFS_KMS_VAULT_MOUNT_PATH is deprecated for the Vault KV2 backend: it never calls the Transit engine and the value is stored but unused"
-                        );
-                        path
-                    }
-                    None => default_vault_kv2_mount_path(),
-                };
-
-                config.backend_config = BackendConfig::VaultKv2(Box::new(VaultConfig {
-                    address,
-                    auth_method,
-                    namespace: get_env_opt_str("RUSTFS_KMS_VAULT_NAMESPACE"),
-                    mount_path,
-                    kv_mount: get_env_str("RUSTFS_KMS_VAULT_KV_MOUNT", "secret"),
-                    key_path_prefix: get_env_str("RUSTFS_KMS_VAULT_KEY_PREFIX", "rustfs/kms/keys"),
-                    tls: vault_tls_config(skip_tls_verify),
-                }));
+                config.backend_config =
+                    BackendConfig::VaultKv2(Box::new(vault_kv2_config_from_env(VaultCliOverrides::default())?));
             }
             KmsBackend::VaultTransit => {
-                let address = get_env_str("RUSTFS_KMS_VAULT_ADDRESS", "http://localhost:8200");
-                let auth_method = vault_auth_method_from_env()?;
-                let skip_tls_verify = get_env_bool(ENV_KMS_VAULT_SKIP_TLS_VERIFY, false);
-
-                config.backend_config = BackendConfig::VaultTransit(Box::new(VaultTransitConfig {
-                    address,
-                    auth_method,
-                    namespace: get_env_opt_str("RUSTFS_KMS_VAULT_NAMESPACE"),
-                    mount_path: get_env_str("RUSTFS_KMS_VAULT_MOUNT_PATH", "transit"),
-                    metadata_kv_mount: get_env_str(
-                        ENV_KMS_VAULT_TRANSIT_METADATA_KV_MOUNT,
-                        DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT,
-                    ),
-                    metadata_key_prefix: get_env_str(
-                        ENV_KMS_VAULT_TRANSIT_METADATA_PREFIX,
-                        DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX,
-                    ),
-                    tls: vault_tls_config(skip_tls_verify),
-                }));
+                config.backend_config =
+                    BackendConfig::VaultTransit(Box::new(vault_transit_config_from_env(VaultCliOverrides::default())?));
             }
             KmsBackend::Static => {
                 // Read from file first, then fall back to direct env var
@@ -1125,13 +1173,81 @@ pub fn allow_immediate_deletion_from_env() -> bool {
     get_env_bool(ENV_KMS_ALLOW_IMMEDIATE_DELETION, false)
 }
 
-fn vault_tls_config(skip_tls_verify: bool) -> Option<TlsConfig> {
-    skip_tls_verify.then_some(TlsConfig {
-        ca_cert_path: None,
-        client_cert_path: None,
-        client_key_path: None,
-        skip_verify: true,
+impl crate::persisted_observability::UnknownFieldSummary {
+    fn record_for_kms_config(&self) {
+        let Some((field, field_name_truncated, field_count)) = self.record("kms-config") else {
+            return;
+        };
+
+        static RECORDS_WITH_UNKNOWN_FIELDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let observed_records = RECORDS_WITH_UNKNOWN_FIELDS
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        if observed_records.is_power_of_two() {
+            tracing::warn!(
+                field = ?field,
+                field_name_truncated,
+                field_count,
+                observed_records,
+                "persisted KMS configuration contains unknown fields"
+            );
+        }
+    }
+}
+
+/// Deserialize a persisted KMS configuration, observing ignored fields.
+///
+/// The persisted configuration deliberately tolerates unknown fields — a
+/// rolling upgrade writes fields the previous build does not know, and
+/// rejecting them would turn every upgrade into a hard stop (see the
+/// regression test pinning that tolerance). Tolerated must not mean
+/// invisible: this loader wraps the deserializer with `serde_ignored`, so
+/// every field the configuration silently dropped is counted and sampled
+/// into a warning, per the repository rule that formats too
+/// compatibility-bound for `deny_unknown_fields` must at least log unknown
+/// fields. Only field paths are recorded, never values — a mistyped field
+/// name can sit next to a secret.
+pub fn kms_config_from_persisted_json(data: &[u8]) -> serde_json::Result<KmsConfig> {
+    use crate::persisted_observability::{BoundedUnknownFieldName, UnknownFieldSummary};
+
+    let mut deserializer = serde_json::Deserializer::from_slice(data);
+    let mut unknown_fields = UnknownFieldSummary::default();
+    let config: KmsConfig = serde_ignored::deserialize(&mut deserializer, |path| {
+        unknown_fields.observe(BoundedUnknownFieldName::new(&path.to_string()));
+    })?;
+    deserializer.end()?;
+    unknown_fields.record_for_kms_config();
+    Ok(config)
+}
+
+/// Assemble the Vault TLS settings from the environment.
+///
+/// Returns `None` when nothing TLS-related is configured so the config
+/// serializes without an empty `tls` block, matching the previous behavior.
+fn vault_tls_config_from_env() -> Option<TlsConfig> {
+    let skip_verify = get_env_bool(ENV_KMS_VAULT_SKIP_TLS_VERIFY, false);
+    let ca_cert_path = get_env_opt_str(ENV_KMS_VAULT_CA_CERT).map(PathBuf::from);
+    let client_cert_path = get_env_opt_str(ENV_KMS_VAULT_CLIENT_CERT).map(PathBuf::from);
+    let client_key_path = get_env_opt_str(ENV_KMS_VAULT_CLIENT_KEY).map(PathBuf::from);
+
+    (skip_verify || ca_cert_path.is_some() || client_cert_path.is_some() || client_key_path.is_some()).then_some(TlsConfig {
+        ca_cert_path,
+        client_cert_path,
+        client_key_path,
+        skip_verify,
     })
+}
+
+/// A client certificate without its key (or the reverse) cannot form an mTLS
+/// identity; rejecting it at validation names the missing setting instead of
+/// failing when the backend loads the files.
+fn validate_vault_tls_pairing(tls: &TlsConfig) -> Result<()> {
+    if tls.client_cert_path.is_some() != tls.client_key_path.is_some() {
+        return Err(KmsError::configuration_error(
+            "Vault client_cert_path and client_key_path must be configured together for mTLS",
+        ));
+    }
+    Ok(())
 }
 
 fn development_default_error(reason: &str) -> KmsError {
@@ -1142,6 +1258,78 @@ fn is_under_temp_dir(path: &Path) -> bool {
     path.starts_with(std::env::temp_dir())
 }
 
+/// Command-line values that take precedence over the matching environment
+/// variables when assembling a Vault backend configuration.
+///
+/// Every field has a `RUSTFS_KMS_VAULT_*` equivalent that the CLI layer already
+/// reads, so these are only set when the operator passed an explicit flag.
+///
+/// Deliberately not `Debug`: `token` holds the raw Vault token, and the
+/// redacting `Debug` impls elsewhere in this module exist because a derived one
+/// would print it. Denying the derive makes a future `{overrides:?}` a compile
+/// error instead of a leak.
+#[derive(Default, Clone, Copy)]
+pub struct VaultCliOverrides<'a> {
+    pub address: Option<&'a str>,
+    pub token: Option<&'a str>,
+    pub mount_path: Option<&'a str>,
+}
+
+/// Assemble the Vault KV2 backend configuration from the environment.
+///
+/// Shared by [`KmsConfig::from_env`] and the server's command-line startup path
+/// so both resolve the same auth method, namespace, TLS and mount settings.
+pub fn vault_kv2_config_from_env(overrides: VaultCliOverrides<'_>) -> Result<VaultConfig> {
+    let mount_path = match overrides
+        .mount_path
+        .map(str::to_string)
+        .or_else(|| get_env_opt_str(ENV_KMS_VAULT_MOUNT_PATH))
+    {
+        Some(path) => {
+            tracing::warn!(
+                "RUSTFS_KMS_VAULT_MOUNT_PATH is deprecated for the Vault KV2 backend: it never calls the Transit engine and the value is stored but unused"
+            );
+            path
+        }
+        None => default_vault_kv2_mount_path(),
+    };
+
+    Ok(VaultConfig {
+        address: vault_address_from_env(overrides.address),
+        auth_method: vault_auth_method_from_env(overrides.token)?,
+        namespace: get_env_opt_str(ENV_KMS_VAULT_NAMESPACE),
+        mount_path,
+        kv_mount: get_env_str("RUSTFS_KMS_VAULT_KV_MOUNT", "secret"),
+        key_path_prefix: get_env_str("RUSTFS_KMS_VAULT_KEY_PREFIX", "rustfs/kms/keys"),
+        tls: vault_tls_config_from_env(),
+    })
+}
+
+/// Assemble the Vault Transit backend configuration from the environment.
+///
+/// Companion to [`vault_kv2_config_from_env`]; see there for why both entry
+/// points share it.
+pub fn vault_transit_config_from_env(overrides: VaultCliOverrides<'_>) -> Result<VaultTransitConfig> {
+    Ok(VaultTransitConfig {
+        address: vault_address_from_env(overrides.address),
+        auth_method: vault_auth_method_from_env(overrides.token)?,
+        namespace: get_env_opt_str(ENV_KMS_VAULT_NAMESPACE),
+        mount_path: overrides
+            .mount_path
+            .map(str::to_string)
+            .unwrap_or_else(|| get_env_str(ENV_KMS_VAULT_MOUNT_PATH, "transit")),
+        metadata_kv_mount: get_env_str(ENV_KMS_VAULT_TRANSIT_METADATA_KV_MOUNT, DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT),
+        metadata_key_prefix: get_env_str(ENV_KMS_VAULT_TRANSIT_METADATA_PREFIX, DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX),
+        tls: vault_tls_config_from_env(),
+    })
+}
+
+fn vault_address_from_env(override_value: Option<&str>) -> String {
+    override_value
+        .map(str::to_string)
+        .unwrap_or_else(|| get_env_str(ENV_KMS_VAULT_ADDRESS, "http://localhost:8200"))
+}
+
 /// Resolve the Vault auth method from environment variables.
 ///
 /// Setting `RUSTFS_KMS_VAULT_APPROLE_ROLE_ID` selects AppRole authentication;
@@ -1149,27 +1337,59 @@ fn is_under_temp_dir(path: &Path) -> bool {
 /// (re-read on every login, mirroring the `RUSTFS_KMS_STATIC_SECRET_KEY_FILE`
 /// precedent) or inline from `RUSTFS_KMS_VAULT_APPROLE_SECRET_ID`, with the
 /// file taking precedence. Without a role id the legacy token flow applies.
-fn vault_auth_method_from_env() -> Result<VaultAuthMethod> {
+///
+/// `RUSTFS_KMS_VAULT_KUBERNETES_ROLE` selects Kubernetes authentication, which
+/// presents the pod's projected ServiceAccount token.
+///
+/// `token_override` carries a token supplied on the command line; it stands in
+/// for `RUSTFS_KMS_VAULT_TOKEN` everywhere below, including the conflict checks,
+/// so a flag and the variable it mirrors select the same method.
+fn vault_auth_method_from_env(token_override: Option<&str>) -> Result<VaultAuthMethod> {
+    let token = token_override
+        .map(str::to_string)
+        .or_else(|| get_env_opt_str(ENV_KMS_VAULT_TOKEN));
+    let role_id = get_env_opt_str(ENV_KMS_VAULT_APPROLE_ROLE_ID);
+    let kubernetes_role = get_env_opt_str(ENV_KMS_VAULT_KUBERNETES_ROLE);
+
     if let Some(token_file) = get_env_opt_str(ENV_KMS_VAULT_TOKEN_FILE) {
         // A token file names one authoritative credential source; combining it
         // with another one would leave the effective identity ambiguous, so
         // that is a configuration error rather than a precedence rule.
-        if get_env_opt_str(ENV_KMS_VAULT_APPROLE_ROLE_ID).is_some() {
-            return Err(KmsError::configuration_error(format!(
-                "{ENV_KMS_VAULT_TOKEN_FILE} cannot be combined with {ENV_KMS_VAULT_APPROLE_ROLE_ID}; configure exactly one Vault auth method"
-            )));
-        }
-        if get_env_opt_str("RUSTFS_KMS_VAULT_TOKEN").is_some() {
-            return Err(KmsError::configuration_error(format!(
-                "{ENV_KMS_VAULT_TOKEN_FILE} cannot be combined with RUSTFS_KMS_VAULT_TOKEN; configure exactly one Vault auth method"
-            )));
+        for (name, configured) in [
+            (ENV_KMS_VAULT_APPROLE_ROLE_ID, role_id.is_some()),
+            (ENV_KMS_VAULT_KUBERNETES_ROLE, kubernetes_role.is_some()),
+            (ENV_KMS_VAULT_TOKEN, token.is_some()),
+        ] {
+            if configured {
+                return Err(KmsError::configuration_error(format!(
+                    "{ENV_KMS_VAULT_TOKEN_FILE} cannot be combined with {name}; configure exactly one Vault auth method"
+                )));
+            }
         }
         return Ok(VaultAuthMethod::token_file(PathBuf::from(token_file)));
     }
 
-    let Some(role_id) = get_env_opt_str(ENV_KMS_VAULT_APPROLE_ROLE_ID) else {
+    if let Some(role) = kubernetes_role {
+        // Unlike a leftover static token, a second login method is never a
+        // stale remnant: both were configured deliberately and neither can be
+        // ranked over the other.
+        if role_id.is_some() {
+            return Err(KmsError::configuration_error(format!(
+                "{ENV_KMS_VAULT_KUBERNETES_ROLE} cannot be combined with {ENV_KMS_VAULT_APPROLE_ROLE_ID}; configure exactly one Vault auth method"
+            )));
+        }
+        return Ok(VaultAuthMethod::Kubernetes {
+            role,
+            mount: get_env_str(ENV_KMS_VAULT_KUBERNETES_MOUNT, DEFAULT_VAULT_KUBERNETES_MOUNT),
+            jwt_path: get_env_opt_str(ENV_KMS_VAULT_KUBERNETES_JWT_PATH)
+                .map_or_else(default_vault_kubernetes_jwt_path, PathBuf::from),
+            refresh_safety_window_secs: None,
+        });
+    }
+
+    let Some(role_id) = role_id else {
         return Ok(VaultAuthMethod::Token {
-            token: get_env_str("RUSTFS_KMS_VAULT_TOKEN", "dev-token"),
+            token: token.unwrap_or_else(|| "dev-token".to_string()),
         });
     };
 
@@ -1210,6 +1430,22 @@ fn validate_vault_auth_method(backend_name: &str, auth_method: &VaultAuthMethod)
             }
             if mount.is_empty() {
                 return Err(KmsError::configuration_error(format!("{backend_name} AppRole mount cannot be empty")));
+            }
+            Ok(())
+        }
+        VaultAuthMethod::Kubernetes {
+            role, mount, jwt_path, ..
+        } => {
+            if role.is_empty() {
+                return Err(KmsError::configuration_error(format!("{backend_name} Kubernetes role cannot be empty")));
+            }
+            if mount.is_empty() {
+                return Err(KmsError::configuration_error(format!("{backend_name} Kubernetes mount cannot be empty")));
+            }
+            if jwt_path.as_os_str().is_empty() {
+                return Err(KmsError::configuration_error(format!(
+                    "{backend_name} Kubernetes ServiceAccount token path cannot be empty"
+                )));
             }
             Ok(())
         }
@@ -1449,6 +1685,111 @@ mod tests {
     }
 
     #[test]
+    fn test_vault_tls_client_cert_and_key_must_be_paired() {
+        fn kv2_with_tls(tls: TlsConfig) -> KmsConfig {
+            KmsConfig {
+                backend: KmsBackend::VaultKv2,
+                backend_config: BackendConfig::VaultKv2(Box::new(VaultConfig {
+                    address: "https://vault.example.com:8200".to_string(),
+                    auth_method: VaultAuthMethod::Token {
+                        token: "vault-token".to_string(),
+                    },
+                    namespace: None,
+                    mount_path: "transit".to_string(),
+                    kv_mount: "secret".to_string(),
+                    key_path_prefix: "rustfs/kms/keys".to_string(),
+                    tls: Some(tls),
+                })),
+                ..Default::default()
+            }
+        }
+
+        let cert_only = kv2_with_tls(TlsConfig {
+            ca_cert_path: None,
+            client_cert_path: Some(PathBuf::from("/certs/client.pem")),
+            client_key_path: None,
+            skip_verify: false,
+        });
+        let error = cert_only
+            .with_insecure_development_defaults()
+            .validate()
+            .expect_err("a client certificate without its key cannot form an mTLS identity");
+        assert!(error.to_string().contains("must be configured together"), "{error}");
+
+        let key_only = kv2_with_tls(TlsConfig {
+            ca_cert_path: None,
+            client_cert_path: None,
+            client_key_path: Some(PathBuf::from("/certs/client.key")),
+            skip_verify: false,
+        });
+        assert!(key_only.with_insecure_development_defaults().validate().is_err());
+
+        let paired = kv2_with_tls(TlsConfig {
+            ca_cert_path: Some(PathBuf::from("/certs/vault-ca.pem")),
+            client_cert_path: Some(PathBuf::from("/certs/client.pem")),
+            client_key_path: Some(PathBuf::from("/certs/client.key")),
+            skip_verify: false,
+        });
+        assert!(paired.with_insecure_development_defaults().validate().is_ok());
+
+        // The Transit branch shares the pairing guard.
+        let transit_cert_only = KmsConfig {
+            backend: KmsBackend::VaultTransit,
+            backend_config: BackendConfig::VaultTransit(Box::new(VaultTransitConfig {
+                address: "https://vault.example.com:8200".to_string(),
+                auth_method: VaultAuthMethod::Token {
+                    token: "vault-token".to_string(),
+                },
+                namespace: None,
+                mount_path: "transit".to_string(),
+                metadata_kv_mount: DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT.to_string(),
+                metadata_key_prefix: DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX.to_string(),
+                tls: Some(TlsConfig {
+                    ca_cert_path: None,
+                    client_cert_path: Some(PathBuf::from("/certs/client.pem")),
+                    client_key_path: None,
+                    skip_verify: false,
+                }),
+            })),
+            ..Default::default()
+        };
+        assert!(transit_cert_only.with_insecure_development_defaults().validate().is_err());
+    }
+
+    #[test]
+    fn test_vault_tls_config_from_env_reads_certificate_paths() {
+        temp_env::with_vars(
+            [
+                (ENV_KMS_VAULT_CA_CERT, Some("/certs/vault-ca.pem")),
+                (ENV_KMS_VAULT_CLIENT_CERT, Some("/certs/client.pem")),
+                (ENV_KMS_VAULT_CLIENT_KEY, Some("/certs/client.key")),
+            ],
+            || {
+                let tls = vault_tls_config_from_env().expect("certificate paths in the environment must produce TLS settings");
+                assert_eq!(tls.ca_cert_path.as_deref(), Some(Path::new("/certs/vault-ca.pem")));
+                assert_eq!(tls.client_cert_path.as_deref(), Some(Path::new("/certs/client.pem")));
+                assert_eq!(tls.client_key_path.as_deref(), Some(Path::new("/certs/client.key")));
+                assert!(!tls.skip_verify);
+            },
+        );
+
+        temp_env::with_vars_unset(
+            [
+                ENV_KMS_VAULT_CA_CERT,
+                ENV_KMS_VAULT_CLIENT_CERT,
+                ENV_KMS_VAULT_CLIENT_KEY,
+                ENV_KMS_VAULT_SKIP_TLS_VERIFY,
+            ],
+            || {
+                assert!(
+                    vault_tls_config_from_env().is_none(),
+                    "no TLS-related environment must keep the config free of a TLS block"
+                );
+            },
+        );
+    }
+
+    #[test]
     fn test_vault_kv2_backend_serialization_uses_pascal_case() {
         let serialized = serde_json::to_string(&KmsBackend::VaultKv2).expect("backend should serialize");
         assert_eq!(serialized, "\"VaultKV2\"");
@@ -1528,30 +1869,10 @@ mod tests {
         assert!(config.validate().is_ok(), "deprecated mount_path must not be required");
     }
 
-    #[test]
-    fn test_vault_kv2_sources_do_not_claim_transit_wrapping() {
-        let sources = [
-            ("config.rs", include_str!("config.rs")),
-            ("api_types.rs", include_str!("api_types.rs")),
-            ("backends/vault.rs", include_str!("backends/vault.rs")),
-            ("lib.rs", include_str!("lib.rs")),
-        ];
-        // Assemble the needles at runtime so this guard does not match its own source.
-        let needles = [
-            format!("wrapping via {}", "Transit"),
-            format!("KV v2 + {}", "Transit"),
-            format!("KV2+{}", "Transit"),
-            format!("you would use Vault's {} engine", "transit"),
-        ];
-        for (name, source) in sources {
-            for needle in &needles {
-                assert!(
-                    !source.contains(needle.as_str()),
-                    "{name} still describes the Vault KV2 backend with `{needle}`"
-                );
-            }
-        }
-    }
+    // The "VaultKv2 must not claim Transit wrapping" documentation-claim
+    // invariant is enforced by scripts/check_fips_wording.sh, which scans every
+    // file in crates/kms rather than a fixed include_str! list
+    // (rustfs/backlog#1884).
 
     #[test]
     fn test_legacy_persisted_vault_transit_config_uses_metadata_defaults() {
@@ -1641,9 +1962,7 @@ mod tests {
 
     #[test]
     fn static_kms_config_serialization_does_not_expose_key_material() {
-        use base64::Engine as _;
-
-        let encoded_key = base64::engine::general_purpose::STANDARD.encode([0x5au8; 32]);
+        let encoded_key = base64_simd::STANDARD.encode_to_string([0x5au8; 32]);
         let config = KmsConfig::static_kms("static-key".to_string(), encoded_key.clone());
 
         let serialized = serde_json::to_string(&config).expect("static KMS config should serialize");
@@ -1833,6 +2152,10 @@ mod tests {
                 ("RUSTFS_KMS_BACKEND", Some("vault")),
                 ("RUSTFS_KMS_VAULT_ADDRESS", Some("https://vault.example.com")),
                 (ENV_KMS_VAULT_TOKEN_FILE, Some("/run/vault-agent/token")),
+                // Cleared explicitly: a static token in the ambient environment
+                // outranks the token file, so leaving it up to the caller's shell
+                // would make this assertion depend on who runs the test.
+                ("RUSTFS_KMS_VAULT_TOKEN", None),
             ],
             || {
                 let config = KmsConfig::from_env().expect("kms config should load from env");
@@ -1912,6 +2235,134 @@ mod tests {
             .expect("well-formed token file auth must validate");
     }
 
+    /// A Kubernetes role alone configures the method: the credential is the
+    /// pod's projected ServiceAccount token, so nothing secret is in the
+    /// environment and the mount and token path fall back to the cluster
+    /// defaults.
+    #[test]
+    fn test_from_env_selects_kubernetes() {
+        with_vars(
+            vec![
+                ("RUSTFS_KMS_BACKEND", Some("vault-transit")),
+                (ENV_KMS_VAULT_ADDRESS, Some("https://vault.example.com")),
+                (ENV_KMS_VAULT_KUBERNETES_ROLE, Some("rustfs")),
+                (ENV_KMS_VAULT_KUBERNETES_MOUNT, None),
+                (ENV_KMS_VAULT_KUBERNETES_JWT_PATH, None),
+                (ENV_KMS_VAULT_TOKEN, None),
+                (ENV_KMS_VAULT_TOKEN_FILE, None),
+                (ENV_KMS_VAULT_APPROLE_ROLE_ID, None),
+            ],
+            || {
+                let config = KmsConfig::from_env().expect("kms config should load from env");
+                let vault = config.vault_transit_config().expect("vault transit backend config");
+                let VaultAuthMethod::Kubernetes {
+                    role,
+                    mount,
+                    jwt_path,
+                    refresh_safety_window_secs,
+                } = &vault.auth_method
+                else {
+                    panic!(
+                        "a kubernetes role in the environment must select Kubernetes auth, got {:?}",
+                        vault.auth_method
+                    );
+                };
+                assert_eq!(role, "rustfs");
+                assert_eq!(mount, DEFAULT_VAULT_KUBERNETES_MOUNT);
+                assert_eq!(jwt_path, Path::new(DEFAULT_VAULT_KUBERNETES_JWT_PATH));
+                assert_eq!(refresh_safety_window_secs, &None);
+            },
+        );
+    }
+
+    #[test]
+    fn test_from_env_kubernetes_is_mutually_exclusive_with_other_auth() {
+        with_vars(
+            vec![
+                ("RUSTFS_KMS_BACKEND", Some("vault-transit")),
+                (ENV_KMS_VAULT_KUBERNETES_ROLE, Some("rustfs")),
+                (ENV_KMS_VAULT_APPROLE_ROLE_ID, Some("env-role-id")),
+                (ENV_KMS_VAULT_TOKEN, None),
+                (ENV_KMS_VAULT_TOKEN_FILE, None),
+            ],
+            || {
+                let error = KmsConfig::from_env().expect_err("kubernetes combined with approle must be rejected");
+                assert!(error.to_string().contains(ENV_KMS_VAULT_KUBERNETES_ROLE));
+                assert!(error.to_string().contains(ENV_KMS_VAULT_APPROLE_ROLE_ID));
+            },
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_bad_kubernetes_settings() {
+        let vault_config = |auth_method: VaultAuthMethod| KmsConfig {
+            backend: KmsBackend::VaultTransit,
+            backend_config: BackendConfig::VaultTransit(Box::new(VaultTransitConfig {
+                address: "https://vault.example.com:8200".to_string(),
+                auth_method,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        let error = vault_config(VaultAuthMethod::kubernetes(String::new()))
+            .validate()
+            .expect_err("an empty kubernetes role must be rejected");
+        assert!(error.to_string().contains("role"), "got {error}");
+
+        let error = vault_config(VaultAuthMethod::Kubernetes {
+            role: "rustfs".to_string(),
+            mount: String::new(),
+            jwt_path: PathBuf::from(DEFAULT_VAULT_KUBERNETES_JWT_PATH),
+            refresh_safety_window_secs: None,
+        })
+        .validate()
+        .expect_err("an empty kubernetes mount must be rejected");
+        assert!(error.to_string().contains("mount"), "got {error}");
+
+        let error = vault_config(VaultAuthMethod::Kubernetes {
+            role: "rustfs".to_string(),
+            mount: DEFAULT_VAULT_KUBERNETES_MOUNT.to_string(),
+            jwt_path: PathBuf::new(),
+            refresh_safety_window_secs: None,
+        })
+        .validate()
+        .expect_err("an empty ServiceAccount token path must be rejected");
+        assert!(error.to_string().contains("token path"), "got {error}");
+
+        vault_config(VaultAuthMethod::kubernetes("rustfs".to_string()))
+            .validate()
+            .expect("well-formed kubernetes auth must validate");
+    }
+
+    /// Every KV2 read, write and listing is routed through `kv_mount`, so an
+    /// empty one names a path no Vault engine answers. The Transit backend
+    /// already rejects its own empty mounts; this closes the same gap on the
+    /// setting whose absence otherwise surfaces as an unroutable-path failure at
+    /// the first Vault call.
+    #[test]
+    fn test_validate_rejects_an_empty_kv2_mount() {
+        let kv2_config = |kv_mount: &str| KmsConfig {
+            backend: KmsBackend::VaultKv2,
+            backend_config: BackendConfig::VaultKv2(Box::new(VaultConfig {
+                address: "https://vault.example.com:8200".to_string(),
+                auth_method: VaultAuthMethod::Token {
+                    token: "a-real-token".to_string(),
+                },
+                kv_mount: kv_mount.to_string(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        let error = kv2_config("")
+            .validate()
+            .expect_err("an empty KV2 mount must be rejected as a configuration error");
+        assert!(error.to_string().contains("mount"), "got {error}");
+
+        kv2_config("secret").validate().expect("a named KV2 mount must validate");
+    }
+
     #[test]
     fn test_approle_config_deserializes_legacy_shape_with_defaults() {
         // Persisted configurations from before the AppRole implementation only
@@ -1969,6 +2420,58 @@ mod tests {
         with_vars(vec![(ENV_KMS_ALLOW_IMMEDIATE_DELETION, None::<&str>)], || {
             assert!(!allow_immediate_deletion_from_env());
         });
+    }
+
+    #[test]
+    fn persisted_config_unknown_fields_remain_readable_and_are_observed() {
+        // Unknown fields in a persisted config are deliberately tolerated (a
+        // rolling upgrade writes fields the previous build does not know), but
+        // tolerated must not mean invisible (rustfs/backlog#1641): the
+        // observing loader counts and warns, naming only the field path —
+        // never the value, which can sit next to a secret. Coverage includes a
+        // field nested inside the backend variant, which the externally tagged
+        // enum exposes to the observer.
+        let mut value = serde_json::to_value(KmsConfig::default()).expect("serialize config");
+        value.as_object_mut().expect("config serializes to an object").insert(
+            "top_level_field_from_the_future".to_string(),
+            serde_json::json!("top-level value must not be logged"),
+        );
+        value
+            .pointer_mut("/backend_config/Local")
+            .expect("default config has a Local backend section")
+            .as_object_mut()
+            .expect("Local backend section is an object")
+            .insert(
+                "nested_field_from_the_future".to_string(),
+                serde_json::json!("nested value must not be logged"),
+            );
+        let data = serde_json::to_vec(&value).expect("encode config");
+
+        let logs = crate::test_support::CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(logs.clone())
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let config = metrics::with_local_recorder(&recorder, || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                kms_config_from_persisted_json(&data).expect("unknown fields must remain readable")
+            })
+        });
+        assert!(matches!(config.backend_config, BackendConfig::Local(_)));
+        assert_eq!(crate::test_support::unknown_field_metric(&recorder, "kms-config"), 2);
+
+        let output = logs.output();
+        assert!(output.contains("persisted KMS configuration contains unknown fields"), "got: {output}");
+        assert!(!output.contains("must not be logged"));
+
+        // A clean config observes nothing and logs nothing.
+        let clean = serde_json::to_vec(&KmsConfig::default()).expect("encode clean config");
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        metrics::with_local_recorder(&recorder, || kms_config_from_persisted_json(&clean).expect("clean config must parse"));
+        assert_eq!(crate::test_support::unknown_field_metric(&recorder, "kms-config"), 0);
     }
 
     #[test]
@@ -2063,14 +2566,12 @@ mod tests {
 
     #[test]
     fn test_from_env_reads_static_secret_file_and_sets_default_key() {
-        use base64::Engine as _;
-
         let temp_dir = TempDir::new().expect("create temp dir for static KMS secret");
         let secret_path = temp_dir.path().join("static-kms-secret");
         // Named `*_key_b64` (not `*_secret`) so the logging-guardrails check does not
         // flag these fixture interpolations as secrets leaking into log strings.
-        let file_key_b64 = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
-        let env_key_b64 = base64::engine::general_purpose::STANDARD.encode([9u8; 32]);
+        let file_key_b64 = base64_simd::STANDARD.encode_to_string([7u8; 32]);
+        let env_key_b64 = base64_simd::STANDARD.encode_to_string([9u8; 32]);
         std::fs::write(&secret_path, format!("file-key:{file_key_b64}\n")).expect("write static KMS secret file");
 
         with_vars(

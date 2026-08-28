@@ -16,12 +16,16 @@
 
 use super::storage_api::bucket_usecase::ECStore;
 use super::storage_api::bucket_usecase::StorageObjectInfo as ObjectInfo;
-use super::storage_api::bucket_usecase::access::{ReqInfo, authorize_request, req_info_ref};
+#[cfg(test)]
+use super::storage_api::bucket_usecase::access::ReqInfo;
+use super::storage_api::bucket_usecase::access::{
+    authorize_request, bucket_config_mutation_incarnation, log_list_buckets_iam_implicit_deny,
+    prepare_list_buckets_iam_authorization, req_info_ref,
+};
 #[cfg(test)]
 use super::storage_api::bucket_usecase::bucket::target::BucketTarget;
 use super::storage_api::bucket_usecase::bucket::{
     ObjectLockConfigExt as _, VersioningConfigExt as _,
-    bucket_target_sys::BucketTargetSys,
     lifecycle::bucket_lifecycle_ops::{
         enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects, run_stale_multipart_upload_cleanup_once,
         validate_lifecycle_config, validate_transition_tier,
@@ -34,8 +38,9 @@ use super::storage_api::bucket_usecase::bucket::{
     metadata_sys,
     policy_sys::PolicySys,
     replication::{
-        ReplicationTargetValidationError, invalid_replication_config_status_field, replication_target_arns,
-        should_remove_replication_target, unsupported_replication_config_field, validate_replication_config_target_arns,
+        OperatorRuleContract, ReplicationTargetValidationError, invalid_replication_config_status_field,
+        merge_user_replication_config, replication_target_arns, should_remove_replication_target,
+        unsupported_replication_config_field, validate_replication_config_structure, validate_replication_config_target_arns,
     },
     target::{BucketTargetType, BucketTargets},
     utils::serialize,
@@ -59,9 +64,6 @@ use super::storage_api::bucket_usecase::{
     get_validated_store, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
     request_context, validate_list_object_unordered_with_delimiter,
 };
-use crate::admin::handlers::site_replication::{
-    site_replication_bucket_meta_hook, site_replication_delete_bucket_hook, site_replication_make_bucket_hook,
-};
 use crate::app::object_data_cache::invalidate_object_data_cache_bucket_after_delete;
 use crate::app::runtime_sources::{
     AppContext, current_app_context, current_encryption_service, current_notification_system,
@@ -69,9 +71,11 @@ use crate::app::runtime_sources::{
 };
 use crate::auth::get_condition_values_with_client_info;
 use crate::error::ApiError;
-use crate::server::RemoteAddr;
+use crate::shared_types::RemoteAddr;
+use crate::site_replication::{
+    site_replication_bucket_meta_hook, site_replication_delete_bucket_hook, site_replication_make_bucket_hook,
+};
 use crate::storage::storage_api::lock_bucket_targets_metadata;
-use futures::StreamExt;
 use http::StatusCode;
 use metrics::counter;
 use rustfs_config::RUSTFS_REGION;
@@ -383,6 +387,29 @@ fn serialize_config<T: xml::Serialize>(value: &T) -> S3Result<Vec<u8>> {
     serialize(value).map_err(to_internal_error)
 }
 
+async fn update_bucket_config_for_incarnation(
+    bucket: &str,
+    config_file: &str,
+    data: Vec<u8>,
+    expected_incarnation_id: Option<uuid::Uuid>,
+) -> Result<time::OffsetDateTime, StorageError> {
+    match expected_incarnation_id {
+        Some(incarnation_id) => metadata_sys::update_if_incarnation(bucket, config_file, data, incarnation_id).await,
+        None => metadata_sys::update(bucket, config_file, data).await,
+    }
+}
+
+async fn delete_bucket_config_for_incarnation(
+    bucket: &str,
+    config_file: &str,
+    expected_incarnation_id: Option<uuid::Uuid>,
+) -> Result<time::OffsetDateTime, StorageError> {
+    match expected_incarnation_id {
+        Some(incarnation_id) => metadata_sys::delete_if_incarnation(bucket, config_file, incarnation_id).await,
+        None => metadata_sys::delete(bucket, config_file).await,
+    }
+}
+
 fn to_internal_error(err: impl Display) -> S3Error {
     S3Error::with_message(S3ErrorCode::InternalError, format!("{err}"))
 }
@@ -482,17 +509,20 @@ fn sr_bucket_meta_item(bucket: String, item_type: &str) -> SRBucketMeta {
         r#type: item_type.to_string(),
         updated_at: Some(time::OffsetDateTime::now_utc()),
         api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        derived_rule_contract: true,
         ..Default::default()
     }
 }
 
-fn notify_bucket_metadata_reload(
+async fn notify_bucket_metadata_reload(
     bucket: String,
     operation: &'static str,
     request_context: Option<request_context::RequestContext>,
     scanner_maintenance_change: bool,
 ) {
     record_local_scanner_maintenance_reload(&bucket, scanner_maintenance_change);
+    // Keep reload detached across request cancellation, but wait before a healthy peer can serve the previous config.
+    let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
     spawn_background_with_context(request_context, async move {
         if let Some(notification_sys) = current_notification_system() {
             let result = if scanner_maintenance_change {
@@ -504,7 +534,9 @@ fn notify_bucket_metadata_reload(
                 warn!(bucket = %bucket, error = %err, "failed to notify peers after {operation}");
             }
         }
+        let _ = completed_tx.send(());
     });
+    let _ = completed_rx.await;
 }
 
 fn record_local_scanner_maintenance_reload(bucket: &str, scanner_maintenance_change: bool) {
@@ -558,6 +590,9 @@ fn validate_replication_config_targets(targets: &BucketTargets, config: &Replica
 }
 
 fn validate_replication_config_capabilities(config: &ReplicationConfiguration) -> S3Result<()> {
+    if let Err(err) = validate_replication_config_structure(config) {
+        return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, err.message()));
+    }
     if let Some(field) = invalid_replication_config_status_field(config) {
         return Err(S3Error::with_message(
             S3ErrorCode::InvalidRequest,
@@ -593,25 +628,67 @@ async fn validate_bucket_replication_update(bucket: &str, config: &ReplicationCo
     validate_replication_config_targets(&targets, config)
 }
 
-async fn replication_targets_without_config_targets(
+/// Defense in depth for site-replication-managed buckets (issue #1948): an S3
+/// PutBucketReplication replaces the operator-authored rules but must not wipe
+/// the rules the reconciler derived for the current remote peers
+/// (`site_peer_deployment_ids`) — until its next pass (600s period) every
+/// peer link on this bucket would be silently dead. The same merge also drops
+/// incoming impostors of those rules. An empty peer set (site replication
+/// disabled) keeps the verbatim overwrite semantics: rule ids are not
+/// reserved, so an operator's own `site-repl-*` rule is ordinary state there.
+/// `contract` is what the peers were probed to support; the merged config is
+/// what gets broadcast, so it is built the way every peer will merge it.
+fn merge_user_replication_config_update(
+    incoming: ReplicationConfiguration,
+    existing: Option<ReplicationConfiguration>,
+    site_peer_deployment_ids: &HashSet<String>,
+    contract: OperatorRuleContract,
+) -> ReplicationConfiguration {
+    if site_peer_deployment_ids.is_empty() {
+        return incoming;
+    }
+    // `incoming` passed structure validation, so it holds at least one rule;
+    // `None` is only reachable when every incoming rule impersonates a
+    // reconciler rule, and then the stored reconciler rules are what remains.
+    merge_user_replication_config(Some(incoming.clone()), existing, site_peer_deployment_ids, contract).unwrap_or(incoming)
+}
+
+/// Split of an S3 DeleteBucketReplication on the stored config (issue #1948):
+/// the operator-authored rules are removed, the rules the reconciler derived
+/// for the current remote peers survive (`None` means nothing survives and
+/// the config is deleted), and the returned ARNs are the ones whose bucket
+/// targets may be garbage-collected — never an ARN a surviving reconciler
+/// rule still points at.
+fn split_replication_config_for_user_delete(
+    config: ReplicationConfiguration,
+    site_peer_deployment_ids: &HashSet<String>,
+    contract: OperatorRuleContract,
+) -> (Option<ReplicationConfiguration>, HashSet<String>) {
+    let mut removable_arns = replication_target_arns(&config);
+    let remaining = merge_user_replication_config(None, Some(config), site_peer_deployment_ids, contract);
+    if let Some(remaining) = remaining.as_ref() {
+        for rule in &remaining.rules {
+            removable_arns.remove(rule.destination.bucket.trim());
+        }
+    }
+    (remaining, removable_arns)
+}
+
+async fn replication_targets_without_arns(
     bucket: &str,
-    config: &ReplicationConfiguration,
+    target_arns: &HashSet<String>,
 ) -> S3Result<Option<(BucketTargets, usize)>> {
-    let target_arns = replication_target_arns(config);
     if target_arns.is_empty() {
         return Ok(None);
     }
 
     let mut targets = match metadata_sys::get_bucket_targets_config(bucket).await {
         Ok(targets) => targets,
-        Err(StorageError::ConfigNotFound) => {
-            BucketTargetSys::get().update_all_targets(bucket, None).await;
-            return Ok(None);
-        }
+        Err(StorageError::ConfigNotFound) => return Ok(None),
         Err(err) => return Err(ApiError::from(err).into()),
     };
 
-    let removed = remove_replication_targets_from_config_targets(&mut targets, &target_arns);
+    let removed = remove_replication_targets_from_config_targets(&mut targets, target_arns);
     if removed == 0 {
         return Ok(None);
     }
@@ -632,12 +709,16 @@ fn remove_replication_targets_from_config_targets(targets: &mut BucketTargets, t
     original_len - targets.targets.len()
 }
 
-async fn write_replication_targets_after_config_delete(bucket: &str, targets: &BucketTargets, removed: usize) -> S3Result<()> {
+async fn write_replication_targets_after_config_delete(
+    bucket: &str,
+    targets: &BucketTargets,
+    removed: usize,
+    expected_incarnation_id: Option<uuid::Uuid>,
+) -> S3Result<()> {
     let json_targets = serde_json::to_vec(&targets).map_err(to_internal_error)?;
-    metadata_sys::update(bucket, BUCKET_TARGETS_FILE, json_targets)
+    update_bucket_config_for_incarnation(bucket, BUCKET_TARGETS_FILE, json_targets, expected_incarnation_id)
         .await
         .map_err(ApiError::from)?;
-    BucketTargetSys::get().update_all_targets(bucket, Some(targets)).await;
     info!(bucket = %bucket, removed, "removed replication remote targets referenced by deleted bucket replication config");
 
     Ok(())
@@ -647,10 +728,13 @@ async fn restore_replication_config_after_target_cleanup_failure(
     bucket: &str,
     config: &ReplicationConfiguration,
     cleanup_err: S3Error,
+    expected_incarnation_id: Option<uuid::Uuid>,
 ) -> S3Error {
     match serialize(config) {
         Ok(data) => {
-            if let Err(restore_err) = metadata_sys::update(bucket, BUCKET_REPLICATION_CONFIG, data).await {
+            if let Err(restore_err) =
+                update_bucket_config_for_incarnation(bucket, BUCKET_REPLICATION_CONFIG, data, expected_incarnation_id).await
+            {
                 error!(
                     bucket = %bucket,
                     error = ?restore_err,
@@ -703,6 +787,22 @@ async fn validate_bucket_versioning_update(bucket: &str, config: &VersioningConf
         }
         Err(StorageError::ConfigNotFound) => {}
         Err(err) => return Err(ApiError::from(err).into()),
+    }
+    // AWS S3 and MinIO both refuse to suspend versioning while a replication
+    // configuration exists: suspension would start minting null versions that
+    // the replication engine (versioned by contract) can never converge.
+    if config.suspended() {
+        match metadata_sys::get_replication_config(bucket).await {
+            Ok(_) => {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidBucketState,
+                    "A replication configuration is present on this bucket, bucket wide versioning cannot be suspended."
+                        .to_string(),
+                ));
+            }
+            Err(StorageError::ConfigNotFound) => {}
+            Err(err) => return Err(ApiError::from(err).into()),
+        }
     }
 
     Ok(())
@@ -774,6 +874,8 @@ async fn is_list_objects_metadata_action_allowed<T>(
     req_info.bucket = Some(bucket.to_string());
     req_info.object = Some(object.to_string());
     req_info.version_id = None;
+    // Denial here is an expected filter outcome, not an error (issue #5740).
+    req_info.suppress_denial_log = true;
     auth_req.extensions.insert(req_info);
 
     match authorize_request(&mut auth_req, Action::S3Action(action)).await {
@@ -834,8 +936,13 @@ fn build_list_object_versions_metadata_output(
         .filter(|object| !object.name.is_empty())
         .map(|object| {
             let object_name = encode_list_versions_value(&object.name, encoding_type);
+            // A null version surfaces as `Some(Uuid::nil())` on the
+            // client-facing `ObjectInfo`; AWS advertises it as the literal
+            // string `null`, and a nil UUID must never reach the wire
+            // (issue #6745).
             let version_id = object
                 .version_id
+                .filter(|version| !version.is_nil())
                 .map(|version| version.to_string())
                 .unwrap_or_else(|| "null".to_string());
             let permission = permissions.get(&object.name).copied().unwrap_or_default();
@@ -969,7 +1076,7 @@ fn build_list_objects_v2_metadata_output(
                 object: Object {
                     key: Some(encode_list_objects_v2_value(&object.name, encoding_type)),
                     last_modified: object.mod_time.map(Timestamp::from),
-                    size: Some(object.get_actual_size().unwrap_or_default()),
+                    size: Some(object.get_actual_size_or_physical()),
                     e_tag: object.etag.clone().map(|etag| to_s3s_etag(&etag)),
                     storage_class: Some(ObjectStorageClass::from(
                         object
@@ -1104,6 +1211,19 @@ fn lifecycle_has_expiry_rules(config: &BucketLifecycleConfiguration) -> bool {
         rule.status == ExpirationStatus::from_static(ExpirationStatus::ENABLED)
             && (rule.expiration.is_some() || rule.del_marker_expiration.is_some() || rule.noncurrent_version_expiration.is_some())
     })
+}
+
+/// Status-independent presence of the expiry subset that site replication
+/// propagates (`replicateILMExpiry`): expiration / noncurrent-version
+/// expiration only. Distinct from [`lifecycle_has_expiry_rules`], which
+/// filters on ENABLED for scanner scheduling — editing a Disabled expiry rule
+/// must still advance the replication axis. Del-marker expiration and
+/// abort-multipart are site-local and never travel.
+fn lifecycle_rules_have_expiry(config: &BucketLifecycleConfiguration) -> bool {
+    config
+        .rules
+        .iter()
+        .any(|rule| rule.expiration.is_some() || rule.noncurrent_version_expiration.is_some())
 }
 
 fn lifecycle_has_abort_multipart_rules(config: &BucketLifecycleConfiguration) -> bool {
@@ -1360,49 +1480,31 @@ impl DefaultBucketUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let mut req = req;
-
         if req.credentials.as_ref().is_none_or(|cred| cred.access_key.is_empty()) {
             return Err(S3Error::with_message(S3ErrorCode::AccessDenied, "Access Denied"));
         }
 
-        let bucket_infos = if let Err(e) = authorize_request(&mut req, Action::S3Action(S3Action::ListAllMyBucketsAction)).await {
-            if e.code() != &S3ErrorCode::AccessDenied {
-                return Err(e);
-            }
-
-            let mut list_bucket_infos = store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?;
-
-            list_bucket_infos = futures::stream::iter(list_bucket_infos)
-                .filter_map(|info| async {
-                    let mut req_clone = req.clone();
-                    let Some(req_info) = req_clone.extensions.get_mut::<ReqInfo>() else {
-                        debug!(bucket = %info.name, "ReqInfo missing in extensions, skipping bucket authorization");
-                        return None;
-                    };
-                    req_info.bucket = Some(info.name.clone());
-
-                    if authorize_request(&mut req_clone, Action::S3Action(S3Action::ListBucketAction))
-                        .await
-                        .is_ok()
-                        || authorize_request(&mut req_clone, Action::S3Action(S3Action::GetBucketLocationAction))
-                            .await
-                            .is_ok()
-                    {
-                        Some(info)
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-                .await;
-
-            if list_bucket_infos.is_empty() {
-                return Err(S3Error::with_message(S3ErrorCode::AccessDenied, "Access Denied"));
-            }
-            list_bucket_infos
-        } else {
+        let iam_authorization = prepare_list_buckets_iam_authorization(&req).await?;
+        let bucket_infos = if iam_authorization.is_allowed("", S3Action::ListAllMyBucketsAction).await {
             store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?
+        } else {
+            log_list_buckets_iam_implicit_deny(&req)?;
+            let bucket_infos = store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?;
+            let mut visible_bucket_infos = Vec::new();
+            for info in bucket_infos {
+                if iam_authorization.is_allowed(&info.name, S3Action::ListBucketAction).await
+                    || iam_authorization
+                        .is_allowed(&info.name, S3Action::GetBucketLocationAction)
+                        .await
+                {
+                    visible_bucket_infos.push(info);
+                }
+            }
+
+            if visible_bucket_infos.is_empty() {
+                return Err(ApiError::access_denied().into());
+            }
+            visible_bucket_infos
         };
 
         Ok(S3Response::new(build_list_buckets_output(&bucket_infos)))
@@ -1412,6 +1514,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketEncryptionInput>,
     ) -> S3Result<S3Response<DeleteBucketEncryptionOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let DeleteBucketEncryptionInput { bucket, .. } = req.input;
 
@@ -1424,11 +1527,11 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        metadata_sys::delete(&bucket, BUCKET_SSECONFIG)
+        delete_bucket_config_for_incarnation(&bucket, BUCKET_SSECONFIG, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "delete bucket encryption", request_context, false);
+        notify_bucket_metadata_reload(bucket.clone(), "delete bucket encryption", request_context, false).await;
 
         let item = sr_bucket_meta_item(bucket.clone(), "sse-config");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
@@ -1443,6 +1546,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketCorsInput>,
     ) -> S3Result<S3Response<DeleteBucketCorsOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let DeleteBucketCorsInput { bucket, .. } = req.input;
 
@@ -1455,11 +1559,11 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        metadata_sys::delete(&bucket, BUCKET_CORS_CONFIG)
+        delete_bucket_config_for_incarnation(&bucket, BUCKET_CORS_CONFIG, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "delete bucket cors", request_context, false);
+        notify_bucket_metadata_reload(bucket.clone(), "delete bucket cors", request_context, false).await;
 
         let item = sr_bucket_meta_item(bucket.clone(), "cors-config");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
@@ -1474,6 +1578,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketLifecycleInput>,
     ) -> S3Result<S3Response<DeleteBucketLifecycleOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let DeleteBucketLifecycleInput { bucket, .. } = req.input;
 
@@ -1486,11 +1591,11 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        metadata_sys::delete(&bucket, BUCKET_LIFECYCLE_CONFIG)
+        delete_bucket_config_for_incarnation(&bucket, BUCKET_LIFECYCLE_CONFIG, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "delete bucket lifecycle", request_context, true);
+        notify_bucket_metadata_reload(bucket.clone(), "delete bucket lifecycle", request_context, true).await;
 
         let item = sr_bucket_meta_item(bucket.clone(), "lc-config");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
@@ -1505,6 +1610,7 @@ impl DefaultBucketUsecase {
         req: S3Request<DeleteBucketPolicyInput>,
     ) -> S3Result<S3Response<DeleteBucketPolicyOutput>> {
         record_s3_op(S3Operation::DeleteBucketPolicy);
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let DeleteBucketPolicyInput { bucket, .. } = req.input;
 
@@ -1517,11 +1623,11 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        metadata_sys::delete(&bucket, BUCKET_POLICY_CONFIG)
+        delete_bucket_config_for_incarnation(&bucket, BUCKET_POLICY_CONFIG, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "delete bucket policy", request_context, false);
+        notify_bucket_metadata_reload(bucket.clone(), "delete bucket policy", request_context, false).await;
 
         let item = sr_bucket_meta_item(bucket.clone(), "policy");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
@@ -1531,10 +1637,18 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(DeleteBucketPolicyOutput {}))
     }
 
+    /// `site_peers` is the set of remote site-replication peer deployment ids
+    /// (empty when site replication is disabled). The interface layer reads it
+    /// from the persisted state and fails closed on a read error, so this
+    /// usecase stays a pure function of its inputs (layer rule: app never
+    /// imports interface).
     pub async fn execute_delete_bucket_replication(
         &self,
         req: S3Request<DeleteBucketReplicationInput>,
+        site_peers: HashSet<String>,
+        contract: OperatorRuleContract,
     ) -> S3Result<S3Response<DeleteBucketReplicationOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let DeleteBucketReplicationInput { bucket, .. } = req.input;
 
@@ -1552,26 +1666,47 @@ impl DefaultBucketUsecase {
             Err(StorageError::ConfigNotFound) => None,
             Err(err) => return Err(ApiError::from(err).into()),
         };
-        let updated_targets = if let Some(config) = replication_config.as_ref() {
-            replication_targets_without_config_targets(&bucket, config).await?
+        let (remaining_config, updated_targets) = if let Some(config) = replication_config.as_ref() {
+            let (remaining, removable_arns) = split_replication_config_for_user_delete(config.clone(), &site_peers, contract);
+            let targets = replication_targets_without_arns(&bucket, &removable_arns).await?;
+            (remaining, targets)
         } else {
-            None
+            (None, None)
         };
 
-        metadata_sys::delete(&bucket, BUCKET_REPLICATION_CONFIG)
-            .await
-            .map_err(ApiError::from)?;
+        match remaining_config {
+            // Site-replication rules and the targets backing them survive the
+            // S3 delete (issue #1948); only the operator-authored rules go.
+            Some(remaining) => {
+                let data = serialize_config(&remaining)?;
+                update_bucket_config_for_incarnation(&bucket, BUCKET_REPLICATION_CONFIG, data, expected_incarnation_id)
+                    .await
+                    .map_err(ApiError::from)?;
+            }
+            None => {
+                delete_bucket_config_for_incarnation(&bucket, BUCKET_REPLICATION_CONFIG, expected_incarnation_id)
+                    .await
+                    .map_err(ApiError::from)?;
+            }
+        }
         if let Some((targets, removed)) = updated_targets
-            && let Err(err) = write_replication_targets_after_config_delete(&bucket, &targets, removed).await
+            && let Err(err) =
+                write_replication_targets_after_config_delete(&bucket, &targets, removed, expected_incarnation_id).await
         {
             if let Some(config) = replication_config.as_ref() {
-                return Err(restore_replication_config_after_target_cleanup_failure(&bucket, config, err).await);
+                return Err(restore_replication_config_after_target_cleanup_failure(
+                    &bucket,
+                    config,
+                    err,
+                    expected_incarnation_id,
+                )
+                .await);
             }
             return Err(err);
         }
         drop(targets_guard);
 
-        notify_bucket_metadata_reload(bucket.clone(), "delete bucket replication", request_context, true);
+        notify_bucket_metadata_reload(bucket.clone(), "delete bucket replication", request_context, true).await;
 
         let item = sr_bucket_meta_item(bucket.clone(), "replication-config");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
@@ -1588,14 +1723,15 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketTaggingInput>,
     ) -> S3Result<S3Response<DeleteBucketTaggingOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let DeleteBucketTaggingInput { bucket, .. } = req.input;
 
-        metadata_sys::delete(&bucket, BUCKET_TAGGING_CONFIG)
+        delete_bucket_config_for_incarnation(&bucket, BUCKET_TAGGING_CONFIG, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "delete bucket tagging", request_context, false);
+        notify_bucket_metadata_reload(bucket.clone(), "delete bucket tagging", request_context, false).await;
 
         let item = sr_bucket_meta_item(bucket.clone(), "tags");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
@@ -1611,6 +1747,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeletePublicAccessBlockInput>,
     ) -> S3Result<S3Response<DeletePublicAccessBlockOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let DeletePublicAccessBlockInput { bucket, .. } = req.input;
 
@@ -1623,11 +1760,11 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        metadata_sys::delete(&bucket, BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG)
+        delete_bucket_config_for_incarnation(&bucket, BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "delete public access block", request_context, false);
+        notify_bucket_metadata_reload(bucket.clone(), "delete public access block", request_context, false).await;
 
         Ok(S3Response::with_status(DeletePublicAccessBlockOutput::default(), StatusCode::NO_CONTENT))
     }
@@ -2039,6 +2176,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketEncryptionInput>,
     ) -> S3Result<S3Response<PutBucketEncryptionOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutBucketEncryptionInput {
             bucket,
@@ -2077,11 +2215,11 @@ impl DefaultBucketUsecase {
             .map_err(ApiError::from)?;
 
         let data = serialize_config(&server_side_encryption_configuration)?;
-        metadata_sys::update(&bucket, BUCKET_SSECONFIG, data)
+        update_bucket_config_for_incarnation(&bucket, BUCKET_SSECONFIG, data, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "put bucket encryption", request_context, false);
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket encryption", request_context, false).await;
 
         let mut item = sr_bucket_meta_item(bucket.clone(), "sse-config");
         item.sse_config = Some(
@@ -2099,6 +2237,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketLifecycleConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketLifecycleConfigurationOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutBucketLifecycleConfigurationInput {
             bucket,
@@ -2136,18 +2275,42 @@ impl DefaultBucketUsecase {
             return Err(s3_error!(InvalidArgument, "{err}"));
         }
 
-        input_cfg.expiry_updated_at = Some(Timestamp::from(time::OffsetDateTime::now_utc()));
+        // Stamp the expiry axis only when the expiry subset can have changed
+        // (MinIO: HasExpiry() || expiryRuleRemoved). Site-replication peers
+        // judge lc-config staleness on this axis; a transition-only edit that
+        // advanced it would let this site's stale expiry subset shadow — and
+        // roll back — a newer peer expiry edit fleet-wide.
+        let previous_expiry_updated_at = match metadata_sys::get_lifecycle_config(&bucket).await {
+            Ok((previous, _)) => {
+                if lifecycle_rules_have_expiry(&input_cfg) || lifecycle_rules_have_expiry(&previous) {
+                    Some(Timestamp::from(time::OffsetDateTime::now_utc()))
+                } else {
+                    previous.expiry_updated_at
+                }
+            }
+            // No previous config (or unreadable): stamping is the
+            // conservative pre-existing behavior.
+            Err(_) => lifecycle_rules_have_expiry(&input_cfg).then(|| Timestamp::from(time::OffsetDateTime::now_utc())),
+        };
+        input_cfg.expiry_updated_at = previous_expiry_updated_at;
         let data = serialize_config(&input_cfg)?;
-        metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, data)
+        update_bucket_config_for_incarnation(&bucket, BUCKET_LIFECYCLE_CONFIG, data, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "put bucket lifecycle", request_context, true);
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket lifecycle", request_context, true).await;
 
         let mut item = sr_bucket_meta_item(bucket.clone(), "lc-config");
         item.expiry_lc_config =
             Some(serialize_config(&input_cfg).and_then(|bytes| String::from_utf8(bytes).map_err(to_internal_error))?);
-        item.expiry_updated_at = item.updated_at;
+        // The item travels with the expiry axis, not the wall clock: a site
+        // whose expiry knowledge is old (or absent — UNIX_EPOCH) must not
+        // out-rank newer peer expiry state at the receivers.
+        item.expiry_updated_at = input_cfg
+            .expiry_updated_at
+            .clone()
+            .map(time::OffsetDateTime::from)
+            .or(Some(time::OffsetDateTime::UNIX_EPOCH));
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
             warn!(bucket = %bucket, error = ?err, "site replication bucket lifecycle hook failed");
         }
@@ -2194,6 +2357,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketNotificationConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketNotificationConfigurationOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_region = req.region.clone();
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
 
@@ -2215,11 +2379,11 @@ impl DefaultBucketUsecase {
             .map_err(ApiError::from)?;
 
         let data = serialize_config(&notification_configuration)?;
-        metadata_sys::update(&bucket, BUCKET_NOTIFICATION_CONFIG, data)
+        update_bucket_config_for_incarnation(&bucket, BUCKET_NOTIFICATION_CONFIG, data, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "put bucket notification", request_context, false);
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket notification", request_context, false).await;
 
         let region = resolve_notification_region(self.global_region(), request_region);
         let notify = current_notify_interface_for_context(self.context.as_deref());
@@ -2269,6 +2433,7 @@ impl DefaultBucketUsecase {
         req: S3Request<PutBucketPolicyInput>,
     ) -> S3Result<S3Response<PutBucketPolicyOutput>> {
         record_s3_op(S3Operation::PutBucketPolicy);
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutBucketPolicyInput { bucket, policy, .. } = req.input;
 
@@ -2319,11 +2484,11 @@ impl DefaultBucketUsecase {
 
         let data = policy.as_bytes().to_vec();
 
-        metadata_sys::update(&bucket, BUCKET_POLICY_CONFIG, data)
+        update_bucket_config_for_incarnation(&bucket, BUCKET_POLICY_CONFIG, data, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "put bucket policy", request_context, false);
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket policy", request_context, false).await;
 
         let mut item = sr_bucket_meta_item(bucket.clone(), "policy");
         item.policy = Some(serde_json::from_str(&policy).map_err(|e| s3_error!(InvalidArgument, "parse policy failed {:?}", e))?);
@@ -2336,6 +2501,7 @@ impl DefaultBucketUsecase {
 
     #[instrument(level = "debug", skip(self))]
     pub async fn execute_put_bucket_cors(&self, req: S3Request<PutBucketCorsInput>) -> S3Result<S3Response<PutBucketCorsOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutBucketCorsInput {
             bucket,
@@ -2353,11 +2519,11 @@ impl DefaultBucketUsecase {
             .map_err(ApiError::from)?;
 
         let data = serialize_config(&cors_configuration)?;
-        metadata_sys::update(&bucket, BUCKET_CORS_CONFIG, data)
+        update_bucket_config_for_incarnation(&bucket, BUCKET_CORS_CONFIG, data, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "put bucket cors", request_context, false);
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket cors", request_context, false).await;
 
         let mut item = sr_bucket_meta_item(bucket.clone(), "cors-config");
         item.cors =
@@ -2369,10 +2535,15 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(PutBucketCorsOutput::default()))
     }
 
+    /// See [`Self::execute_delete_bucket_replication`] for `site_peers` and
+    /// `contract`.
     pub async fn execute_put_bucket_replication(
         &self,
         req: S3Request<PutBucketReplicationInput>,
+        site_peers: HashSet<String>,
+        contract: OperatorRuleContract,
     ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutBucketReplicationInput {
             bucket,
@@ -2394,13 +2565,20 @@ impl DefaultBucketUsecase {
 
         let targets_guard = lock_bucket_targets_metadata(&bucket).await;
         validate_bucket_replication_update(&bucket, &replication_configuration).await?;
+        let existing_config = match metadata_sys::get_replication_config(&bucket).await {
+            Ok((config, _)) => Some(config),
+            Err(StorageError::ConfigNotFound) => None,
+            Err(err) => return Err(ApiError::from(err).into()),
+        };
+        let replication_configuration =
+            merge_user_replication_config_update(replication_configuration, existing_config, &site_peers, contract);
         let data = serialize_config(&replication_configuration)?;
-        metadata_sys::update(&bucket, BUCKET_REPLICATION_CONFIG, data)
+        update_bucket_config_for_incarnation(&bucket, BUCKET_REPLICATION_CONFIG, data, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
         drop(targets_guard);
 
-        notify_bucket_metadata_reload(bucket.clone(), "put bucket replication", request_context, true);
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket replication", request_context, true).await;
 
         let mut item = sr_bucket_meta_item(bucket.clone(), "replication-config");
         item.replication_config = Some(
@@ -2418,6 +2596,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutPublicAccessBlockInput>,
     ) -> S3Result<S3Response<PutPublicAccessBlockOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutPublicAccessBlockInput {
             bucket,
@@ -2435,11 +2614,11 @@ impl DefaultBucketUsecase {
             .map_err(ApiError::from)?;
 
         let data = serialize_config(&public_access_block_configuration)?;
-        metadata_sys::update(&bucket, BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, data)
+        update_bucket_config_for_incarnation(&bucket, BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, data, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "put public access block", request_context, false);
+        notify_bucket_metadata_reload(bucket.clone(), "put public access block", request_context, false).await;
 
         Ok(S3Response::new(PutPublicAccessBlockOutput::default()))
     }
@@ -2449,6 +2628,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketTaggingInput>,
     ) -> S3Result<S3Response<PutBucketTaggingOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutBucketTaggingInput { bucket, tagging, .. } = req.input;
 
@@ -2463,11 +2643,11 @@ impl DefaultBucketUsecase {
 
         let data = serialize_config(&tagging)?;
 
-        metadata_sys::update(&bucket, BUCKET_TAGGING_CONFIG, data)
+        update_bucket_config_for_incarnation(&bucket, BUCKET_TAGGING_CONFIG, data, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "put bucket tagging", request_context, false);
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket tagging", request_context, false).await;
 
         let mut item = sr_bucket_meta_item(bucket.clone(), "tags");
         item.tags = Some(serialize_config(&tagging).and_then(|bytes| String::from_utf8(bytes).map_err(to_internal_error))?);
@@ -2484,6 +2664,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketVersioningInput>,
     ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutBucketVersioningInput {
             bucket,
@@ -2495,11 +2676,11 @@ impl DefaultBucketUsecase {
 
         let data = serialize_config(&versioning_configuration)?;
 
-        metadata_sys::update(&bucket, BUCKET_VERSIONING_CONFIG, data)
+        update_bucket_config_for_incarnation(&bucket, BUCKET_VERSIONING_CONFIG, data, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "put bucket versioning", request_context, false);
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket versioning", request_context, false).await;
 
         let mut item = sr_bucket_meta_item(bucket.clone(), "version-config");
         item.versioning = Some(
@@ -2513,7 +2694,7 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(PutBucketVersioningOutput {}))
     }
 
-    #[instrument(level = "info", skip(self, req))]
+    #[instrument(level = "trace", skip(self, req))]
     pub async fn execute_list_objects_v2(&self, req: S3Request<ListObjectsV2Input>) -> S3Result<S3Response<ListObjectsV2Output>> {
         // warn!("list_objects_v2 req {:?}", &req.input);
         let ListObjectsV2Input {
@@ -2950,7 +3131,7 @@ mod tests {
                 "{method} should identify the bucket metadata operation in reload logs"
             );
             let expected_reload = format!(
-                "notify_bucket_metadata_reload(bucket.clone(), \"{operation}\", request_context, {scanner_maintenance_change});"
+                "notify_bucket_metadata_reload(bucket.clone(), \"{operation}\", request_context, {scanner_maintenance_change}).await;"
             );
             assert!(
                 body.contains(&expected_reload),
@@ -3018,6 +3199,200 @@ mod tests {
         let arns = replication_target_arns(&config);
 
         assert!(arns.contains(destination));
+    }
+
+    fn replication_rule_with_id(arn: &str, id: &str, priority: i32) -> ReplicationRule {
+        let mut rule = replication_rule_for_target(arn);
+        rule.id = Some(id.to_string());
+        rule.priority = Some(priority);
+        rule
+    }
+
+    fn site_peers(deployment_ids: &[&str]) -> HashSet<String> {
+        deployment_ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    #[test]
+    fn put_replication_merge_preserves_site_replication_rules() {
+        let existing = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![
+                replication_rule_with_id("arn:rustfs:replication::peer-dep:bucket", "site-repl-peer-dep", 1),
+                replication_rule_with_id("arn:rustfs:replication:us-east-1:old:bucket", "old-user-rule", 2),
+            ],
+        };
+        let incoming = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![
+                replication_rule_with_id("arn:rustfs:replication:us-east-1:new:bucket", "new-user-rule", 1),
+                replication_rule_with_id("arn:rustfs:replication::forged-dep:bucket", "site-repl-peer-dep", 2),
+                replication_rule_with_id("arn:rustfs:replication::other-dep:bucket", "site-repl-other", 3),
+            ],
+        };
+
+        let merged = merge_user_replication_config_update(
+            incoming,
+            Some(existing),
+            &site_peers(&["peer-dep"]),
+            OperatorRuleContract::Derived,
+        );
+
+        let rules: Vec<_> = merged
+            .rules
+            .iter()
+            .map(|rule| (rule.id.as_deref().unwrap_or_default(), rule.destination.bucket.as_str()))
+            .collect();
+        assert_eq!(
+            rules,
+            vec![
+                ("new-user-rule", "arn:rustfs:replication:us-east-1:new:bucket"),
+                ("site-repl-other", "arn:rustfs:replication::other-dep:bucket"),
+                ("site-repl-peer-dep", "arn:rustfs:replication::peer-dep:bucket"),
+            ],
+            "user rules replaced, the reconciler rule for the current peer kept over the incoming impostor, \
+             a site-repl-* id that names no current peer is ordinary operator state"
+        );
+    }
+
+    // Rule ids do not reserve `site-repl-*`: outside site replication an
+    // owner's `site-repl-user` rule is ordinary state, so PUT stores it
+    // verbatim and DELETE removes it and garbage-collects its target.
+    #[test]
+    fn put_then_delete_replication_without_site_replication_treats_site_repl_id_as_user_rule() {
+        let user_arn = "arn:minio:replication:us-east-1:2f1c-remote:bucket";
+        let incoming = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![replication_rule_with_id(user_arn, "site-repl-user", 1)],
+        };
+
+        let stored = merge_user_replication_config_update(incoming.clone(), None, &HashSet::new(), OperatorRuleContract::Derived);
+        assert_eq!(stored, incoming, "PUT on a non-site-replication bucket is verbatim");
+
+        let (remaining, removable) =
+            split_replication_config_for_user_delete(stored, &HashSet::new(), OperatorRuleContract::Derived);
+        assert!(remaining.is_none(), "DELETE must remove the operator's site-repl-* rule");
+        assert_eq!(removable, HashSet::from([user_arn.to_string()]));
+    }
+
+    // Under site replication only a rule the reconciler would derive — id
+    // `site-repl-<peer>` for a current peer, destination ARN naming the same
+    // peer — is reconciler-owned. Everything else is operator state.
+    #[test]
+    fn delete_replication_split_keeps_only_reconciler_derived_rules() {
+        let peer_arn = "arn:rustfs:replication::peer-dep:bucket";
+        let user_arn = "arn:minio:replication:us-east-1:2f1c-remote:bucket";
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![
+                replication_rule_with_id(user_arn, "site-repl-user", 1),
+                replication_rule_with_id(user_arn, "site-repl-peer-dep", 2),
+                replication_rule_with_id("arn:rustfs:replication::gone-dep:bucket", "site-repl-gone-dep", 3),
+                replication_rule_with_id(peer_arn, "site-repl-peer-dep", 4),
+            ],
+        };
+
+        let (remaining, removable) =
+            split_replication_config_for_user_delete(config, &site_peers(&["peer-dep"]), OperatorRuleContract::Derived);
+
+        let remaining = remaining.expect("the reconciler-derived rule must survive");
+        assert_eq!(remaining.rules.len(), 1);
+        assert_eq!(remaining.rules[0].destination.bucket, peer_arn);
+        assert_eq!(
+            removable,
+            HashSet::from([user_arn.to_string(), "arn:rustfs:replication::gone-dep:bucket".to_string()]),
+            "targets of operator rules and of a removed peer are garbage-collected"
+        );
+    }
+
+    #[test]
+    fn put_replication_merge_returns_incoming_verbatim_without_site_rules() {
+        let existing = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![replication_rule_with_id(
+                "arn:rustfs:replication:us-east-1:old:bucket",
+                "old-user-rule",
+                7,
+            )],
+        };
+        let incoming = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![replication_rule_with_id(
+                "arn:rustfs:replication:us-east-1:new:bucket",
+                "new-user-rule",
+                5,
+            )],
+        };
+
+        let merged = merge_user_replication_config_update(
+            incoming.clone(),
+            Some(existing),
+            &HashSet::new(),
+            OperatorRuleContract::Derived,
+        );
+
+        assert_eq!(merged.role, incoming.role);
+        assert_eq!(merged.rules, incoming.rules, "non-SR buckets keep the verbatim overwrite semantics");
+    }
+
+    #[test]
+    fn delete_replication_split_keeps_site_rules_and_their_targets() {
+        let sr_arn = "arn:rustfs:replication::peer-dep:bucket";
+        let user_arn = "arn:rustfs:replication:us-east-1:user:bucket";
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![
+                replication_rule_with_id(user_arn, "user-rule", 1),
+                replication_rule_with_id(sr_arn, "site-repl-peer-dep", 2),
+            ],
+        };
+
+        let (remaining, removable) =
+            split_replication_config_for_user_delete(config, &site_peers(&["peer-dep"]), OperatorRuleContract::Derived);
+
+        let remaining = remaining.expect("site-replication rules must survive a user delete");
+        let ids: Vec<_> = remaining
+            .rules
+            .iter()
+            .map(|rule| rule.id.as_deref().unwrap_or_default())
+            .collect();
+        assert_eq!(ids, vec!["site-repl-peer-dep"]);
+        assert_eq!(removable, HashSet::from([user_arn.to_string()]));
+    }
+
+    #[test]
+    fn delete_replication_split_protects_targets_shared_with_site_rules() {
+        let sr_arn = "arn:rustfs:replication::peer-dep:bucket";
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![
+                replication_rule_with_id(sr_arn, "user-rule-on-sr-target", 1),
+                replication_rule_with_id(sr_arn, "site-repl-peer-dep", 2),
+            ],
+        };
+
+        let (remaining, removable) =
+            split_replication_config_for_user_delete(config, &site_peers(&["peer-dep"]), OperatorRuleContract::Derived);
+
+        assert!(remaining.is_some());
+        assert!(
+            removable.is_empty(),
+            "a target still referenced by a surviving site-replication rule must not be removed"
+        );
+    }
+
+    #[test]
+    fn delete_replication_split_removes_everything_without_site_rules() {
+        let user_arn = "arn:rustfs:replication:us-east-1:user:bucket";
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![replication_rule_with_id(user_arn, "user-rule", 1)],
+        };
+
+        let (remaining, removable) =
+            split_replication_config_for_user_delete(config, &site_peers(&["peer-dep"]), OperatorRuleContract::Derived);
+
+        assert!(remaining.is_none(), "without site-replication rules the whole config is deleted");
+        assert_eq!(removable, HashSet::from([user_arn.to_string()]));
     }
 
     fn replication_targets_with_arn(arns: &[&str]) -> BucketTargets {
@@ -3136,6 +3511,24 @@ mod tests {
                 .contains("Destination.EncryptionConfiguration is not supported")
         );
         assert!(!err.to_string().contains(destination_key_id));
+    }
+
+    #[test]
+    fn validate_replication_config_capabilities_rejects_structural_defects_before_write() {
+        let mut first = replication_rule_for_target("arn:rustfs:replication:us-east-1:target:bucket");
+        first.priority = Some(1);
+        let mut second = replication_rule_for_target("arn:rustfs:replication:us-east-1:target:bucket");
+        second.priority = Some(1);
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![first, second],
+        };
+
+        let err = validate_replication_config_capabilities(&config)
+            .expect_err("duplicate rule priorities must be rejected before persistence");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert!(err.to_string().contains("Priority must be unique"));
     }
 
     #[test]
@@ -3297,7 +3690,7 @@ mod tests {
         let req = build_request(input, Method::PUT);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_create_bucket(req).await.unwrap_err();
+        let err = Box::pin(usecase.execute_create_bucket(req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
@@ -3339,7 +3732,10 @@ mod tests {
         let req = build_request(input, Method::DELETE);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_delete_bucket_replication(req).await.unwrap_err();
+        let err = usecase
+            .execute_delete_bucket_replication(req, HashSet::new(), OperatorRuleContract::Derived)
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
@@ -3768,7 +4164,9 @@ mod tests {
         match &output.entries[0] {
             ListObjectVersionMetadataEntry::Version(version, extension) => {
                 assert_eq!(version.key.as_deref(), Some("obj-a"));
-                assert_eq!(version.version_id.as_deref(), Some(Uuid::nil().to_string().as_str()));
+                // A null version's synthesized nil UUID must surface as the
+                // literal `null`, never as `00000000-…` (issue #6745).
+                assert_eq!(version.version_id.as_deref(), Some("null"));
                 assert_eq!(extension.user_tags.as_deref(), Some("env=prod"));
                 assert_eq!(extension.internal, Some(ObjectInternalInfo { k: 4, m: 2 }));
                 assert_eq!(
@@ -4411,11 +4809,13 @@ mod tests {
 
     #[tokio::test]
     async fn execute_put_bucket_replication_returns_internal_error_when_store_uninitialized() {
+        // The config must clear the structural/capability validators so the
+        // request actually reaches the store lookup this test pins.
         let input = PutBucketReplicationInput::builder()
             .bucket("test-bucket".to_string())
             .replication_configuration(ReplicationConfiguration {
                 role: "arn:aws:iam::123456789012:role/test".to_string(),
-                rules: vec![],
+                rules: vec![replication_rule_for_target("arn:rustfs:replication:us-east-1:target:bucket")],
             })
             .build()
             .unwrap();
@@ -4423,7 +4823,10 @@ mod tests {
         let req = build_request(input, Method::PUT);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_put_bucket_replication(req).await.unwrap_err();
+        let err = usecase
+            .execute_put_bucket_replication(req, HashSet::new(), OperatorRuleContract::Derived)
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
@@ -4441,7 +4844,7 @@ mod tests {
             .unwrap();
 
         let err = DefaultBucketUsecase::without_context()
-            .execute_put_bucket_replication(build_request(input, Method::PUT))
+            .execute_put_bucket_replication(build_request(input, Method::PUT), HashSet::new(), OperatorRuleContract::Derived)
             .await
             .expect_err("unsupported fields must be rejected before store access");
 

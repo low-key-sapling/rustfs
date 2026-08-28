@@ -16,17 +16,24 @@ pub mod bucket_lifecycle_audit;
 pub mod bucket_lifecycle_ops;
 mod config_boundary;
 pub mod core;
+mod durable_namespace;
 pub mod evaluator;
 pub mod manual_transition_job;
 mod metadata_boundary;
+pub(crate) use metadata_boundary::{LifecycleExpiryConfigs, get_expiry_configs};
+mod object_handlers_common;
 mod object_lock_boundary;
 pub use self::core as lifecycle;
 mod replication_sink;
 pub mod rule;
 mod runtime_boundary;
-mod tagging_boundary;
 pub mod tier_delete_journal;
 pub mod tier_free_version_recovery;
 pub mod tier_last_day_stats;
 pub mod tier_sweeper;
 pub mod transition_transaction;
+
+pub(crate) use durable_namespace::{
+    DurableIlmRecordCheckpoint, ILM_META_PREFIX, ValidatedDurableIlmRecord, classify_durable_ilm_record,
+    validate_durable_ilm_record,
+};

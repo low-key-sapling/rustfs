@@ -23,8 +23,8 @@
 
 use super::common::LocalKMSTestEnvironment;
 use crate::common::{TEST_BUCKET, init_logging};
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::types::ServerSideEncryption;
-use serial_test::serial;
 use std::fs;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -32,14 +32,13 @@ use tracing::{info, warn};
 
 /// Test KMS behavior when key directory is temporarily unavailable
 #[tokio::test]
-#[serial]
 async fn test_kms_key_directory_unavailable() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Testing KMS behavior with unavailable key directory");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -79,12 +78,25 @@ async fn test_kms_key_directory_unavailable() -> Result<(), Box<dyn std::error::
         .send()
         .await;
 
-    // This should fail, but the server should still be responsive
-    if put_result2.is_err() {
-        info!("✅ Upload correctly failed when key directory unavailable");
-    } else {
-        warn!("⚠️ Upload succeeded despite unavailable key directory (may be using cached keys)");
-    }
+    let unavailable_error = put_result2.expect_err("a missing Local KMS key directory must reject encrypted writes");
+    assert_eq!(unavailable_error.raw_response().map(|response| response.status().as_u16()), Some(500));
+    assert_eq!(
+        unavailable_error.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("InternalError")
+    );
+    let unavailable_absence = s3_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key(object_key2)
+        .send()
+        .await
+        .expect_err("a write rejected by unavailable KMS must not publish an object");
+    assert_eq!(unavailable_absence.raw_response().map(|response| response.status().as_u16()), Some(404));
+    assert_eq!(
+        unavailable_absence.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("NoSuchKey")
+    );
+    info!("✅ Upload correctly failed when key directory unavailable");
 
     // Restore the key directory
     info!("🔧 Restoring key directory");
@@ -109,6 +121,11 @@ async fn test_kms_key_directory_unavailable() -> Result<(), Box<dyn std::error::
 
     assert_eq!(put_response3.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
 
+    let get_response3 = s3_client.get_object().bucket(TEST_BUCKET).key(object_key3).send().await?;
+    assert_eq!(get_response3.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
+    let downloaded_data3 = get_response3.body.collect().await?.into_bytes();
+    assert_eq!(downloaded_data3.as_ref(), test_data3);
+
     // Verify we can still access the original file
     info!("📥 Verifying access to original encrypted file");
     let get_response = s3_client.get_object().bucket(TEST_BUCKET).key(object_key).send().await?;
@@ -123,14 +140,13 @@ async fn test_kms_key_directory_unavailable() -> Result<(), Box<dyn std::error::
 
 /// Test handling of corrupted key files
 #[tokio::test]
-#[serial]
 async fn test_kms_corrupted_key_files() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Testing KMS behavior with corrupted key files");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -177,12 +193,22 @@ async fn test_kms_corrupted_key_files() -> Result<(), Box<dyn std::error::Error 
         .send()
         .await;
 
-    // This might succeed if KMS uses cached keys, but should eventually fail
-    if put_result2.is_err() {
-        info!("✅ Upload correctly failed with corrupted key");
-    } else {
-        warn!("⚠️ Upload succeeded despite corrupted key (likely using cached key)");
-    }
+    let corrupt_error = put_result2.expect_err("corrupt Local KMS key material must reject encrypted writes");
+    assert_eq!(corrupt_error.raw_response().map(|response| response.status().as_u16()), Some(500));
+    assert_eq!(
+        corrupt_error.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("InternalError")
+    );
+    let corrupt_absence = s3_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key(object_key2)
+        .send()
+        .await
+        .expect_err("a write rejected by corrupt KMS material must not publish an object");
+    assert_eq!(corrupt_absence.raw_response().map(|response| response.status().as_u16()), Some(404));
+    assert_eq!(corrupt_absence.as_service_error().and_then(ProvideErrorMetadata::code), Some("NoSuchKey"));
+    info!("✅ Upload correctly failed with corrupted key");
 
     // Restore the original key file
     info!("🔧 Restoring original key file");
@@ -208,6 +234,11 @@ async fn test_kms_corrupted_key_files() -> Result<(), Box<dyn std::error::Error 
 
     assert_eq!(put_response3.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
 
+    let get_response3 = s3_client.get_object().bucket(TEST_BUCKET).key(object_key3).send().await?;
+    assert_eq!(get_response3.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
+    let downloaded_data3 = get_response3.body.collect().await?.into_bytes();
+    assert_eq!(downloaded_data3.as_ref(), test_data3);
+
     kms_env.base_env.delete_test_bucket(TEST_BUCKET).await?;
     info!("✅ Corrupted key files test completed successfully");
     Ok(())
@@ -215,14 +246,13 @@ async fn test_kms_corrupted_key_files() -> Result<(), Box<dyn std::error::Error 
 
 /// Test multipart upload interruption and recovery
 #[tokio::test]
-#[serial]
 async fn test_kms_multipart_upload_interruption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Testing KMS multipart upload interruption and recovery");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -284,18 +314,14 @@ async fn test_kms_multipart_upload_interruption() -> Result<(), Box<dyn std::err
     info!("🔧 Simulating upload interruption");
 
     // Abort the multipart upload
-    let abort_result = s3_client
+    s3_client
         .abort_multipart_upload()
         .bucket(TEST_BUCKET)
         .key(object_key)
         .upload_id(upload_id)
         .send()
-        .await;
-
-    match abort_result {
-        Ok(_) => info!("✅ Multipart upload aborted successfully"),
-        Err(e) => warn!("⚠️ Failed to abort multipart upload: {}", e),
-    }
+        .await?;
+    info!("✅ Multipart upload aborted successfully");
 
     // Try to complete the aborted upload - this should fail
     info!("🔍 Attempting to complete aborted upload");
@@ -314,17 +340,37 @@ async fn test_kms_multipart_upload_interruption() -> Result<(), Box<dyn std::err
         .set_parts(Some(completed_parts))
         .build();
 
-    let complete_result = s3_client
+    let complete_error = s3_client
         .complete_multipart_upload()
         .bucket(TEST_BUCKET)
         .key(object_key)
         .upload_id(upload_id)
         .multipart_upload(completed_multipart_upload)
         .send()
-        .await;
-
-    assert!(complete_result.is_err(), "Should not be able to complete aborted upload");
+        .await
+        .expect_err("an aborted multipart upload must not be completable");
+    assert_eq!(complete_error.raw_response().map(|response| response.status().as_u16()), Some(404));
+    assert_eq!(
+        complete_error.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("NoSuchUpload")
+    );
+    assert_eq!(
+        complete_error.as_service_error().and_then(ProvideErrorMetadata::message),
+        Some(
+            "The specified multipart upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed."
+        )
+    );
     info!("✅ Correctly failed to complete aborted upload");
+
+    let missing_object = s3_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key(object_key)
+        .send()
+        .await
+        .expect_err("aborting a multipart upload must not publish an object");
+    assert_eq!(missing_object.raw_response().map(|response| response.status().as_u16()), Some(404));
+    assert_eq!(missing_object.as_service_error().and_then(ProvideErrorMetadata::code), Some("NoSuchKey"));
 
     // Start a new multipart upload and complete it successfully
     info!("📤 Starting new multipart upload");
@@ -397,16 +443,14 @@ async fn test_kms_multipart_upload_interruption() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-/// Test KMS resilience to temporary resource constraints
+/// Test concurrent KMS encryption requests
 #[tokio::test]
-#[serial]
-async fn test_kms_resource_constraints() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_kms_concurrent_encryption_requests() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    info!("🧪 Testing KMS behavior under resource constraints");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -436,29 +480,27 @@ async fn test_kms_resource_constraints() -> Result<(), Box<dyn std::error::Error
     }
 
     // Wait for all uploads to complete
-    let mut successful_uploads = 0;
-    let mut failed_uploads = 0;
+    let mut failures = Vec::new();
 
     for task in upload_tasks {
-        let (object_key, result) = task.await.unwrap();
+        let (object_key, result) = task.await?;
         match result {
             Ok(_) => {
-                successful_uploads += 1;
                 info!("✅ Rapid upload {} succeeded", object_key);
             }
             Err(e) => {
-                failed_uploads += 1;
                 warn!("❌ Rapid upload {} failed: {}", object_key, e);
+                failures.push(format!("{object_key}: {e}"));
             }
         }
     }
 
-    info!("📊 Rapid upload results: {} succeeded, {} failed", successful_uploads, failed_uploads);
-
-    // We expect most uploads to succeed even under load
-    assert!(successful_uploads >= 7, "Expected at least 7/10 rapid uploads to succeed");
+    assert!(
+        failures.is_empty(),
+        "all 10 concurrent KMS uploads must succeed; failures: {}",
+        failures.join("; ")
+    );
 
     kms_env.base_env.delete_test_bucket(TEST_BUCKET).await?;
-    info!("✅ Resource constraints test completed successfully");
     Ok(())
 }

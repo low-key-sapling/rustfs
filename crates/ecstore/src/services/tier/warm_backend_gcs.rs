@@ -30,21 +30,19 @@ use google_cloud_storage::client::Storage;
 use google_cloud_storage::client::StorageControl;
 use std::convert::TryFrom;
 
-use crate::client::{
-    admin_handler_utils::AdminError,
-    api_put_object::PutObjectOptions,
-    transition_api::{Options, ReadCloser, ReaderImpl},
-};
 use crate::services::tier::{
     tier_config::TierGCS,
     warm_backend::{WarmBackend, WarmBackendGetOpts},
 };
+use rustfs_s3_client::{
+    admin_handler_utils::AdminError,
+    api_put_object::PutObjectOptions,
+    transition_api::{Options, ReadCloser, ReaderImpl},
+};
+use rustfs_utils::egress::validate_outbound_url;
 use tracing::warn;
 
-const MAX_MULTIPART_PUT_OBJECT_SIZE: i64 = 1024 * 1024 * 1024 * 1024 * 5;
-const MAX_PARTS_COUNT: i64 = 10000;
 const _MAX_PART_SIZE: i64 = 1024 * 1024 * 1024 * 5;
-const MIN_PART_SIZE: i64 = 1024 * 1024 * 128;
 
 fn parse_generation(remote_version: &str) -> Result<Option<i64>, Error> {
     if remote_version.is_empty() {
@@ -64,7 +62,6 @@ pub struct WarmBackendGCS {
     pub control: Arc<StorageControl>,
     pub bucket: String,
     pub prefix: String,
-    pub storage_class: String,
 }
 
 impl WarmBackendGCS {
@@ -75,6 +72,12 @@ impl WarmBackendGCS {
 
         if conf.bucket == "" {
             return Err(std::io::Error::other("no bucket name was provided"));
+        }
+
+        if !conf.endpoint.is_empty() {
+            let endpoint_url = url::Url::parse(&conf.endpoint).map_err(|e| std::io::Error::other(e.to_string()))?;
+            validate_outbound_url(&endpoint_url)
+                .map_err(|err| std::io::Error::other(format!("tier endpoint is not allowed: {err}")))?;
         }
 
         let authorized_user = serde_json::from_str(&conf.creds)?;
@@ -104,7 +107,6 @@ impl WarmBackendGCS {
             control,
             bucket: conf.bucket.clone(),
             prefix: conf.prefix.strip_suffix("/").unwrap_or(&conf.prefix).to_owned(),
-            storage_class: "".to_string(),
         })
     }
 
@@ -216,7 +218,9 @@ impl WarmBackend for WarmBackendGCS {
 
 #[cfg(test)]
 mod tests {
+    use super::WarmBackendGCS;
     use super::parse_generation;
+    use crate::services::tier::tier_config::TierGCS;
     use std::io::ErrorKind;
 
     #[test]
@@ -234,6 +238,21 @@ mod tests {
         for value in ["unknown", "1.0", "-1", "0", "9223372036854775808"] {
             let err = parse_generation(value).expect_err("unknown generation must fail closed");
             assert_eq!(err.kind(), ErrorKind::InvalidData, "{value}");
+        }
+    }
+
+    #[tokio::test]
+    async fn new_rejects_loopback_endpoint_before_credential_setup() {
+        let conf = TierGCS {
+            endpoint: "https://127.0.0.1:9000".to_string(),
+            creds: "not-json".to_string(),
+            bucket: "tier-bucket".to_string(),
+            ..Default::default()
+        };
+
+        match WarmBackendGCS::new(&conf, "tier").await {
+            Ok(_) => panic!("loopback endpoint should be rejected"),
+            Err(err) => assert!(err.to_string().contains("not allowed"), "unexpected error: {err}"),
         }
     }
 }

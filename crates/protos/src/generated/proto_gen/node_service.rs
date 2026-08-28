@@ -142,6 +142,10 @@ pub struct DeleteRequest {
     pub path: ::prost::alloc::string::String,
     #[prost(string, tag = "4")]
     pub options: ::prost::alloc::string::String,
+    /// Optional scanner publication lease token. When present, the target binds
+    /// the complete delete operation to its movement read admission.
+    #[prost(bytes = "bytes", tag = "5")]
+    pub scanner_publication_lease_token: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeleteResponse {
@@ -393,6 +397,11 @@ pub struct RenameDataRequest {
     pub dst_path: ::prost::alloc::string::String,
     #[prost(bytes = "bytes", tag = "7")]
     pub file_info_bin: ::prost::bytes::Bytes,
+    /// Optional target-side scanner publication lease.  Empty preserves the
+    /// legacy rename request body; a non-empty token is checked at the target's
+    /// rename linearization point.
+    #[prost(bytes = "bytes", tag = "8")]
+    pub scanner_publication_lease_token: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RenameDataResponse {
@@ -714,7 +723,7 @@ pub struct DeleteVersionsRequest {
     #[prost(bytes = "bytes", tag = "6")]
     pub opts_bin: ::prost::bytes::Bytes,
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DeleteVersionsResponse {
     #[prost(bool, tag = "1")]
     pub success: bool,
@@ -722,6 +731,10 @@ pub struct DeleteVersionsResponse {
     pub errors: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(message, optional, tag = "3")]
     pub error: ::core::option::Option<Error>,
+    /// Senders dual-write the legacy strings and typed entries. Receivers prefer typed entries
+    /// when present and fall back to strings for peers that predate this field. Code zero means success.
+    #[prost(message, repeated, tag = "4")]
+    pub item_errors: ::prost::alloc::vec::Vec<Error>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReadMultipleRequest {
@@ -832,6 +845,8 @@ pub struct LocalStorageInfoResponse {
     pub storage_info: ::prost::bytes::Bytes,
     #[prost(string, optional, tag = "3")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(enumeration = "ControlPlaneErrorCode", optional, tag = "4")]
+    pub error_code: ::core::option::Option<i32>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ServerInfoRequest {
@@ -1034,6 +1049,8 @@ pub struct LoadBucketMetadataResponse {
     pub success: bool,
     #[prost(string, optional, tag = "2")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(enumeration = "ControlPlaneErrorCode", optional, tag = "3")]
+    pub error_code: ::core::option::Option<i32>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeleteBucketMetadataRequest {
@@ -1058,6 +1075,8 @@ pub struct DeletePolicyResponse {
     pub success: bool,
     #[prost(string, optional, tag = "2")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(enumeration = "ControlPlaneErrorCode", optional, tag = "3")]
+    pub error_code: ::core::option::Option<i32>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct LoadPolicyRequest {
@@ -1070,6 +1089,8 @@ pub struct LoadPolicyResponse {
     pub success: bool,
     #[prost(string, optional, tag = "2")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(enumeration = "ControlPlaneErrorCode", optional, tag = "3")]
+    pub error_code: ::core::option::Option<i32>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct LoadPolicyMappingRequest {
@@ -1086,6 +1107,8 @@ pub struct LoadPolicyMappingResponse {
     pub success: bool,
     #[prost(string, optional, tag = "2")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(enumeration = "ControlPlaneErrorCode", optional, tag = "3")]
+    pub error_code: ::core::option::Option<i32>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeleteUserRequest {
@@ -1098,6 +1121,8 @@ pub struct DeleteUserResponse {
     pub success: bool,
     #[prost(string, optional, tag = "2")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(enumeration = "ControlPlaneErrorCode", optional, tag = "3")]
+    pub error_code: ::core::option::Option<i32>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeleteServiceAccountRequest {
@@ -1110,6 +1135,8 @@ pub struct DeleteServiceAccountResponse {
     pub success: bool,
     #[prost(string, optional, tag = "2")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(enumeration = "ControlPlaneErrorCode", optional, tag = "3")]
+    pub error_code: ::core::option::Option<i32>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct LoadUserRequest {
@@ -1124,6 +1151,8 @@ pub struct LoadUserResponse {
     pub success: bool,
     #[prost(string, optional, tag = "2")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(enumeration = "ControlPlaneErrorCode", optional, tag = "3")]
+    pub error_code: ::core::option::Option<i32>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct LoadServiceAccountRequest {
@@ -1136,6 +1165,8 @@ pub struct LoadServiceAccountResponse {
     pub success: bool,
     #[prost(string, optional, tag = "2")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(enumeration = "ControlPlaneErrorCode", optional, tag = "3")]
+    pub error_code: ::core::option::Option<i32>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct LoadGroupRequest {
@@ -1148,6 +1179,8 @@ pub struct LoadGroupResponse {
     pub success: bool,
     #[prost(string, optional, tag = "2")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(enumeration = "ControlPlaneErrorCode", optional, tag = "3")]
+    pub error_code: ::core::option::Option<i32>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReloadSiteReplicationConfigRequest {}
@@ -1157,6 +1190,8 @@ pub struct ReloadSiteReplicationConfigResponse {
     pub success: bool,
     #[prost(string, optional, tag = "2")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(enumeration = "ControlPlaneErrorCode", optional, tag = "3")]
+    pub error_code: ::core::option::Option<i32>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SignalServiceRequest {
@@ -1209,9 +1244,80 @@ pub struct ScannerActivityResponse {
     pub dirty_usage_generation: u64,
     #[prost(bool, tag = "9")]
     pub dirty_usage_pending: bool,
+    /// v7 fields.  They are optional so v6 peers can continue to decode the
+    /// response shape while newer readers fail closed when they are absent.
+    #[prost(uint64, optional, tag = "10")]
+    pub movement_generation: ::core::option::Option<u64>,
+    #[prost(bool, optional, tag = "11")]
+    pub publication_blocked: ::core::option::Option<bool>,
+}
+/// A short-lived storage-owned read admission used only around a final
+/// scanner metadata publication.  It is intentionally separate from the
+/// ScannerActivity observation wire so v6/v7 rolling compatibility remains
+/// unchanged.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ScannerPublicationLeaseRequest {
+    #[prost(bytes = "bytes", tag = "1")]
+    pub challenge: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "2")]
+    pub expected_movement_generation: u64,
+    #[prost(uint64, tag = "3")]
+    pub ttl_ms: u64,
+    /// The activity instance is a process session nonce.  It is intentionally
+    /// separate from the storage-owned deployment identity returned by the
+    /// lease response so a restart cannot reuse an old session token.
+    #[prost(string, tag = "4")]
+    pub expected_session_id: ::prost::alloc::string::String,
+    /// A non-empty token turns the acquire RPC into an in-place validation of an
+    /// existing lease.  Keeping this on the existing RPC lets old peers reject
+    /// the proof without changing the v7 activity wire shape.
+    #[prost(bytes = "bytes", tag = "5")]
+    pub token: ::prost::bytes::Bytes,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ScannerPublicationLeaseResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub token: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "3")]
+    pub movement_generation: u64,
+    #[prost(uint64, tag = "4")]
+    pub lease_ttl_ms: u64,
+    #[prost(message, optional, tag = "5")]
+    pub error: ::core::option::Option<Error>,
+    #[prost(bytes = "bytes", tag = "6")]
+    pub response_proof: ::prost::bytes::Bytes,
+    #[prost(string, tag = "7")]
+    pub owner_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "8")]
+    pub session_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ScannerPublicationLeaseReleaseRequest {
+    #[prost(bytes = "bytes", tag = "1")]
+    pub challenge: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub token: ::prost::bytes::Bytes,
+    #[prost(string, tag = "3")]
+    pub owner_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub session_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ScannerPublicationLeaseReleaseResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(message, optional, tag = "2")]
+    pub error: ::core::option::Option<Error>,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub response_proof: ::prost::bytes::Bytes,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct BackgroundHealStatusRequest {}
+pub struct BackgroundHealStatusRequest {
+    #[prost(uint32, tag = "1")]
+    pub protocol_version: u32,
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BackgroundHealStatusResponse {
     #[prost(bool, tag = "1")]
@@ -1220,6 +1326,21 @@ pub struct BackgroundHealStatusResponse {
     pub bg_heal_state: ::prost::bytes::Bytes,
     #[prost(string, optional, tag = "3")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(enumeration = "ControlPlaneErrorCode", optional, tag = "4")]
+    pub error_code: ::core::option::Option<i32>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReplacementRecoveryStatusRequest {}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReplacementRecoveryStatusResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub recovery_status: ::prost::bytes::Bytes,
+    #[prost(string, optional, tag = "3")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(enumeration = "ControlPlaneErrorCode", optional, tag = "4")]
+    pub error_code: ::core::option::Option<i32>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct HealControlRequest {
@@ -1277,6 +1398,8 @@ pub struct ReloadPoolMetaResponse {
     pub success: bool,
     #[prost(string, optional, tag = "2")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(enumeration = "ControlPlaneErrorCode", optional, tag = "3")]
+    pub error_code: ::core::option::Option<i32>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct StopRebalanceRequest {
@@ -1289,6 +1412,8 @@ pub struct StopRebalanceResponse {
     pub success: bool,
     #[prost(string, optional, tag = "2")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(enumeration = "ControlPlaneErrorCode", optional, tag = "3")]
+    pub error_code: ::core::option::Option<i32>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct LoadRebalanceMetaRequest {
@@ -1301,6 +1426,8 @@ pub struct LoadRebalanceMetaResponse {
     pub success: bool,
     #[prost(string, optional, tag = "2")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(enumeration = "ControlPlaneErrorCode", optional, tag = "3")]
+    pub error_code: ::core::option::Option<i32>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct StartDecommissionRequest {
@@ -1313,6 +1440,8 @@ pub struct StartDecommissionResponse {
     pub success: bool,
     #[prost(string, optional, tag = "2")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(enumeration = "ControlPlaneErrorCode", optional, tag = "3")]
+    pub error_code: ::core::option::Option<i32>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CancelDecommissionRequest {
@@ -1325,6 +1454,8 @@ pub struct CancelDecommissionResponse {
     pub success: bool,
     #[prost(string, optional, tag = "2")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(enumeration = "ControlPlaneErrorCode", optional, tag = "3")]
+    pub error_code: ::core::option::Option<i32>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ClearDecommissionRequest {
@@ -1337,6 +1468,8 @@ pub struct ClearDecommissionResponse {
     pub success: bool,
     #[prost(string, optional, tag = "2")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(enumeration = "ControlPlaneErrorCode", optional, tag = "3")]
+    pub error_code: ::core::option::Option<i32>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct LoadTransitionTierConfigRequest {}
@@ -1346,6 +1479,8 @@ pub struct LoadTransitionTierConfigResponse {
     pub success: bool,
     #[prost(string, optional, tag = "2")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(enumeration = "ControlPlaneErrorCode", optional, tag = "3")]
+    pub error_code: ::core::option::Option<i32>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TierMutationPrepareRequest {
@@ -1406,6 +1541,38 @@ pub struct GetLiveEventsResponse {
     pub truncated: bool,
     #[prost(string, optional, tag = "5")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// Typed control-plane error discriminants carried alongside the legacy
+/// error_info string on control-plane responses. Rolling-upgrade compat:
+/// old peers ignore the field and keep reading error_info.
+/// RUSTFS_COMPAT_TODO(not-initialized-error-code-v1): legacy string dual-write. Remove after the minimum supported RustFS peer version always sends error_code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ControlPlaneErrorCode {
+    ControlPlaneErrorUnspecified = 0,
+    /// The peer answered but its storage/IAM layer is not initialized yet
+    /// (legacy string form: "errServerNotInitialized").
+    ControlPlaneErrorNotInitialized = 1,
+}
+impl ControlPlaneErrorCode {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::ControlPlaneErrorUnspecified => "CONTROL_PLANE_ERROR_UNSPECIFIED",
+            Self::ControlPlaneErrorNotInitialized => "CONTROL_PLANE_ERROR_NOT_INITIALIZED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "CONTROL_PLANE_ERROR_UNSPECIFIED" => Some(Self::ControlPlaneErrorUnspecified),
+            "CONTROL_PLANE_ERROR_NOT_INITIALIZED" => Some(Self::ControlPlaneErrorNotInitialized),
+            _ => None,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -2677,6 +2844,36 @@ pub mod node_service_client {
                 .insert(GrpcMethod::new("node_service.NodeService", "ScannerActivity"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn acquire_scanner_publication_lease(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ScannerPublicationLeaseRequest>,
+        ) -> std::result::Result<tonic::Response<super::ScannerPublicationLeaseResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/AcquireScannerPublicationLease");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "AcquireScannerPublicationLease"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn release_scanner_publication_lease(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ScannerPublicationLeaseReleaseRequest>,
+        ) -> std::result::Result<tonic::Response<super::ScannerPublicationLeaseReleaseResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/ReleaseScannerPublicationLease");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "ReleaseScannerPublicationLease"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn background_heal_status(
             &mut self,
             request: impl tonic::IntoRequest<super::BackgroundHealStatusRequest>,
@@ -2690,6 +2887,21 @@ pub mod node_service_client {
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("node_service.NodeService", "BackgroundHealStatus"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn replacement_recovery_status(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ReplacementRecoveryStatusRequest>,
+        ) -> std::result::Result<tonic::Response<super::ReplacementRecoveryStatusResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/ReplacementRecoveryStatus");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "ReplacementRecoveryStatus"));
             self.inner.unary(req, path, codec).await
         }
         pub async fn get_metacache_listing(
@@ -3175,10 +3387,22 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::ScannerActivityRequest>,
         ) -> std::result::Result<tonic::Response<super::ScannerActivityResponse>, tonic::Status>;
+        async fn acquire_scanner_publication_lease(
+            &self,
+            request: tonic::Request<super::ScannerPublicationLeaseRequest>,
+        ) -> std::result::Result<tonic::Response<super::ScannerPublicationLeaseResponse>, tonic::Status>;
+        async fn release_scanner_publication_lease(
+            &self,
+            request: tonic::Request<super::ScannerPublicationLeaseReleaseRequest>,
+        ) -> std::result::Result<tonic::Response<super::ScannerPublicationLeaseReleaseResponse>, tonic::Status>;
         async fn background_heal_status(
             &self,
             request: tonic::Request<super::BackgroundHealStatusRequest>,
         ) -> std::result::Result<tonic::Response<super::BackgroundHealStatusResponse>, tonic::Status>;
+        async fn replacement_recovery_status(
+            &self,
+            request: tonic::Request<super::ReplacementRecoveryStatusRequest>,
+        ) -> std::result::Result<tonic::Response<super::ReplacementRecoveryStatusResponse>, tonic::Status>;
         async fn get_metacache_listing(
             &self,
             request: tonic::Request<super::GetMetacacheListingRequest>,
@@ -5451,6 +5675,67 @@ pub mod node_service_server {
                     };
                     Box::pin(fut)
                 }
+                "/node_service.NodeService/AcquireScannerPublicationLease" => {
+                    #[allow(non_camel_case_types)]
+                    struct AcquireScannerPublicationLeaseSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::ScannerPublicationLeaseRequest> for AcquireScannerPublicationLeaseSvc<T> {
+                        type Response = super::ScannerPublicationLeaseResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::ScannerPublicationLeaseRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::acquire_scanner_publication_lease(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = AcquireScannerPublicationLeaseSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/ReleaseScannerPublicationLease" => {
+                    #[allow(non_camel_case_types)]
+                    struct ReleaseScannerPublicationLeaseSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::ScannerPublicationLeaseReleaseRequest>
+                        for ReleaseScannerPublicationLeaseSvc<T>
+                    {
+                        type Response = super::ScannerPublicationLeaseReleaseResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ScannerPublicationLeaseReleaseRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::release_scanner_publication_lease(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ReleaseScannerPublicationLeaseSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
                 "/node_service.NodeService/BackgroundHealStatus" => {
                     #[allow(non_camel_case_types)]
                     struct BackgroundHealStatusSvc<T: NodeService>(pub Arc<T>);
@@ -5470,6 +5755,34 @@ pub mod node_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = BackgroundHealStatusSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/ReplacementRecoveryStatus" => {
+                    #[allow(non_camel_case_types)]
+                    struct ReplacementRecoveryStatusSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::ReplacementRecoveryStatusRequest> for ReplacementRecoveryStatusSvc<T> {
+                        type Response = super::ReplacementRecoveryStatusResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::ReplacementRecoveryStatusRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::replacement_recovery_status(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ReplacementRecoveryStatusSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)

@@ -13,7 +13,6 @@
 // limitations under the License.
 
 /// The metric name is the individual name of the metric
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetricName {
     // The generic metric name
@@ -233,6 +232,7 @@ pub enum MetricName {
     UsageVersionsCount,
     UsageDeleteMarkersCount,
     UsageBucketsCount,
+    UsageSnapshotConverged,
     UsageSizeDistribution,
     UsageVersionCountDistribution,
 
@@ -371,6 +371,8 @@ pub enum MetricName {
     DriveWaitingIO,
     DriveAPILatencyMicros,
     DriveHealth,
+    DriveWritesTotal,
+    DriveDeletesTotal,
 
     DriveOfflineCount,
     DriveOnlineCount,
@@ -442,7 +444,6 @@ pub enum MetricName {
 }
 
 impl MetricName {
-    #[allow(dead_code)]
     pub fn as_str(&self) -> String {
         match self {
             Self::AuthTotal => "auth_total".to_string(),
@@ -642,6 +643,7 @@ impl MetricName {
             Self::UsageVersionsCount => "versions_count".to_string(),
             Self::UsageDeleteMarkersCount => "delete_markers_count".to_string(),
             Self::UsageBucketsCount => "buckets_count".to_string(),
+            Self::UsageSnapshotConverged => "snapshot_converged".to_string(),
             Self::UsageSizeDistribution => "size_distribution".to_string(),
             Self::UsageVersionCountDistribution => "version_count_distribution".to_string(),
 
@@ -780,6 +782,8 @@ impl MetricName {
             Self::DriveWaitingIO => "waiting_io".to_string(),
             Self::DriveAPILatencyMicros => "api_latency_micros".to_string(),
             Self::DriveHealth => "health".to_string(),
+            Self::DriveWritesTotal => "writes_total".to_string(),
+            Self::DriveDeletesTotal => "deletes_total".to_string(),
 
             Self::DriveOfflineCount => "offline_count".to_string(),
             Self::DriveOnlineCount => "online_count".to_string(),

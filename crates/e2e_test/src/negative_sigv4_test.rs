@@ -34,10 +34,10 @@
 //! rejected header-SigV4 requests.
 
 use crate::common::{RustFSTestEnvironment, init_logging, local_http_client};
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::request_signature_v4::{SIGN_V4_ALGORITHM, get_scope, get_signature, get_signing_key};
-use serial_test::serial;
 use std::fmt::Write as _;
 use time::macros::format_description;
 use time::{Duration, OffsetDateTime};
@@ -183,7 +183,6 @@ async fn setup(env: &mut RustFSTestEnvironment) -> Result<(), Box<dyn std::error
 /// this, every negative assertion below could pass for the wrong reason (a
 /// broken signer that never produces a valid signature).
 #[tokio::test]
-#[serial]
 async fn valid_header_sigv4_request_succeeds() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;
@@ -214,7 +213,6 @@ async fn valid_header_sigv4_request_succeeds() -> Result<(), Box<dyn std::error:
 /// (a) Tampering the `Signature=` component must be rejected with
 /// SignatureDoesNotMatch / 403.
 #[tokio::test]
-#[serial]
 async fn tampered_signature_returns_signature_does_not_match() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;
@@ -254,7 +252,6 @@ async fn tampered_signature_returns_signature_does_not_match() -> Result<(), Box
 /// (b) A valid AccessKeyId paired with the wrong secret key must be rejected
 /// with SignatureDoesNotMatch / 403.
 #[tokio::test]
-#[serial]
 async fn wrong_secret_key_returns_signature_does_not_match() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;
@@ -279,13 +276,13 @@ async fn wrong_secret_key_returns_signature_does_not_match() -> Result<(), Box<d
 /// signature itself is valid (it covers the *declared* hash), so the server is
 /// forced to detect the payload/hash mismatch while streaming the body.
 #[tokio::test]
-#[serial]
 async fn tampered_payload_is_rejected() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;
     setup(&mut env).await?;
 
-    let path = format!("/{BUCKET}/tampered-payload.txt");
+    let key = "tampered-payload.txt";
+    let path = format!("/{BUCKET}/{key}");
     let claimed_body = b"the-body-i-claim-to-send";
     let actual_body = b"the-body-i-really-send!!";
     assert_eq!(claimed_body.len(), actual_body.len(), "keep content-length stable for the mismatch");
@@ -300,17 +297,82 @@ async fn tampered_payload_is_rejected() -> Result<(), Box<dyn std::error::Error 
         Ok(resp) => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            assert_ne!(status.as_u16(), 200, "payload mismatch must not succeed, body:\n{body}");
             assert!(
-                status.is_client_error() || status.is_server_error(),
-                "payload mismatch must be an error status, got {status}, body:\n{body}"
+                status.is_client_error(),
+                "payload mismatch must be rejected with a client error, got {status}, body:\n{body}"
             );
             info!(%status, "tampered payload rejected with error status");
         }
         // A mid-stream hash-mismatch abort surfacing as a transport error is
         // also a valid rejection (definitely not a 200 success).
-        Err(err) => info!(%err, "tampered payload rejected via transport error"),
+        Err(err) => {
+            assert!(!err.is_connect(), "connection failure is not proof of payload rejection: {err}");
+            assert!(!err.is_timeout(), "request timeout is not proof of payload rejection: {err}");
+            info!(%err, "tampered payload rejected via mid-stream transport error");
+        }
     }
+
+    let absent = env
+        .create_s3_client()
+        .get_object()
+        .bucket(BUCKET)
+        .key(key)
+        .send()
+        .await
+        .expect_err("a tampered payload must not publish an object");
+    assert_eq!(absent.raw_response().map(|response| response.status().as_u16()), Some(404));
+    assert_eq!(absent.as_service_error().and_then(ProvideErrorMetadata::code), Some("NoSuchKey"));
+    Ok(())
+}
+
+/// A signed UploadPart body must pass the same payload-hash gate as PutObject.
+/// Rejection must happen before the part is published into the multipart upload.
+#[tokio::test]
+async fn tampered_upload_part_payload_is_rejected() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    setup(&mut env).await?;
+
+    let key = "tampered-upload-part.bin";
+    let client = env.create_s3_client();
+    let upload = client.create_multipart_upload().bucket(BUCKET).key(key).send().await?;
+    let upload_id = upload.upload_id().ok_or("create multipart upload omitted upload_id")?;
+
+    let path = format!("/{BUCKET}/{key}");
+    let canonical_query = format!("partNumber=1&uploadId={}", urlencoding::encode(upload_id));
+    let request_target = format!("{path}?{canonical_query}");
+    let claimed_body = b"the-part-i-claim-to-send";
+    let actual_body = b"the-part-i-really-send!!";
+    assert_eq!(claimed_body.len(), actual_body.len(), "keep content-length stable for the mismatch");
+
+    let signer = SigV4::new(&env);
+    let headers = signer.sign("PUT", &path, &canonical_query, &sha256_hex(claimed_body));
+    let resp = send_signed(&env, reqwest::Method::PUT, &request_target, &headers, Some(actual_body.to_vec())).await?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "multipart payload mismatch must be rejected as BadDigest, body:\n{body}"
+    );
+    assert_error_code(&body, "BadDigest");
+
+    let parts = client
+        .list_parts()
+        .bucket(BUCKET)
+        .key(key)
+        .upload_id(upload_id)
+        .send()
+        .await?;
+    assert!(parts.parts().is_empty(), "a tampered UploadPart must not publish a part");
+
+    client
+        .abort_multipart_upload()
+        .bucket(BUCKET)
+        .key(key)
+        .upload_id(upload_id)
+        .send()
+        .await?;
     Ok(())
 }
 
@@ -320,7 +382,6 @@ async fn tampered_payload_is_rejected() -> Result<(), Box<dyn std::error::Error 
 /// x-amz-date both derive from the same skewed timestamp, so skew — not a
 /// signature mismatch — is the failure.
 #[tokio::test]
-#[serial]
 async fn skewed_date_returns_request_time_too_skewed() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;
@@ -344,7 +405,6 @@ async fn skewed_date_returns_request_time_too_skewed() -> Result<(), Box<dyn std
 /// structurally invalid SigV4 header that must be rejected before any
 /// credential/service handling.
 #[tokio::test]
-#[serial]
 async fn malformed_authorization_header_returns_clean_4xx() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;

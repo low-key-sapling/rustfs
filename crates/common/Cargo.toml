@@ -38,11 +38,8 @@ hotpath.workspace = true
 tokio = { workspace = true, features = ["fs", "rt-multi-thread"] }
 tonic = { workspace = true, features = ["gzip", "deflate"] }
 uuid = { workspace = true, features = ["v4", "fast-rng", "macro-diagnostics"] }
-chrono = { workspace = true, features = ["serde"] }
 metrics = { workspace = true }
-serde = { workspace = true, features = ["derive"] }
-rmp-serde = { workspace = true }
-s3s = { workspace = true, features = ["minio"] }
+smallvec = { workspace = true }
 tracing = { workspace = true }
 
 [lib]

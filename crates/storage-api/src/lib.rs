@@ -17,6 +17,26 @@
 pub const WALK_DIR_STREAM_COMPLETION_QUERY: &str = "walk_dir_stream_completion";
 pub const WALK_DIR_STREAM_COMPLETION_V1: &str = "error-v1";
 pub const WALK_DIR_BODY_SHA256_QUERY: &str = "walk_dir_body_sha256";
+pub const PUT_FILE_AUTH_QUERY: &str = "put_file_auth";
+pub const PUT_FILE_AUTH_V1: &str = "digest-trailer-v1";
+pub const PUT_FILE_NONCE_QUERY: &str = "put_file_nonce";
+pub const PUT_FILE_CAPABILITY_QUERY: &str = "put_file_capability";
+pub const PUT_FILE_CAPABILITY_CHALLENGE_QUERY: &str = "put_file_challenge";
+pub const PUT_FILE_CAPABILITY_VERSION: u16 = 1;
+pub const PUT_FILE_SERVER_EPOCH_QUERY: &str = "put_file_server_epoch";
+pub const PUT_FILE_AUTH_TRAILER_MAGIC: &[u8; 16] = b"RFS-PUT-AUTH-V1\0";
+pub const PUT_FILE_AUTH_TRAILER_DIGEST_LEN: usize = 64;
+pub const PUT_FILE_AUTH_TRAILER_MAC_LEN: usize = 32;
+pub const PUT_FILE_AUTH_TRAILER_LEN: usize =
+    PUT_FILE_AUTH_TRAILER_MAGIC.len() + PUT_FILE_AUTH_TRAILER_DIGEST_LEN + PUT_FILE_AUTH_TRAILER_MAC_LEN;
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PutFileCapabilityResponse {
+    pub version: u16,
+    pub server_epoch: uuid::Uuid,
+    pub proof: Vec<u8>,
+}
 pub const NS_SCANNER_BODY_SHA256_QUERY: &str = "ns_scanner_body_sha256";
 pub const NS_SCANNER_CAPABILITY_CHALLENGE_QUERY: &str = "ns_scanner_challenge";
 pub const NS_SCANNER_CYCLE_QUERY: &str = "ns_scanner_cycle";
@@ -26,10 +46,16 @@ pub const NS_SCANNER_SERVER_EPOCH_QUERY: &str = "ns_scanner_server_epoch";
 pub const NS_SCANNER_SESSION_ID_QUERY: &str = "ns_scanner_session_id";
 pub const NS_SCANNER_SESSION_SEQUENCE_QUERY: &str = "ns_scanner_session_sequence";
 pub const NS_SCANNER_PROTOCOL_VERSION_QUERY: &str = "ns_scanner_protocol";
+pub const NS_SCANNER_TIER_REGISTRY_GENERATION_QUERY: &str = "ns_scanner_tier_registry_generation";
 pub const NS_SCANNER_PROTOCOL_VERSION: u16 = 3;
 pub const SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION: u32 = 0;
 pub const SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION: u32 = 5;
-pub const SCANNER_ACTIVITY_PROTOCOL_VERSION: u32 = 6;
+/// Protocol v6 carries the activity fields that predate the storage-owned
+/// movement generation.  It remains readable during the rolling upgrade, but
+/// a scanner must not use it as a publication proof because terminal movement
+/// state is not authenticated by that version.
+pub const SCANNER_ACTIVITY_V6_PROTOCOL_VERSION: u32 = 6;
+pub const SCANNER_ACTIVITY_PROTOCOL_VERSION: u32 = 7;
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
@@ -37,6 +63,8 @@ pub struct NsScannerCapabilityResponse {
     pub version: u16,
     pub server_epoch: uuid::Uuid,
     pub proof: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_tier_registry_generation: Option<bool>,
 }
 
 pub mod admin;
@@ -51,10 +79,12 @@ pub mod topology;
 mod replication;
 
 pub use admin::{DiskSetSelector, StorageAdminApi};
+pub use bucket::BUCKET_LIFECYCLE_LOCK_OBJECT;
 pub use bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};
 pub use capability::{CapabilitySnapshotError, CapabilityState, CapabilityStatus};
 pub use error::{StorageErrorCode, StorageResult};
 pub use multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo};
+pub use object::DeleteAccounting;
 pub use object::ObjectLockDeleteOptions;
 pub use object::{DeletedObject, ObjectToDelete};
 pub use object::{ExpirationOptions, TransitionedObject};

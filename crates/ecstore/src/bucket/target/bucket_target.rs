@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::error::{Error, Result};
+use jiff::Timestamp;
 use rmp_serde::Serializer as rmpSerializer;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -31,8 +32,12 @@ pub struct Credentials {
     pub access_key: String,
     #[serde(rename = "secretKey")]
     pub secret_key: String,
+    // The aliases accept madmin's JSON tags (MinIO-written bucket-targets
+    // metadata and mc request bodies) without changing the snake_case
+    // persisted/peer wire format this struct serializes to.
+    #[serde(alias = "sessionToken")]
     pub session_token: Option<String>,
-    pub expiration: Option<chrono::DateTime<chrono::Utc>>,
+    pub expiration: Option<Timestamp>,
 }
 
 impl Credentials {
@@ -58,6 +63,10 @@ impl fmt::Debug for Credentials {
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
+#[allow(
+    dead_code,
+    reason = "MinIO-parity bucket-target service discriminator with no caller in this port (backlog#1823)"
+)]
 pub enum ServiceType {
     #[default]
     Replication,
@@ -93,6 +102,21 @@ mod duration_milliseconds {
     }
 }
 
+/// Defensive decode for the two integer wire encodings of these duration
+/// fields: RustFS persists (and legacy RustFS clients sent) plain seconds,
+/// while Go `time.Duration` JSON — madmin/mc requests and MinIO-written
+/// bucket-targets metadata — is nanoseconds. No meaningful interval lies
+/// between 10^7 seconds (~115 days) and 10^7 nanoseconds (10ms), so the
+/// magnitude disambiguates the unit.
+pub fn duration_from_secs_or_nanos(value: u64) -> Duration {
+    const NANOS_THRESHOLD: u64 = 10_000_000;
+    if value < NANOS_THRESHOLD {
+        Duration::from_secs(value)
+    } else {
+        Duration::from_nanos(value)
+    }
+}
+
 mod duration_seconds {
     use serde::{Deserialize, Deserializer, Serializer};
     use std::time::Duration;
@@ -108,8 +132,8 @@ mod duration_seconds {
     where
         D: Deserializer<'de>,
     {
-        let secs = u64::deserialize(deserializer)?;
-        Ok(Duration::from_secs(secs))
+        let value = u64::deserialize(deserializer)?;
+        Ok(super::duration_from_secs_or_nanos(value))
     }
 }
 
@@ -182,12 +206,14 @@ pub struct BucketTarget {
     #[serde(default)]
     pub region: String,
 
-    #[serde(alias = "bandwidth", default)]
+    // madmin-go v3.0.109 tags this `bandwidthlimit`; `bandwidth` is a legacy
+    // alias kept for inputs written before the madmin tag was verified.
+    #[serde(alias = "bandwidthlimit", alias = "bandwidth", default)]
     pub bandwidth_limit: i64,
 
     #[serde(rename = "replicationSync", default)]
     pub replication_sync: bool,
-    #[serde(default)]
+    #[serde(alias = "storageclass", default)]
     pub storage_class: String,
     #[serde(rename = "skipTlsVerify", default)]
     pub skip_tls_verify: bool,
@@ -200,7 +226,7 @@ pub struct BucketTarget {
 
     #[serde(rename = "resetBeforeDate", with = "time::serde::rfc3339::option", default)]
     pub reset_before_date: Option<OffsetDateTime>,
-    #[serde(default)]
+    #[serde(alias = "resetID", default)]
     pub reset_id: String,
     #[serde(rename = "totalDowntime", with = "duration_seconds", default)]
     pub total_downtime: Duration,
@@ -213,7 +239,7 @@ pub struct BucketTarget {
     #[serde(default)]
     pub latency: LatencyStat,
 
-    #[serde(default)]
+    #[serde(alias = "deploymentID", default)]
     pub deployment_id: String,
 
     #[serde(default)]
@@ -408,7 +434,11 @@ mod tests {
         assert_eq!(credentials.access_key, "test-access-key");
         assert_eq!(credentials.secret_key, "test-secret-key");
         assert_eq!(credentials.session_token, Some("test-session-token".to_string()));
-        assert!(credentials.expiration.is_some());
+        assert_eq!(
+            serde_json::to_value(credentials.expiration.expect("expiration should parse"))
+                .expect("expiration should serialize to JSON"),
+            serde_json::json!("2024-12-31T23:59:59Z")
+        );
 
         // Verify latency statistics
         assert_eq!(target.latency.curr, Duration::from_millis(100));
@@ -482,6 +512,108 @@ mod tests {
         assert_eq!(original.online, deserialized.online);
         assert_eq!(original.edge, deserialized.edge);
         assert_eq!(original.offline_count, deserialized.offline_count);
+    }
+
+    #[test]
+    fn bucket_target_reads_go_nanosecond_durations_defensively() {
+        // MinIO-written bucket-targets metadata and madmin clients encode
+        // these fields as Go `time.Duration` nanoseconds; RustFS has always
+        // persisted seconds. Both encodings must decode to the same interval.
+        let target: BucketTarget = serde_json::from_value(serde_json::json!({
+            "endpoint": "localhost:9000",
+            "targetbucket": "target",
+            "type": "replication",
+            "healthCheckDuration": 60_000_000_000u64,
+            "totalDowntime": 90_000_000_000u64
+        }))
+        .expect("nanosecond durations should deserialize");
+
+        assert_eq!(target.health_check_duration, Duration::from_secs(60));
+        assert_eq!(target.total_downtime, Duration::from_secs(90));
+
+        // The persisted wire format stays seconds for existing RustFS readers.
+        let value = serde_json::to_value(&target).expect("target should serialize");
+        assert_eq!(value["healthCheckDuration"], 60);
+        assert_eq!(value["totalDowntime"], 90);
+    }
+
+    #[test]
+    fn bucket_target_persisted_wire_keys_stay_snake_case() {
+        // bucket-targets.json (persisted via `serde_json::to_vec(&BucketTargets)`
+        // in the admin set/remove handlers) and the msgpack struct-map form
+        // (`BucketTargets::marshal_msg`) both come straight from this struct's
+        // serde field names. madmin naming is applied only in the admin
+        // response layer (`remote_target_admin_json`); renaming here would
+        // silently break every existing deployment's persisted metadata.
+        let targets = BucketTargets {
+            targets: vec![BucketTarget {
+                credentials: Some(Credentials {
+                    access_key: "ak".to_string(),
+                    secret_key: "sk".to_string(),
+                    session_token: Some("token".to_string()),
+                    expiration: None,
+                }),
+                bandwidth_limit: 5,
+                storage_class: "STANDARD".to_string(),
+                reset_id: "reset-1".to_string(),
+                deployment_id: "deploy-1".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        let json = serde_json::to_value(&targets).expect("targets should serialize to JSON");
+        let msgpack: serde_json::Value =
+            rmp_serde::from_slice(&targets.marshal_msg().expect("targets should marshal to msgpack"))
+                .expect("msgpack struct map should decode into a JSON value");
+
+        for (wire, entry) in [("JSON", &json["targets"][0]), ("msgpack", &msgpack["targets"][0])] {
+            assert_eq!(entry["bandwidth_limit"], 5, "{wire} key `bandwidth_limit` must stay");
+            assert_eq!(entry["storage_class"], "STANDARD", "{wire} key `storage_class` must stay");
+            assert_eq!(entry["reset_id"], "reset-1", "{wire} key `reset_id` must stay");
+            assert_eq!(entry["deployment_id"], "deploy-1", "{wire} key `deployment_id` must stay");
+            assert_eq!(entry["credentials"]["session_token"], "token", "{wire} key `session_token` must stay");
+        }
+    }
+
+    #[test]
+    fn minio_written_bucket_targets_json_populates_madmin_named_fields() {
+        // A MinIO-written bucket-targets.json carries madmin's JSON tags
+        // (`bandwidthlimit`, `storageclass`, `resetID`, `deploymentID`,
+        // `credentials.sessionToken` — madmin-go v3.0.109 bucket-targets.go).
+        // On migration these must land in the matching fields instead of
+        // silently defaulting (backlog#1951).
+        let targets: BucketTargets = serde_json::from_value(serde_json::json!({
+            "targets": [{
+                "sourcebucket": "src",
+                "endpoint": "minio.example:9000",
+                "credentials": {
+                    "accessKey": "ak",
+                    "secretKey": "sk",
+                    "sessionToken": "minio-session-token"
+                },
+                "targetbucket": "dst",
+                "type": "replication",
+                "replicationSync": true,
+                "bandwidthlimit": 107374182400i64,
+                "storageclass": "STANDARD",
+                "resetID": "reset-789",
+                "deploymentID": "deploy-123"
+            }]
+        }))
+        .expect("MinIO-written bucket-targets.json must deserialize");
+
+        let target = &targets.targets[0];
+        assert_eq!(target.bandwidth_limit, 107374182400);
+        assert_eq!(target.storage_class, "STANDARD");
+        assert_eq!(target.reset_id, "reset-789");
+        assert_eq!(target.deployment_id, "deploy-123");
+        assert_eq!(
+            target
+                .credentials
+                .as_ref()
+                .and_then(|credentials| credentials.session_token.as_deref()),
+            Some("minio-session-token")
+        );
     }
 
     #[test]
@@ -562,12 +694,15 @@ mod tests {
                 .and_then(|credentials| credentials.session_token.as_deref()),
             Some("legacy-session-token")
         );
-        assert!(
+        assert_eq!(
             target
                 .credentials
                 .as_ref()
                 .and_then(|credentials| credentials.expiration)
-                .is_some()
+                .map(serde_json::to_value)
+                .transpose()
+                .expect("expiration should serialize to JSON"),
+            Some(serde_json::json!("2024-12-31T23:59:59Z"))
         );
     }
 
@@ -609,7 +744,11 @@ mod tests {
             credentials.session_token,
             Some("AQoEXAMPLEH4aoAH0gNCAPyJxz4BlCFFxWNE1OPTgk5TthT".to_string())
         );
-        assert!(credentials.expiration.is_some());
+        assert_eq!(
+            serde_json::to_value(credentials.expiration.expect("expiration should parse"))
+                .expect("expiration should serialize to JSON"),
+            serde_json::json!("2024-12-31T23:59:59Z")
+        );
     }
 
     #[test]

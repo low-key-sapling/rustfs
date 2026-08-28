@@ -19,16 +19,26 @@
 //! here; the contract stays implemented `for SetDisks`, so its associated-type
 //! bounds are unchanged and helper access is via inherent calls.
 
-use super::super::*;
+use super::super::{
+    Arc, DiskError, DiskInfo, DiskInfoOptions, DiskOption, DiskStore, Endpoint, Error, FormatV3, HealChannelPriority, LockResult,
+    NamespaceLock, NamespaceLockWrapper, ObjectKey, Result, SetDisks, StorageError, debug, disk, info, load_format_erasure,
+    send_heal_disk, warn,
+};
+use crate::disk::DiskAPI;
 use crate::disk::health_state::DriveMembershipSnapshot;
+#[cfg(test)]
+use crate::disk::new_disk;
 use crate::runtime::sources as runtime_sources;
+use rand::prelude::SliceRandom;
+#[cfg(test)]
+use uuid::Uuid;
 
 #[async_trait::async_trait]
 impl crate::storage_api_contracts::namespace::NamespaceLocking for SetDisks {
     type Error = Error;
     type NamespaceLock = NamespaceLockWrapper;
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
         // Resolved from this set's own instance context (backlog#1052), not the
         // ambient facade: the facade tracks whichever context is currently
@@ -36,19 +46,23 @@ impl crate::storage_api_contracts::namespace::NamespaceLocking for SetDisks {
         // test's transient DistErasure window) would push this set's namespace
         // locking onto its own — possibly empty — dist locker list.
         let set_lock = if self.ctx.is_dist_erasure().await {
-            // Calculate quorum based on lockers count (majority)
-            let lockers_count = self.lockers.len();
+            let lockers = if self.lockers.len() == self.shared_lockers.len()
+                && self
+                    .lockers
+                    .iter()
+                    .zip(self.shared_lockers.iter())
+                    .all(|(current, shared)| Arc::ptr_eq(current, shared))
+            {
+                self.shared_lockers.clone()
+            } else {
+                Arc::from(self.lockers.clone())
+            };
+            // Calculate quorum from the exact client domain used by this lock.
+            let lockers_count = lockers.len();
             let write_quorum = if lockers_count > 1 { (lockers_count / 2) + 1 } else { 1 };
-            NamespaceLock::with_clients_and_quorum(
-                format!("set-{}-{}", self.pool_index, self.set_index),
-                self.lockers.clone(),
-                write_quorum,
-            )
+            NamespaceLock::with_clients_and_quorum_shared(self.set_lock_namespace.clone(), lockers, write_quorum)
         } else {
-            NamespaceLock::Local(LocalLock::new(
-                format!("set-{}-{}", self.pool_index, self.set_index),
-                self.local_lock_manager.clone(),
-            ))
+            NamespaceLock::with_local_manager_shared(self.set_lock_namespace.clone(), self.local_lock_manager.clone())
         };
 
         let resource = ObjectKey {
@@ -62,6 +76,7 @@ impl crate::storage_api_contracts::namespace::NamespaceLocking for SetDisks {
 }
 
 impl SetDisks {
+    #[allow(dead_code, reason = "lock diagnostics formatter with no caller in this port (backlog#1823)")]
     pub(in crate::set_disk) fn format_lock_error(&self, bucket: &str, object: &str, mode: &str, err: &LockResult) -> String {
         match err {
             LockResult::Timeout => {
@@ -75,6 +90,7 @@ impl SetDisks {
         }
     }
 
+    #[allow(dead_code, reason = "lock diagnostics formatter with no caller in this port (backlog#1823)")]
     pub(in crate::set_disk) fn format_lock_error_from_error(
         &self,
         bucket: &str,
@@ -139,6 +155,7 @@ impl SetDisks {
         disks
     }
 
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     pub(in crate::set_disk) async fn get_online_disks(&self) -> Vec<Option<DiskStore>> {
         let snapshot = self.drive_membership_snapshot().await;
         let mut disks = snapshot.strict_online_candidates().into_iter().map(Some).collect::<Vec<_>>();
@@ -149,6 +166,10 @@ impl SetDisks {
         disks
     }
 
+    #[allow(
+        dead_code,
+        reason = "local-only sibling of the test-covered get_online_disks; no caller in this port (backlog#1823)"
+    )]
     pub(in crate::set_disk) async fn get_online_local_disks(&self) -> Vec<Option<DiskStore>> {
         let snapshot = self.drive_membership_snapshot().await;
         let mut disks = snapshot
@@ -428,6 +449,10 @@ impl SetDisks {
         Ok((disk, fm))
     }
 
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity healing-disk accessor with no caller in this port (backlog#1823)"
+    )]
     pub(in crate::set_disk) async fn get_online_disk_with_healing(
         &self,
         incl_healing: bool,
@@ -436,6 +461,10 @@ impl SetDisks {
         Ok((new_disks, healing > 0))
     }
 
+    #[allow(
+        dead_code,
+        reason = "reached only from get_online_disk_with_healing, itself uncalled in this port (backlog#1823)"
+    )]
     pub(in crate::set_disk) async fn get_online_disk_with_healing_and_info(
         &self,
         incl_healing: bool,
@@ -903,10 +932,11 @@ mod tests {
 
         // The List family runs through the borrow handle with unchanged
         // behavior: delete_all reports success even when the prefix is absent.
-        ListOperations::new(set_disks.ctx())
-            .delete_all("nonexistent-bucket", "nonexistent-prefix")
-            .await
-            .expect("delete_all via borrow handle should succeed");
+        let (result, observed_disks) = ListOperations::new(set_disks.ctx())
+            .delete_all_observed("nonexistent-bucket", "nonexistent-prefix", None)
+            .await;
+        result.expect("delete_all via borrow handle should succeed");
+        assert_eq!(observed_disks.len(), disk_count);
         set_disks
             .delete_all("nonexistent-bucket", "nonexistent-prefix")
             .await

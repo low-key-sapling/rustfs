@@ -107,7 +107,7 @@ async fn drop_table(dsn: &str, table: &str) {
         .await;
 }
 
-#[ignore]
+#[ignore = "requires a live MySQL 8.0+/TiDB instance (see module docs for the container command)"]
 #[tokio::test]
 async fn direct_write_and_read() {
     let dsn = test_dsn();
@@ -122,16 +122,16 @@ async fn direct_write_and_read() {
 
     let pool = build_test_pool(&dsn);
     let mut conn = pool.get_conn().await.expect("get conn");
-    let rows: Vec<mysql_async::Row> = conn.query(format!("SELECT * FROM `{table}`")).await.expect("select");
+    let rows: Vec<mysql_async::Row> = conn.query(format!("SELECT event_data FROM `{table}`")).await.expect("select");
     assert_eq!(rows.len(), 1);
 
-    let data: String = mysql_async::from_value(rows[0].get(1).unwrap());
+    let data: String = mysql_async::from_value(rows[0].get(0).unwrap());
     assert!(data.contains("mybucket"), "event_data should contain bucket name, got: {data}");
 
     drop_table(&dsn, &table).await;
 }
 
-#[ignore]
+#[ignore = "requires a live MySQL 8.0+/TiDB instance (see module docs for the container command)"]
 #[tokio::test]
 async fn delete_appends_row_does_not_remove_old() {
     let dsn = test_dsn();
@@ -155,7 +155,7 @@ async fn delete_appends_row_does_not_remove_old() {
     drop_table(&dsn, &table).await;
 }
 
-#[ignore]
+#[ignore = "requires a live MySQL 8.0+/TiDB instance (see module docs for the container command)"]
 #[tokio::test]
 async fn queue_store_saves_entry_and_replays() {
     let dsn = test_dsn();
@@ -195,9 +195,9 @@ async fn queue_store_saves_entry_and_replays() {
     drop_table(&dsn, &table).await;
 }
 
-#[ignore]
+#[ignore = "requires a live MySQL 8.0+/TiDB instance (see module docs for the container command)"]
 #[tokio::test]
-async fn duplicate_replay_produces_duplicate_rows() {
+async fn duplicate_replay_is_idempotent() {
     let dsn = test_dsn();
     let table = table_name("test_dupe");
     let tmpdir = TempDir::new().expect("temp dir");
@@ -218,7 +218,7 @@ async fn duplicate_replay_produces_duplicate_rows() {
         let raw = store.get_raw(key).expect("get raw");
         let queued = QueuedPayload::decode(&raw).expect("decode");
 
-        // Replay twice: duplicate rows are expected (at-least-once)
+        // Replay twice: the stable queue key must make the insert idempotent.
         for _ in 0..2 {
             target
                 .send_raw_from_store(key.clone(), queued.body.clone(), queued.meta.clone())
@@ -231,12 +231,12 @@ async fn duplicate_replay_produces_duplicate_rows() {
     let pool = build_test_pool(&dsn);
     let mut conn = pool.get_conn().await.expect("get conn");
     let rows: Vec<mysql_async::Row> = conn.query(format!("SELECT * FROM `{table}`")).await.expect("select");
-    assert_eq!(rows.len(), 2, "duplicate replay should produce 2 rows");
+    assert_eq!(rows.len(), 1, "duplicate replay should produce one row");
 
     drop_table(&dsn, &table).await;
 }
 
-#[ignore]
+#[ignore = "requires a live MySQL 8.0+/TiDB instance (see module docs for the container command)"]
 #[tokio::test]
 async fn incompatible_schema_init_fails() {
     let dsn = test_dsn();
@@ -267,7 +267,7 @@ async fn incompatible_schema_init_fails() {
     drop_table(&dsn, &table).await;
 }
 
-#[ignore]
+#[ignore = "requires a live MySQL 8.0+/TiDB instance (see module docs for the container command)"]
 #[tokio::test]
 async fn check_mysql_server_available_succeeds_against_existing_table() {
     let dsn = test_dsn();

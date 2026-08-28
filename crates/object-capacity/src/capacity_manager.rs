@@ -14,25 +14,27 @@
 
 //! Hybrid Capacity Manager for efficient capacity statistics
 
-use super::scan::refresh_capacity_with_scope;
+use super::scan::{ScheduledCapacityRefresh, refresh_capacity_with_scope, select_scheduled_capacity_refresh};
 use super::types::CapacityDiskRef;
 use crate::capacity_scope::{CapacityScope, CapacityScopeDisk, drain_global_dirty_scopes, take_capacity_scope};
 use futures::FutureExt;
 use rustfs_config::{
     DEFAULT_CAPACITY_ENABLE_DYNAMIC_TIMEOUT, DEFAULT_CAPACITY_FOLLOW_SYMLINKS, DEFAULT_CAPACITY_MAX_TIMEOUT_SECS,
-    DEFAULT_CAPACITY_METRICS_INTERVAL_SECS, DEFAULT_CAPACITY_MIN_TIMEOUT_SECS, DEFAULT_FAST_UPDATE_THRESHOLD_SECS,
-    DEFAULT_MAX_FILES_THRESHOLD, DEFAULT_SAMPLE_RATE, DEFAULT_SCHEDULED_UPDATE_INTERVAL_SECS, DEFAULT_STAT_TIMEOUT_SECS,
-    DEFAULT_WRITE_FREQUENCY_THRESHOLD, DEFAULT_WRITE_TRIGGER_DELAY_SECS, ENV_CAPACITY_ENABLE_DYNAMIC_TIMEOUT,
+    DEFAULT_CAPACITY_METRICS_INTERVAL_SECS, DEFAULT_CAPACITY_MIN_TIMEOUT_SECS, DEFAULT_DRIVE_TIMEOUT_PROFILE,
+    DEFAULT_FAST_UPDATE_THRESHOLD_SECS, DEFAULT_MAX_FILES_THRESHOLD, DEFAULT_SAMPLE_RATE, DEFAULT_SCHEDULED_UPDATE_INTERVAL_SECS,
+    DEFAULT_STAT_TIMEOUT_SECS, DEFAULT_WRITE_FREQUENCY_THRESHOLD, DEFAULT_WRITE_TRIGGER_DELAY_SECS,
+    DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY, DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY_SECS, ENV_CAPACITY_ENABLE_DYNAMIC_TIMEOUT,
     ENV_CAPACITY_FAST_UPDATE_THRESHOLD, ENV_CAPACITY_FOLLOW_SYMLINKS, ENV_CAPACITY_MAX_FILES_THRESHOLD, ENV_CAPACITY_MAX_TIMEOUT,
     ENV_CAPACITY_METRICS_INTERVAL, ENV_CAPACITY_MIN_TIMEOUT, ENV_CAPACITY_SAMPLE_RATE, ENV_CAPACITY_SCHEDULED_INTERVAL,
     ENV_CAPACITY_STAT_TIMEOUT, ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD, ENV_CAPACITY_WRITE_TRIGGER_DELAY,
+    ENV_DRIVE_TIMEOUT_PROFILE,
 };
 use rustfs_io_metrics::capacity_metrics::{
     record_capacity_current_bytes, record_capacity_degraded_reading, record_capacity_dirty_disk_count,
     record_capacity_refresh_inflight, record_capacity_refresh_joiner, record_capacity_refresh_result,
     record_capacity_update_completed, record_capacity_update_failed, record_capacity_write_operation,
 };
-use rustfs_utils::{get_env_bool, get_env_u64, get_env_usize};
+use rustfs_utils::{get_env_bool, get_env_str, get_env_u64, get_env_usize};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
@@ -40,6 +42,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock, watch};
+use tokio::task::{JoinError, JoinSet};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 const LOG_COMPONENT_CAPACITY: &str = "capacity";
@@ -55,7 +59,7 @@ const EVENT_CAPACITY_REFRESH_CANCELLED: &str = "capacity_refresh_cancelled";
 const EVENT_CAPACITY_REFRESH_RUNTIME_SUMMARY: &str = "capacity_refresh_runtime_summary";
 const EVENT_CAPACITY_REFRESH_INTERVAL_CLAMPED: &str = "capacity_refresh_interval_clamped";
 const EVENT_CAPACITY_REFRESH_SCHEDULED: &str = "capacity_refresh_scheduled";
-const EVENT_CAPACITY_REFRESH_SKIPPED: &str = "capacity_refresh_skipped";
+const MAX_SCHEDULED_REFRESH_BACKOFF: Duration = Duration::from_secs(30 * 60);
 
 // ============================================================================
 // Configuration Functions
@@ -110,6 +114,15 @@ fn env_u64_at_least(env: &'static str, default: u64, min: u64) -> u64 {
     }
 }
 
+fn capacity_timeout_profile_default(default: u64) -> u64 {
+    let profile = get_env_str(ENV_DRIVE_TIMEOUT_PROFILE, DEFAULT_DRIVE_TIMEOUT_PROFILE);
+    if profile.trim().eq_ignore_ascii_case(DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY) {
+        DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY_SECS
+    } else {
+        default
+    }
+}
+
 impl CachedCapacityConfig {
     /// Build configuration from environment variables
     fn from_env() -> Self {
@@ -129,7 +142,11 @@ impl CachedCapacityConfig {
             )),
             max_files_threshold: env_u64_at_least(ENV_CAPACITY_MAX_FILES_THRESHOLD, DEFAULT_MAX_FILES_THRESHOLD as u64, 1)
                 as usize,
-            stat_timeout: Duration::from_secs(env_u64_at_least(ENV_CAPACITY_STAT_TIMEOUT, DEFAULT_STAT_TIMEOUT_SECS, 1)),
+            stat_timeout: Duration::from_secs(env_u64_at_least(
+                ENV_CAPACITY_STAT_TIMEOUT,
+                capacity_timeout_profile_default(DEFAULT_STAT_TIMEOUT_SECS),
+                1,
+            )),
             sample_rate: get_env_usize(ENV_CAPACITY_SAMPLE_RATE, DEFAULT_SAMPLE_RATE),
             metrics_interval: Duration::from_secs(get_env_u64(
                 ENV_CAPACITY_METRICS_INTERVAL,
@@ -138,7 +155,11 @@ impl CachedCapacityConfig {
             follow_symlinks: get_env_bool(ENV_CAPACITY_FOLLOW_SYMLINKS, DEFAULT_CAPACITY_FOLLOW_SYMLINKS),
             enable_dynamic_timeout: get_env_bool(ENV_CAPACITY_ENABLE_DYNAMIC_TIMEOUT, DEFAULT_CAPACITY_ENABLE_DYNAMIC_TIMEOUT),
             min_timeout: Duration::from_secs(env_u64_at_least(ENV_CAPACITY_MIN_TIMEOUT, DEFAULT_CAPACITY_MIN_TIMEOUT_SECS, 1)),
-            max_timeout: Duration::from_secs(env_u64_at_least(ENV_CAPACITY_MAX_TIMEOUT, DEFAULT_CAPACITY_MAX_TIMEOUT_SECS, 1)),
+            max_timeout: Duration::from_secs(env_u64_at_least(
+                ENV_CAPACITY_MAX_TIMEOUT,
+                capacity_timeout_profile_default(DEFAULT_CAPACITY_MAX_TIMEOUT_SECS),
+                1,
+            )),
         }
     }
 }
@@ -335,6 +356,8 @@ pub struct CapacityUpdate {
     /// `is_estimated` only reflects sampling; this flag is the only carrier of
     /// the "some disks failed to scan" fact (backlog#1014).
     pub degraded: bool,
+    /// Whether the scan reached its time budget and returned a fallback estimate.
+    pub timed_out: bool,
     /// Per-disk breakdown captured from a successful refresh.
     pub per_disk: Vec<DiskCapacityUpdate>,
     /// Expected disk count for a complete disk cache.
@@ -357,6 +380,7 @@ impl CapacityUpdate {
             file_count,
             is_estimated: false,
             degraded: false,
+            timed_out: false,
             per_disk: Vec::new(),
             expected_disk_count: None,
             replaces_disk_cache: false,
@@ -372,6 +396,7 @@ impl CapacityUpdate {
             file_count,
             is_estimated: true,
             degraded: false,
+            timed_out: false,
             per_disk: Vec::new(),
             expected_disk_count: None,
             replaces_disk_cache: false,
@@ -387,6 +412,7 @@ impl CapacityUpdate {
             file_count: 0,
             is_estimated: true,
             degraded: false,
+            timed_out: false,
             per_disk: Vec::new(),
             expected_disk_count: None,
             replaces_disk_cache: false,
@@ -420,7 +446,6 @@ pub enum DataSource {
     /// Write triggered
     WriteTriggered,
     /// Fallback value
-    #[allow(dead_code)]
     Fallback,
 }
 
@@ -596,7 +621,6 @@ impl WriteRecord {
 
 /// Hybrid strategy configuration
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct HybridStrategyConfig {
     /// Scheduled update interval
     pub scheduled_update_interval: Duration,
@@ -991,14 +1015,12 @@ impl HybridCapacityManager {
     }
 
     /// Get cache age
-    #[allow(dead_code)]
     pub async fn get_cache_age(&self) -> Option<Duration> {
         let cache = self.cache.read().await;
         cache.as_ref().map(|c| c.last_update.elapsed())
     }
 
     /// Get write frequency (writes/minute)
-    #[allow(dead_code)]
     pub async fn get_write_frequency(&self) -> usize {
         let record = &self.write_record;
         record.recent_write_count(record.monotonic_second())
@@ -1018,6 +1040,7 @@ impl HybridCapacityManager {
     /// remote or removed disks would otherwise stay marked forever and keep
     /// the dirty-disk gauge permanently non-zero (backlog#1020 S30).
     pub async fn retain_dirty_disks_within(&self, local: &HashSet<CapacityScopeDisk>) {
+        self.sync_global_dirty_scopes().await;
         let mut dirty_disks = self.dirty_disks.write().await;
         let before = dirty_disks.len();
         dirty_disks.retain(|disk, _| local.contains(disk));
@@ -1293,7 +1316,6 @@ pub fn get_capacity_manager() -> Arc<HybridCapacityManager> {
 ///     .update_capacity(CapacityUpdate::exact(1000, 0), DataSource::RealTime)
 ///     .await;
 /// ```
-#[allow(dead_code)]
 pub fn create_isolated_manager(config: HybridStrategyConfig) -> Arc<HybridCapacityManager> {
     Arc::new(HybridCapacityManager::new(config))
 }
@@ -1321,7 +1343,134 @@ fn clamp_background_interval(value: Duration, env_var: &'static str) -> Duration
     clamped
 }
 
+#[derive(Debug)]
+struct ScheduledRefreshBackoff {
+    base: Duration,
+    current: Duration,
+    max: Duration,
+}
+
+impl ScheduledRefreshBackoff {
+    fn new(base: Duration) -> Self {
+        Self {
+            base,
+            current: base,
+            max: base.max(MAX_SCHEDULED_REFRESH_BACKOFF),
+        }
+    }
+
+    fn delay(&self) -> Duration {
+        self.current
+    }
+
+    fn record_result(&mut self, clean: bool) {
+        self.current = if clean {
+            self.base
+        } else {
+            self.current.saturating_mul(2).min(self.max)
+        };
+    }
+}
+
+fn scheduled_refresh_was_clean(result: &Result<CapacityUpdate, String>) -> bool {
+    matches!(result, Ok(update) if !update.timed_out && !update.degraded)
+}
+
+async fn run_scheduled_refresh_loop<F, Fut>(refresh_interval: Duration, shutdown: CancellationToken, mut refresh: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let mut backoff = ScheduledRefreshBackoff::new(refresh_interval);
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            _ = tokio::time::sleep(backoff.delay()) => {}
+        }
+        // Widen the cross-thread cancellation window deterministically in tests.
+        #[cfg(test)]
+        tokio::task::yield_now().await;
+        if shutdown.is_cancelled() {
+            break;
+        }
+        backoff.record_result(refresh().await);
+    }
+}
+
+async fn run_scheduled_capacity_refresh(manager: Arc<HybridCapacityManager>, disks: Vec<CapacityDiskRef>) -> bool {
+    let start = Instant::now();
+    match select_scheduled_capacity_refresh(manager.as_ref(), &disks).await {
+        ScheduledCapacityRefresh::Idle => {
+            debug!(
+                event = EVENT_CAPACITY_REFRESH_SCHEDULED,
+                component = LOG_COMPONENT_CAPACITY,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                state = "skipped",
+                source = DataSource::Scheduled.as_metric_label(),
+                reason = "no_dirty_disks",
+                disk_count = disks.len(),
+                "capacity refresh scheduled"
+            );
+            true
+        }
+        ScheduledCapacityRefresh::Scan { disks, dirty_subset } => {
+            debug!(
+                event = EVENT_CAPACITY_REFRESH_SCHEDULED,
+                component = LOG_COMPONENT_CAPACITY,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                state = "started",
+                source = DataSource::Scheduled.as_metric_label(),
+                refresh_scope = if dirty_subset { "dirty_subset" } else { "full" },
+                disk_count = disks.len(),
+                enqueue_latency_ms = start.elapsed().as_millis() as u64,
+                "capacity refresh scheduled"
+            );
+            let result = manager
+                .refresh_or_join(DataSource::Scheduled, move || async move {
+                    refresh_capacity_with_scope(disks, dirty_subset).await
+                })
+                .await;
+            scheduled_refresh_was_clean(&result)
+        }
+    }
+}
+
+/// Owned capacity scheduler tasks for one server runtime.
+#[must_use = "capacity background tasks stop when their lifecycle handle is dropped"]
+pub struct CapacityBackgroundTasks {
+    shutdown: CancellationToken,
+    tasks: JoinSet<()>,
+}
+
+impl CapacityBackgroundTasks {
+    /// Leave the schedulers running without lifecycle ownership.
+    pub fn detach(mut self) {
+        self.tasks.detach_all();
+    }
+
+    /// Cancel the schedulers and wait for them and any active scheduled refresh.
+    pub async fn shutdown(mut self) -> Result<(), JoinError> {
+        self.shutdown.cancel();
+        let mut join_error = None;
+        while let Some(result) = self.tasks.join_next().await {
+            if let Err(err) = result
+                && join_error.is_none()
+            {
+                join_error = Some(err);
+            }
+        }
+        join_error.map_or(Ok(()), Err)
+    }
+}
+
+/// Start capacity refresh and metrics schedulers without lifecycle ownership.
 pub async fn start_background_task(disks: Vec<CapacityDiskRef>) {
+    start_background_tasks(disks).await.detach();
+}
+
+/// Start capacity refresh and metrics schedulers with lifecycle ownership.
+pub async fn start_background_tasks(disks: Vec<CapacityDiskRef>) -> CapacityBackgroundTasks {
     let manager = get_capacity_manager();
     let manager_for_refresh = manager.clone();
     let manager_for_metrics = manager.clone();
@@ -1331,56 +1480,31 @@ pub async fn start_background_task(disks: Vec<CapacityDiskRef>) {
     refresh_interval = clamp_background_interval(refresh_interval, ENV_CAPACITY_SCHEDULED_INTERVAL);
     metrics_interval = clamp_background_interval(metrics_interval, ENV_CAPACITY_METRICS_INTERVAL);
 
-    tokio::spawn(async move {
-        let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + refresh_interval, refresh_interval);
+    let shutdown = CancellationToken::new();
+    let refresh_shutdown = shutdown.clone();
+    let metrics_shutdown = shutdown.clone();
+    let mut tasks = JoinSet::new();
 
-        loop {
-            timer.tick().await;
-
-            let start = Instant::now();
-            let manager = manager_for_refresh.clone();
-            let disks = disks.clone();
-            let disk_count = disks.len();
-            let started = manager
-                .clone()
-                .spawn_refresh_if_needed(
-                    DataSource::Scheduled,
-                    move || async move { refresh_capacity_with_scope(disks, false).await },
-                )
-                .await;
-
-            if started {
-                debug!(
-                    event = EVENT_CAPACITY_REFRESH_SCHEDULED,
-                    component = LOG_COMPONENT_CAPACITY,
-                    subsystem = LOG_SUBSYSTEM_RUNTIME,
-                    state = "started",
-                    source = DataSource::Scheduled.as_metric_label(),
-                    disk_count,
-                    enqueue_latency_ms = start.elapsed().as_millis() as u64,
-                    "capacity refresh scheduled"
-                );
-            } else {
-                debug!(
-                    event = EVENT_CAPACITY_REFRESH_SKIPPED,
-                    component = LOG_COMPONENT_CAPACITY,
-                    subsystem = LOG_SUBSYSTEM_RUNTIME,
-                    state = "inflight",
-                    source = DataSource::Scheduled.as_metric_label(),
-                    disk_count,
-                    "capacity refresh skipped"
-                );
-            }
-        }
+    tasks.spawn(async move {
+        run_scheduled_refresh_loop(refresh_interval, refresh_shutdown, move || {
+            run_scheduled_capacity_refresh(manager_for_refresh.clone(), disks.clone())
+        })
+        .await;
     });
 
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + metrics_interval, metrics_interval);
         loop {
-            timer.tick().await;
+            tokio::select! {
+                biased;
+                _ = metrics_shutdown.cancelled() => break,
+                _ = timer.tick() => {}
+            }
             manager_for_metrics.log_runtime_summary().await;
         }
     });
+
+    CapacityBackgroundTasks { shutdown, tasks }
 }
 
 // ============================================================================
@@ -1392,13 +1516,184 @@ mod tests {
     use super::*;
     use crate::capacity_scope::{CapacityScope, CapacityScopeDisk, record_capacity_scope, record_global_dirty_scope};
     use rustfs_config::{
-        ENV_CAPACITY_FAST_UPDATE_THRESHOLD, ENV_CAPACITY_MAX_FILES_THRESHOLD, ENV_CAPACITY_METRICS_INTERVAL,
-        ENV_CAPACITY_SAMPLE_RATE, ENV_CAPACITY_STAT_TIMEOUT, ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD,
-        ENV_CAPACITY_WRITE_TRIGGER_DELAY,
+        DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY, ENV_CAPACITY_FAST_UPDATE_THRESHOLD, ENV_CAPACITY_MAX_FILES_THRESHOLD,
+        ENV_CAPACITY_MAX_TIMEOUT, ENV_CAPACITY_METRICS_INTERVAL, ENV_CAPACITY_MIN_TIMEOUT, ENV_CAPACITY_SAMPLE_RATE,
+        ENV_CAPACITY_STAT_TIMEOUT, ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD, ENV_CAPACITY_WRITE_TRIGGER_DELAY,
+        ENV_DRIVE_TIMEOUT_PROFILE,
     };
-    use serial_test::serial;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn test_scheduled_refresh_backoff_grows_caps_and_resets() {
+        let mut backoff = ScheduledRefreshBackoff::new(Duration::from_secs(120));
+        let cases = [
+            (false, 240),
+            (false, 480),
+            (false, 960),
+            (false, 1_800),
+            (false, 1_800),
+            (true, 120),
+        ];
+
+        assert_eq!(backoff.delay(), Duration::from_secs(120));
+        for (clean, expected_secs) in cases {
+            backoff.record_result(clean);
+            assert_eq!(backoff.delay(), Duration::from_secs(expected_secs));
+        }
+
+        let mut configured_above_cap = ScheduledRefreshBackoff::new(Duration::from_secs(3_600));
+        configured_above_cap.record_result(false);
+        assert_eq!(configured_above_cap.delay(), Duration::from_secs(3_600));
+    }
+
+    #[test]
+    fn test_scheduled_refresh_cleanliness_distinguishes_sampling_from_timeout() {
+        let exact = Ok(CapacityUpdate::exact(10, 1));
+        let sampled = Ok(CapacityUpdate::estimated(10, 1));
+        let mut timed_out = CapacityUpdate::estimated(10, 1);
+        timed_out.timed_out = true;
+        let mut degraded = CapacityUpdate::exact(10, 1);
+        degraded.degraded = true;
+
+        assert!(scheduled_refresh_was_clean(&exact));
+        assert!(scheduled_refresh_was_clean(&sampled));
+        assert!(!scheduled_refresh_was_clean(&Ok(timed_out)));
+        assert!(!scheduled_refresh_was_clean(&Ok(degraded)));
+        assert!(!scheduled_refresh_was_clean(&Err("scan failed".to_string())));
+    }
+
+    #[tokio::test]
+    async fn test_scheduled_capacity_refresh_skips_clean_cache_then_scans_dirty_disk() {
+        let temp_dir = tempfile::TempDir::new().expect("capacity test directory should be created");
+        std::fs::write(temp_dir.path().join("object.bin"), b"capacity-bytes").expect("capacity fixture should be written");
+        let disk = CapacityDiskRef {
+            endpoint: "node-a".to_string(),
+            drive_path: temp_dir.path().display().to_string(),
+        };
+        let manager = create_isolated_manager(HybridStrategyConfig::default());
+        manager
+            .update_capacity(CapacityUpdate::estimated(123, 1), DataSource::RealTime)
+            .await;
+
+        assert!(run_scheduled_capacity_refresh(manager.clone(), vec![disk.clone()]).await);
+        let cached = manager.get_capacity().await.expect("cached capacity should remain available");
+        assert_eq!(cached.total_used, 123);
+        assert_eq!(cached.source, DataSource::RealTime);
+
+        manager
+            .mark_dirty_scope(&CapacityScope {
+                disks: vec![CapacityScopeDisk {
+                    endpoint: disk.endpoint.clone(),
+                    drive_path: disk.drive_path.clone(),
+                }],
+            })
+            .await;
+
+        assert!(run_scheduled_capacity_refresh(manager.clone(), vec![disk]).await);
+        let cached = manager.get_capacity().await.expect("dirty refresh should update the cache");
+        assert_eq!(cached.source, DataSource::Scheduled);
+        assert!(manager.get_dirty_disks().await.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_scheduled_refresh_loop_applies_backoff_and_reset() {
+        use std::collections::VecDeque;
+        use std::sync::Mutex as StdMutex;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let results = Arc::new(StdMutex::new(VecDeque::from([false, false, true, true])));
+        let task_calls = calls.clone();
+        let task_results = results.clone();
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(run_scheduled_refresh_loop(Duration::from_secs(10), shutdown.clone(), move || {
+            let task_calls = task_calls.clone();
+            let task_results = task_results.clone();
+            async move {
+                task_calls.fetch_add(1, Ordering::SeqCst);
+                task_results
+                    .lock()
+                    .expect("scheduled result queue lock should succeed")
+                    .pop_front()
+                    .unwrap_or(true)
+            }
+        }));
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(Duration::from_secs(19)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        tokio::time::advance(Duration::from_secs(40)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+
+        shutdown.cancel();
+        task.await.expect("scheduled refresh loop should stop cleanly");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scheduled_refresh_shutdown_waits_for_active_refresh() {
+        let shutdown = CancellationToken::new();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut started_tx = Some(started_tx);
+        let mut release_rx = Some(release_rx);
+        let task_shutdown = shutdown.clone();
+        let task = tokio::spawn(run_scheduled_refresh_loop(Duration::from_secs(1), task_shutdown, move || {
+            let started_tx = started_tx.take().expect("test runs one refresh");
+            let release_rx = release_rx.take().expect("test runs one refresh");
+            async move {
+                started_tx.send(()).expect("test should observe refresh start");
+                release_rx.await.expect("test should release active refresh");
+                true
+            }
+        }));
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        started_rx.await.expect("scheduled refresh should start");
+        shutdown.cancel();
+        assert!(!task.is_finished());
+
+        release_tx.send(()).expect("active refresh should still be running");
+        task.await.expect("scheduled refresh loop should stop cleanly");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scheduled_refresh_shutdown_at_due_boundary_skips_refresh() {
+        let shutdown = CancellationToken::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let task_calls = calls.clone();
+        let task_shutdown = shutdown.clone();
+        let task = tokio::spawn(run_scheduled_refresh_loop(Duration::from_secs(1), task_shutdown, move || {
+            task_calls.fetch_add(1, Ordering::SeqCst);
+            async { true }
+        }));
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        shutdown.cancel();
+        task.await.expect("scheduled refresh loop should stop cleanly");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
 
     type ConfigGetterCase = (&'static str, fn() -> u64, u64, &'static str, u64);
 
@@ -1443,17 +1738,17 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_config_getter_defaults() {
-        for (env_var, getter, default, _, _) in config_getter_cases() {
-            temp_env::with_var(env_var, None::<&str>, || {
-                assert_eq!(getter(), default, "{env_var}: unexpected default value");
-            });
-        }
+        temp_env::with_var_unset(ENV_DRIVE_TIMEOUT_PROFILE, || {
+            for (env_var, getter, default, _, _) in config_getter_cases() {
+                temp_env::with_var(env_var, None::<&str>, || {
+                    assert_eq!(getter(), default, "{env_var}: unexpected default value");
+                });
+            }
+        });
     }
 
     #[test]
-    #[serial]
     fn test_config_getter_env_overrides() {
         for (env_var, getter, _, override_value, expected) in config_getter_cases() {
             temp_env::with_var(env_var, Some(override_value), || {
@@ -1463,7 +1758,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_zero_env_values_clamp_to_defaults() {
         // A zero threshold makes small disks report 0 bytes; a zero timeout
         // (with dynamic timeout off) makes every scan fail. Both must fall
@@ -1475,15 +1769,70 @@ mod tests {
             (ENV_CAPACITY_MIN_TIMEOUT, || get_min_timeout().as_secs(), 2),
             (ENV_CAPACITY_MAX_TIMEOUT, || get_max_timeout().as_secs(), 15),
         ];
-        for (env_var, getter, default) in zero_cases {
-            temp_env::with_var(env_var, Some("0"), || {
-                assert_eq!(getter(), default, "{env_var}: zero must clamp to default");
-            });
-        }
+        temp_env::with_var_unset(ENV_DRIVE_TIMEOUT_PROFILE, || {
+            for (env_var, getter, default) in zero_cases {
+                temp_env::with_var(env_var, Some("0"), || {
+                    assert_eq!(getter(), default, "{env_var}: zero must clamp to default");
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn capacity_timeouts_use_high_latency_drive_profile_defaults() {
+        temp_env::with_vars(
+            [
+                (ENV_DRIVE_TIMEOUT_PROFILE, Some(DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY)),
+                (ENV_CAPACITY_STAT_TIMEOUT, None),
+                (ENV_CAPACITY_MIN_TIMEOUT, None),
+                (ENV_CAPACITY_MAX_TIMEOUT, None),
+            ],
+            || {
+                let config = CachedCapacityConfig::from_env();
+                assert_eq!(config.stat_timeout, Duration::from_secs(60));
+                assert_eq!(config.min_timeout, Duration::from_secs(2));
+                assert_eq!(config.max_timeout, Duration::from_secs(60));
+            },
+        );
+    }
+
+    #[test]
+    fn explicit_capacity_timeouts_override_high_latency_drive_profile() {
+        temp_env::with_vars(
+            [
+                (ENV_DRIVE_TIMEOUT_PROFILE, Some(DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY)),
+                (ENV_CAPACITY_STAT_TIMEOUT, Some("7")),
+                (ENV_CAPACITY_MIN_TIMEOUT, Some("4")),
+                (ENV_CAPACITY_MAX_TIMEOUT, Some("11")),
+            ],
+            || {
+                let config = CachedCapacityConfig::from_env();
+                assert_eq!(config.stat_timeout, Duration::from_secs(7));
+                assert_eq!(config.min_timeout, Duration::from_secs(4));
+                assert_eq!(config.max_timeout, Duration::from_secs(11));
+            },
+        );
+    }
+
+    #[test]
+    fn invalid_drive_profile_preserves_capacity_defaults() {
+        temp_env::with_vars(
+            [
+                (ENV_DRIVE_TIMEOUT_PROFILE, Some("invalid")),
+                (ENV_CAPACITY_STAT_TIMEOUT, None),
+                (ENV_CAPACITY_MIN_TIMEOUT, None),
+                (ENV_CAPACITY_MAX_TIMEOUT, None),
+            ],
+            || {
+                let config = CachedCapacityConfig::from_env();
+                assert_eq!(config.stat_timeout, Duration::from_secs(DEFAULT_STAT_TIMEOUT_SECS));
+                assert_eq!(config.min_timeout, Duration::from_secs(DEFAULT_CAPACITY_MIN_TIMEOUT_SECS));
+                assert_eq!(config.max_timeout, Duration::from_secs(DEFAULT_CAPACITY_MAX_TIMEOUT_SECS));
+            },
+        );
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_update_capacity_preserves_retrieval_metadata() {
         let manager = HybridCapacityManager::from_env();
 
@@ -1499,7 +1848,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_record_write_operation() {
         let manager = HybridCapacityManager::from_env();
 
@@ -1510,7 +1858,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_write_frequency_window() {
         let manager = HybridCapacityManager::from_env();
 
@@ -1541,8 +1888,63 @@ mod tests {
         let _ = tokio::time::Instant::now() + MAX_BACKGROUND_INTERVAL;
     }
 
+    #[tokio::test]
+    async fn background_tasks_shutdown_cancels_and_joins_schedulers() {
+        let tasks = start_background_tasks(Vec::new()).await;
+
+        tokio::time::timeout(Duration::from_secs(1), tasks.shutdown())
+            .await
+            .expect("capacity background tasks should stop promptly")
+            .expect("capacity background tasks should join cleanly");
+    }
+
+    #[tokio::test]
+    async fn background_tasks_shutdown_joins_remaining_tasks_after_failure() {
+        let shutdown = CancellationToken::new();
+        let mut tasks = JoinSet::new();
+        let failed_task = tasks.spawn(async { panic!("expected scheduler failure") });
+        while !failed_task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+
+        let task_shutdown = shutdown.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        tasks.spawn(async move {
+            task_shutdown.cancelled().await;
+            ready_tx.send(()).expect("test should observe scheduler cancellation");
+            release_rx.await.expect("test should release scheduler shutdown");
+        });
+        let release_task = tokio::spawn(async move {
+            ready_rx.await.expect("scheduler should observe cancellation");
+            release_tx.send(()).expect("scheduler should still be joinable");
+        });
+
+        let background_tasks = CapacityBackgroundTasks { shutdown, tasks };
+        assert!(background_tasks.shutdown().await.is_err());
+        release_task.await.expect("scheduler release task should join");
+    }
+
+    #[tokio::test]
+    async fn background_tasks_detach_keeps_schedulers_running() {
+        let shutdown = CancellationToken::new();
+        let mut tasks = JoinSet::new();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        tasks.spawn(async move {
+            ready_tx.send(()).expect("test should observe scheduler start");
+            release_rx.await.expect("test should release detached scheduler");
+            completed_tx.send(()).expect("test should observe scheduler completion");
+        });
+
+        CapacityBackgroundTasks { shutdown, tasks }.detach();
+        ready_rx.await.expect("detached scheduler should start");
+        release_tx.send(()).expect("detached scheduler should still be running");
+        completed_rx.await.expect("detached scheduler should complete");
+    }
+
     #[test]
-    #[serial]
     fn test_recent_write_count_ignores_future_buckets() {
         let record = WriteRecord::new();
         record.write_buckets[0].store(120, 3);
@@ -1556,7 +1958,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_needs_fast_update() {
         let manager = HybridCapacityManager::from_env();
 
@@ -1573,7 +1974,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_cache_age_tracking() {
         let manager = HybridCapacityManager::from_env();
 
@@ -1593,7 +1993,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_data_source_tracking() {
         let manager = HybridCapacityManager::from_env();
 
@@ -1609,7 +2008,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_needs_fast_update_waits_for_write_trigger_delay() {
         let manager = create_isolated_manager(HybridStrategyConfig {
             scheduled_update_interval: Duration::from_secs(60),
@@ -1640,7 +2038,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_needs_fast_update_respects_enable_write_trigger() {
         let manager = create_isolated_manager(HybridStrategyConfig {
             scheduled_update_interval: Duration::from_secs(60),
@@ -1667,7 +2064,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_concurrent_access() {
         let manager = Arc::new(HybridCapacityManager::from_env());
         let mut handles = Vec::new();
@@ -1694,7 +2090,6 @@ mod tests {
     // exact under heavy same-second contention or the frequency window (and the
     // write-trigger decision) would undercount.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    #[serial]
     async fn test_record_write_operation_lock_free_is_exact_under_contention() {
         let manager = Arc::new(HybridCapacityManager::from_env());
         let mut handles = Vec::new();
@@ -1719,7 +2114,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_performance_overhead() {
         let manager = Arc::new(HybridCapacityManager::from_env());
         let start = Instant::now();
@@ -1736,7 +2130,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_refresh_or_join_singleflight() {
         let manager = Arc::new(HybridCapacityManager::from_env());
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1776,7 +2169,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_refresh_or_join_recovers_after_leader_cancellation() {
         let manager = Arc::new(HybridCapacityManager::from_env());
 
@@ -1805,7 +2197,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_refresh_or_join_cancelled_leader_unblocks_joiner() {
         let manager = Arc::new(HybridCapacityManager::from_env());
 
@@ -1833,7 +2224,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_spawn_refresh_if_needed_deduplicates_background_refresh() {
         let manager = Arc::new(HybridCapacityManager::from_env());
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1871,7 +2261,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_record_write_operation_with_scope_token_marks_dirty_disks() {
         let manager = create_isolated_manager(HybridStrategyConfig::default());
         let token = uuid::Uuid::new_v4();
@@ -1895,7 +2284,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_get_dirty_disks_drains_global_dirty_scope_registry() {
         let manager = create_isolated_manager(HybridStrategyConfig::default());
         record_global_dirty_scope(CapacityScope {
@@ -1915,7 +2303,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_update_capacity_recomputes_total_from_disk_cache_for_subset_refresh() {
         let manager = create_isolated_manager(HybridStrategyConfig::default());
 
@@ -1926,6 +2313,7 @@ mod tests {
                     file_count: 3,
                     is_estimated: false,
                     degraded: false,
+                    timed_out: false,
                     per_disk: vec![
                         DiskCapacityUpdate {
                             disk: CapacityScopeDisk {
@@ -1962,6 +2350,7 @@ mod tests {
                     file_count: 1,
                     is_estimated: true,
                     degraded: false,
+                    timed_out: false,
                     per_disk: vec![DiskCapacityUpdate {
                         disk: CapacityScopeDisk {
                             endpoint: "node-a".to_string(),
@@ -2011,6 +2400,7 @@ mod tests {
             file_count: 2,
             is_estimated: false,
             degraded: false,
+            timed_out: false,
             per_disk: vec![
                 disk_entry("node-a", "/tmp/disk-a", 100, 1),
                 disk_entry("node-b", "/tmp/disk-b", 100, 1),
@@ -2023,7 +2413,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_update_capacity_degraded_full_refresh_merges_cache_and_does_not_oscillate() {
         let manager = create_isolated_manager(HybridStrategyConfig::default());
 
@@ -2039,6 +2428,7 @@ mod tests {
                     file_count: 1,
                     is_estimated: false,
                     degraded: true,
+                    timed_out: false,
                     per_disk: vec![disk_entry("node-a", "/tmp/disk-a", 100, 1)],
                     expected_disk_count: None,
                     replaces_disk_cache: false,
@@ -2068,7 +2458,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_update_capacity_degraded_with_empty_per_disk_serves_merged_cache() {
         let manager = create_isolated_manager(HybridStrategyConfig::default());
         manager.update_capacity(full_two_disk_update(), DataSource::RealTime).await;
@@ -2082,6 +2471,7 @@ mod tests {
                     file_count: 1,
                     is_estimated: false,
                     degraded: true,
+                    timed_out: false,
                     per_disk: Vec::new(),
                     expected_disk_count: None,
                     replaces_disk_cache: false,
@@ -2097,7 +2487,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_update_capacity_degraded_without_complete_cache_keeps_partial_sum() {
         let manager = create_isolated_manager(HybridStrategyConfig::default());
 
@@ -2111,6 +2500,7 @@ mod tests {
                     file_count: 1,
                     is_estimated: false,
                     degraded: true,
+                    timed_out: false,
                     per_disk: vec![disk_entry("node-a", "/tmp/disk-a", 100, 1)],
                     expected_disk_count: None,
                     replaces_disk_cache: false,
@@ -2137,7 +2527,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_commit_keeps_dirty_marks_recorded_after_scan_start() {
         let manager = create_isolated_manager(HybridStrategyConfig::default());
         let disk = scope_disk("node-a", "/tmp/disk-a");
@@ -2168,7 +2557,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_commit_clears_dirty_marks_recorded_before_scan_start() {
         let manager = create_isolated_manager(HybridStrategyConfig::default());
         let disk = scope_disk("node-a", "/tmp/disk-a");
@@ -2189,7 +2577,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_retain_dirty_disks_within_drops_ghost_entries() {
         let manager = create_isolated_manager(HybridStrategyConfig::default());
         let local = scope_disk("node-a", "/tmp/disk-a");
@@ -2208,7 +2595,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_spawn_refresh_recovers_from_construction_panic() {
         let manager = create_isolated_manager(HybridStrategyConfig::default());
 
@@ -2275,7 +2661,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    #[serial]
     async fn test_refresh_or_join_joiner_times_out_when_leader_wedges() {
         let manager = create_isolated_manager(HybridStrategyConfig::default());
 
@@ -2303,7 +2688,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_refresh_or_join_returns_cluster_total_for_dirty_subset() {
         let manager = create_isolated_manager(HybridStrategyConfig::default());
 
@@ -2315,6 +2699,7 @@ mod tests {
                     file_count: 3,
                     is_estimated: false,
                     degraded: false,
+                    timed_out: false,
                     per_disk: vec![
                         DiskCapacityUpdate {
                             disk: CapacityScopeDisk {
@@ -2350,6 +2735,7 @@ mod tests {
             file_count: 1,
             is_estimated: true,
             degraded: false,
+            timed_out: false,
             per_disk: vec![DiskCapacityUpdate {
                 disk: CapacityScopeDisk {
                     endpoint: "node-a".to_string(),
@@ -2383,7 +2769,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_config_from_env() {
         let config = HybridStrategyConfig::from_env();
 
@@ -2397,7 +2782,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_config_from_env_with_override() {
         temp_env::with_var(ENV_CAPACITY_SCHEDULED_INTERVAL, Some("600"), || {
             let config = HybridStrategyConfig::from_env();

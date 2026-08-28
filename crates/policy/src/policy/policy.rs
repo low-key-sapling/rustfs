@@ -195,7 +195,8 @@ pub struct BucketPolicyArgs<'a> {
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct BucketPolicy {
-    #[serde(default, rename = "Id", skip_serializing_if = "ID::is_empty")]
+    // RUSTFS_COMPAT_TODO(rustfs-6339): accept bucket policies persisted with the legacy "ID" key. Remove after migration tooling rewrites every retained legacy bucket policy.
+    #[serde(default, rename = "Id", alias = "ID", skip_serializing_if = "ID::is_empty")]
     pub id: ID,
     #[serde(rename = "Version")]
     pub version: String,
@@ -853,13 +854,14 @@ mod test {
 
     /// Actions that act on the service or on every key's material at once. No role
     /// template may confer them.
-    const KMS_CLUSTER_ADMIN_ACTIONS: [KmsAction; 6] = [
+    const KMS_CLUSTER_ADMIN_ACTIONS: [KmsAction; 7] = [
         KmsAction::AllActions,
         KmsAction::ConfigureAction,
         KmsAction::ServiceControlAction,
         KmsAction::ClearCacheAction,
         KmsAction::BackupAction,
         KmsAction::RestoreAction,
+        KmsAction::RekeyAction,
     ];
 
     const KMS_ROLE_TEMPLATES: [&str; 3] = [default::KMS_KEY_ADMINISTRATOR, default::KMS_KEY_USER, default::KMS_AUDITOR];
@@ -2136,6 +2138,87 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_kms_bundle_actions_require_an_unscoped_statement() -> Result<()> {
+        use crate::policy::action::{Action, KmsAction};
+
+        let scoped = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:*"],
+      "Resource": ["arn:aws:kms:::key/key-a"]
+    }
+  ]
+}"#,
+        )?;
+        let unscoped = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:Backup", "kms:Restore"]
+    }
+  ]
+}"#,
+        )?;
+        let partially_scoped = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:Backup", "kms:Restore"],
+      "NotResource": ["arn:aws:kms:::key/protected"]
+    }
+  ]
+}"#,
+        )?;
+        let scoped_deny = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["kms:Backup", "kms:Restore"]
+    },
+    {
+      "Effect": "Deny",
+      "Action": ["kms:Backup", "kms:Restore"],
+      "Resource": ["arn:aws:kms:::key/protected"]
+    }
+  ]
+}"#,
+        )?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+
+        for action in [KmsAction::BackupAction, KmsAction::RestoreAction] {
+            let args = kms_args(Action::KmsAction(action), "", &conditions, &claims);
+            assert!(
+                !scoped.is_allowed(&args).await,
+                "a single-key grant must not authorize the all-key {action:?} operation"
+            );
+            assert!(
+                !partially_scoped.is_allowed(&args).await,
+                "a grant excluding one key must not authorize the all-key {action:?} operation"
+            );
+            assert!(
+                unscoped.is_allowed(&args).await,
+                "an action-only grant must continue authorizing {action:?}"
+            );
+            assert!(
+                !scoped_deny.is_allowed(&args).await,
+                "a deny for included key material must block the all-key {action:?} operation"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_kms_statement_without_resource_matches_every_key() -> Result<()> {
         use crate::policy::action::{Action, KmsAction};
 
@@ -2705,7 +2788,7 @@ mod test {
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("Should parse");
 
         // Verify empty fields are omitted
-        assert!(!parsed.as_object().unwrap().contains_key("ID"), "Empty ID should be omitted");
+        assert!(parsed.get("Id").is_none(), "Empty ID should be omitted");
 
         let statement = &parsed["Statement"][0];
         assert!(!statement.as_object().unwrap().contains_key("Sid"), "Empty Sid should be omitted");
@@ -2726,6 +2809,43 @@ mod test {
         assert_eq!(parsed["Version"], "2012-10-17");
         assert_eq!(statement["Effect"], "Allow");
         assert_eq!(statement["Principal"]["AWS"], "*");
+    }
+
+    #[test]
+    fn test_bucket_policy_deserializes_legacy_id() {
+        let legacy_policy = br#"{"ID":"","Version":"2012-10-17","Statement":[{"Sid":"","Effect":"Allow","Principal":{"AWS":["*"]},"Action":["s3:GetObject"],"NotAction":[],"Resource":["arn:aws:s3:::bucket/*"],"NotResource":[],"Condition":{}}]}"#;
+
+        let policy: BucketPolicy =
+            serde_json::from_slice(legacy_policy).expect("bucket policy with legacy ID should deserialize");
+        assert!(policy.id.is_empty());
+        policy.is_valid().expect("legacy bucket policy should remain valid");
+
+        let policy: BucketPolicy = serde_json::from_str(r#"{"ID":"legacy-policy","Version":"2012-10-17","Statement":[]}"#)
+            .expect("non-empty legacy ID should deserialize");
+        assert_eq!(policy.id.0, "legacy-policy");
+
+        let serialized = serde_json::to_value(&policy).expect("bucket policy should serialize");
+        assert_eq!(serialized["Id"], "legacy-policy");
+        assert!(serialized.get("ID").is_none(), "legacy ID spelling should not be serialized");
+    }
+
+    #[test]
+    fn test_bucket_policy_legacy_id_alias_remains_strict() {
+        let unknown_field = r#"{"Version":"2012-10-17","Statement":[],"Unexpected":true}"#;
+        let error =
+            serde_json::from_str::<BucketPolicy>(unknown_field).expect_err("unrelated unknown fields should remain rejected");
+        assert!(
+            error.to_string().contains("unknown field `Unexpected`"),
+            "unexpected deserialization error: {error}"
+        );
+
+        let duplicate_id = r#"{"Id":"current-policy","ID":"legacy-policy","Version":"2012-10-17","Statement":[]}"#;
+        let error = serde_json::from_str::<BucketPolicy>(duplicate_id)
+            .expect_err("canonical and legacy ID fields should not be accepted together");
+        assert!(
+            error.to_string().contains("duplicate field `Id`"),
+            "unexpected deserialization error: {error}"
+        );
     }
 
     #[test]

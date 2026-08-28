@@ -140,6 +140,14 @@ done
 latest_guard="startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')"
 require_job_if "$build_workflow" "update-latest-version" "    if: $latest_guard"
 require_line "$build_workflow" "    needs: [ build-check, publish-release ]" "latest update must follow release publication"
+
+# Preview releases are internal validation artifacts: once the deliverable
+# release is published they are deleted, while their tags stay behind.
+require_job_if "$build_workflow" "cleanup-preview-releases" "    if: $latest_guard"
+require_line "$build_workflow" "            gh release delete \"\$preview_tag\" --yes" "preview release cleanup after publication"
+require_line "$build_workflow" "              | select(.tag_name | startswith(\$tag + \"-preview.\"))" "cleanup must match the target's own preview tags"
+require_line "$build_workflow" "              | select(.tag_name | ltrimstr(\$tag + \"-preview.\") | test(\"^[0-9]+\$\"))" "cleanup must match a numeric preview iteration"
+require_absent "$build_workflow" "--cleanup-tag" "preview tags must survive their release cleanup"
 require_line "$build_workflow" "          TARGET_COMMITISH=\$(git rev-parse --verify \"refs/tags/\${TAG}^{commit}\")" "release target commit resolution"
 require_line "$build_workflow" "          ./scripts/release/create_or_update_release.sh \\" "managed release creation"
 require_absent "$build_workflow" "git tag -l --format='%(contents)'" "annotated tag messages must not become release notes"
@@ -195,6 +203,13 @@ IFS= read -r -d '' expected_docker_automatic_guard <<'EOF' || true
 EOF
 expected_docker_automatic_guard=${expected_docker_automatic_guard%$'\n'}
 require_job_if "$docker_workflow" "build-check" "$expected_docker_automatic_guard"
+require_line "$docker_workflow" '      source_ref: ${{ steps.check.outputs.source_ref }}' "Docker source ref output"
+require_line "$docker_workflow" '            source_ref="$HEAD_SHA"' "automatic Docker source ref"
+require_line "$docker_workflow" '              source_ref="$tag_ref"' "manual Docker source ref"
+require_line "$docker_workflow" '          ref: ${{ needs.build-check.outputs.source_ref }}' "Docker release source checkout"
+require_line "$docker_workflow" '          SOURCE_REVISION="$(git rev-parse HEAD)"' "Docker source revision resolution"
+require_line "$docker_workflow" '          LABELS="$LABELS,org.opencontainers.image.revision=$SOURCE_REVISION"' "Docker revision label"
+require_absent "$docker_workflow" 'org.opencontainers.image.revision=${{ github.sha }}' "Docker revision must not use the workflow branch SHA"
 
 docker_manual_guard=$(awk '
   $0 == "              *-preview*)" { in_preview = 1 }

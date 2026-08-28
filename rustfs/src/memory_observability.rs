@@ -17,23 +17,23 @@ use rustfs_io_metrics::{
     record_cpu_usage, record_memory_usage, record_process_memory_split,
 };
 use serde::Serialize;
-#[cfg(any(test, not(target_os = "windows")))]
+#[cfg(any(not(target_os = "windows"), test))]
 use serde_json::Value;
-use std::collections::HashMap;
-#[cfg(not(target_os = "windows"))]
-use std::ffi::CStr;
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use sysinfo::System;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
-
-static MEMORY_SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
 
 const ENV_MEMORY_OBSERVABILITY_INTERVAL_SECS: &str = "RUSTFS_MEMORY_OBSERVABILITY_INTERVAL_SECS";
 const DEFAULT_MEMORY_OBSERVABILITY_INTERVAL_SECS: u64 = 15;
 const MEMORY_OBSERVABILITY_SERVICE_NAME: &str = "memory_observability";
+const CGROUP_V2_MEMORY_STAT_PATH: &str = "/sys/fs/cgroup/memory.stat";
+const CGROUP_V2_MEMORY_CURRENT_PATH: &str = "/sys/fs/cgroup/memory.current";
+const CGROUP_V2_MEMORY_MAX_PATH: &str = "/sys/fs/cgroup/memory.max";
+const CGROUP_V1_MEMORY_STAT_PATH: &str = "/sys/fs/cgroup/memory/memory.stat";
+const CGROUP_V1_MEMORY_USAGE_PATH: &str = "/sys/fs/cgroup/memory/memory.usage_in_bytes";
+const CGROUP_V1_MEMORY_LIMIT_PATH: &str = "/sys/fs/cgroup/memory/memory.limit_in_bytes";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -132,19 +132,30 @@ struct CgroupMemorySnapshot {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CgroupMemoryStatFields {
+    anon: Option<u64>,
+    file: Option<u64>,
+    active_file: Option<u64>,
+    inactive_file: Option<u64>,
+    rss: Option<u64>,
+    cache: Option<u64>,
+    total_rss: Option<u64>,
+    total_cache: Option<u64>,
+    total_active_file: Option<u64>,
+    total_inactive_file: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct AllocatorMemorySnapshot {
     backend: &'static str,
     observation: AllocatorMemoryObservation,
 }
 
-fn memory_system() -> &'static Mutex<System> {
-    MEMORY_SYSTEM.get_or_init(|| Mutex::new(System::new()))
-}
-
-fn refresh_total_memory() -> u64 {
-    let mut system = memory_system().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    system.refresh_memory();
-    system.total_memory()
+/// Get effective total memory from container resources.
+///
+/// Returns the effective memory (considering cgroup limits and overrides).
+fn refresh_effective_memory() -> u64 {
+    crate::cgroup_resources::container_resources().memory_bytes
 }
 
 fn read_optional_u64(path: &Path) -> Option<u64> {
@@ -156,57 +167,55 @@ fn read_optional_u64(path: &Path) -> Option<u64> {
     trimmed.parse::<u64>().ok()
 }
 
-fn parse_kv_stats(content: &str) -> HashMap<String, u64> {
-    content
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.split_whitespace();
-            let key = parts.next()?;
-            let value = parts.next()?.parse::<u64>().ok()?;
-            Some((key.to_string(), value))
-        })
-        .collect()
+fn parse_cgroup_memory_stat(content: &str) -> CgroupMemoryStatFields {
+    let mut fields = CgroupMemoryStatFields::default();
+    for line in content.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(key) = parts.next() else {
+            continue;
+        };
+        let Some(value) = parts.next().and_then(|value| value.parse::<u64>().ok()) else {
+            continue;
+        };
+
+        match key {
+            "anon" => fields.anon = Some(value),
+            "file" => fields.file = Some(value),
+            "active_file" => fields.active_file = Some(value),
+            "inactive_file" => fields.inactive_file = Some(value),
+            "rss" => fields.rss = Some(value),
+            "cache" => fields.cache = Some(value),
+            "total_rss" => fields.total_rss = Some(value),
+            "total_cache" => fields.total_cache = Some(value),
+            "total_active_file" => fields.total_active_file = Some(value),
+            "total_inactive_file" => fields.total_inactive_file = Some(value),
+            _ => {}
+        }
+    }
+    fields
 }
 
 fn read_cgroup_v2() -> Option<CgroupMemorySnapshot> {
-    let root = Path::new("/sys/fs/cgroup");
-    let stat_path = root.join("memory.stat");
-    if !stat_path.exists() {
-        return None;
-    }
-
-    let stats = parse_kv_stats(&std::fs::read_to_string(&stat_path).ok()?);
+    let stats = parse_cgroup_memory_stat(&std::fs::read_to_string(CGROUP_V2_MEMORY_STAT_PATH).ok()?);
     Some(CgroupMemorySnapshot {
-        current_bytes: read_optional_u64(&root.join("memory.current")),
-        limit_bytes: read_optional_u64(&root.join("memory.max")),
-        anon_bytes: stats.get("anon").copied(),
-        file_bytes: stats.get("file").copied(),
-        active_file_bytes: stats.get("active_file").copied(),
-        inactive_file_bytes: stats.get("inactive_file").copied(),
+        current_bytes: read_optional_u64(Path::new(CGROUP_V2_MEMORY_CURRENT_PATH)),
+        limit_bytes: read_optional_u64(Path::new(CGROUP_V2_MEMORY_MAX_PATH)),
+        anon_bytes: stats.anon,
+        file_bytes: stats.file,
+        active_file_bytes: stats.active_file,
+        inactive_file_bytes: stats.inactive_file,
     })
 }
 
 fn read_cgroup_v1() -> Option<CgroupMemorySnapshot> {
-    let root = Path::new("/sys/fs/cgroup/memory");
-    let stat_path = root.join("memory.stat");
-    if !stat_path.exists() {
-        return None;
-    }
-
-    let stats = parse_kv_stats(&std::fs::read_to_string(&stat_path).ok()?);
+    let stats = parse_cgroup_memory_stat(&std::fs::read_to_string(CGROUP_V1_MEMORY_STAT_PATH).ok()?);
     Some(CgroupMemorySnapshot {
-        current_bytes: read_optional_u64(&root.join("memory.usage_in_bytes")),
-        limit_bytes: read_optional_u64(&root.join("memory.limit_in_bytes")),
-        anon_bytes: stats.get("total_rss").copied().or_else(|| stats.get("rss").copied()),
-        file_bytes: stats.get("total_cache").copied().or_else(|| stats.get("cache").copied()),
-        active_file_bytes: stats
-            .get("total_active_file")
-            .copied()
-            .or_else(|| stats.get("active_file").copied()),
-        inactive_file_bytes: stats
-            .get("total_inactive_file")
-            .copied()
-            .or_else(|| stats.get("inactive_file").copied()),
+        current_bytes: read_optional_u64(Path::new(CGROUP_V1_MEMORY_USAGE_PATH)),
+        limit_bytes: read_optional_u64(Path::new(CGROUP_V1_MEMORY_LIMIT_PATH)),
+        anon_bytes: stats.total_rss.or(stats.rss),
+        file_bytes: stats.total_cache.or(stats.cache),
+        active_file_bytes: stats.total_active_file.or(stats.active_file),
+        inactive_file_bytes: stats.total_inactive_file.or(stats.inactive_file),
     })
 }
 
@@ -214,7 +223,25 @@ fn read_cgroup_memory_snapshot() -> Option<CgroupMemorySnapshot> {
     read_cgroup_v2().or_else(read_cgroup_v1)
 }
 
-#[cfg(any(test, not(target_os = "windows")))]
+#[cfg(not(target_os = "windows"))]
+fn read_allocator_memory_snapshot() -> Option<AllocatorMemorySnapshot> {
+    let json = rustfs_mimalloc::MiMalloc::stats_json();
+    if json.is_empty() {
+        return None;
+    }
+    let observation = parse_mimalloc_stats_json(&json)?;
+    Some(AllocatorMemorySnapshot {
+        backend: crate::allocator_reclaim::allocator_backend(),
+        observation,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn read_allocator_memory_snapshot() -> Option<AllocatorMemorySnapshot> {
+    None
+}
+
+#[cfg(any(not(target_os = "windows"), test))]
 fn numeric_json_value(value: &Value) -> Option<u64> {
     match value {
         Value::Number(number) => number
@@ -225,7 +252,7 @@ fn numeric_json_value(value: &Value) -> Option<u64> {
     }
 }
 
-#[cfg(any(test, not(target_os = "windows")))]
+#[cfg(any(not(target_os = "windows"), test))]
 fn numeric_json_field(value: &Value, field: &str) -> Option<u64> {
     match value {
         Value::Object(fields) => fields
@@ -237,7 +264,7 @@ fn numeric_json_field(value: &Value, field: &str) -> Option<u64> {
     }
 }
 
-#[cfg(any(test, not(target_os = "windows")))]
+#[cfg(any(not(target_os = "windows"), test))]
 fn mimalloc_stat_field(value: &Value, metric: &str, field: &str) -> Option<u64> {
     match value {
         Value::Object(fields) => {
@@ -254,21 +281,37 @@ fn mimalloc_stat_field(value: &Value, metric: &str, field: &str) -> Option<u64> 
     }
 }
 
-#[cfg(any(test, not(target_os = "windows")))]
+#[cfg(any(not(target_os = "windows"), test))]
 fn mimalloc_stat_current(value: &Value, metric: &str) -> Option<u64> {
     mimalloc_stat_field(value, metric, "current")
 }
 
-#[cfg(any(test, not(target_os = "windows")))]
+#[cfg(any(not(target_os = "windows"), test))]
+fn mimalloc_stat_sum(value: &Value, metrics: &[&str], field: &str) -> Option<u64> {
+    metrics
+        .iter()
+        .map(|metric| mimalloc_stat_field(value, metric, field))
+        .try_fold(0_u64, |sum, value| value.map(|value| sum.saturating_add(value)))
+        .filter(|value| *value > 0)
+}
+
+#[cfg(any(not(target_os = "windows"), test))]
 fn parse_mimalloc_stats_json(stats_json: &str) -> Option<AllocatorMemoryObservation> {
     let value = serde_json::from_str::<Value>(stats_json).ok()?;
+    let malloc_metrics = ["malloc_normal", "malloc_huge"];
     let observation = AllocatorMemoryObservation {
         reserved_bytes: mimalloc_stat_current(&value, "reserved"),
         committed_bytes: mimalloc_stat_current(&value, "committed"),
         page_committed_bytes: mimalloc_stat_current(&value, "page_committed"),
-        malloc_requested_bytes: mimalloc_stat_current(&value, "malloc_requested"),
-        malloc_requested_peak_bytes: mimalloc_stat_field(&value, "malloc_requested", "peak"),
-        malloc_requested_total_bytes: mimalloc_stat_field(&value, "malloc_requested", "total"),
+        malloc_requested_bytes: mimalloc_stat_current(&value, "malloc_requested")
+            .filter(|value| *value > 0)
+            .or_else(|| mimalloc_stat_sum(&value, &malloc_metrics, "current")),
+        malloc_requested_peak_bytes: mimalloc_stat_field(&value, "malloc_requested", "peak")
+            .filter(|value| *value > 0)
+            .or_else(|| mimalloc_stat_sum(&value, &malloc_metrics, "peak")),
+        malloc_requested_total_bytes: mimalloc_stat_field(&value, "malloc_requested", "total")
+            .filter(|value| *value > 0)
+            .or_else(|| mimalloc_stat_sum(&value, &malloc_metrics, "total")),
         heap_count: mimalloc_stat_current(&value, "heaps").or_else(|| mimalloc_stat_current(&value, "heap_count")),
     };
 
@@ -277,34 +320,6 @@ fn parse_mimalloc_stats_json(stats_json: &str) -> Option<AllocatorMemoryObservat
     } else {
         Some(observation)
     }
-}
-
-#[cfg(not(target_os = "windows"))]
-#[allow(unsafe_code)]
-fn read_allocator_memory_snapshot() -> Option<AllocatorMemorySnapshot> {
-    // SAFETY: `mi_stats_get_json` returns a null-terminated JSON buffer owned by
-    // mimalloc when called with a null input buffer. The mimalloc API requires
-    // freeing that buffer with `mi_free`, which is done before returning.
-    let stats = unsafe {
-        let stats_ptr = libmimalloc_sys::mi_stats_get_json(0, std::ptr::null_mut());
-        if stats_ptr.is_null() {
-            return None;
-        }
-
-        let stats = CStr::from_ptr(stats_ptr).to_str().ok().map(str::to_owned);
-        libmimalloc_sys::mi_free(stats_ptr.cast());
-        stats?
-    };
-    let observation = parse_mimalloc_stats_json(&stats)?;
-    Some(AllocatorMemorySnapshot {
-        backend: crate::allocator_reclaim::allocator_backend(),
-        observation,
-    })
-}
-
-#[cfg(target_os = "windows")]
-fn read_allocator_memory_snapshot() -> Option<AllocatorMemorySnapshot> {
-    None
 }
 
 fn configured_memory_observability_interval_secs() -> u64 {
@@ -374,19 +389,36 @@ pub fn memory_observability_controller_snapshot(ctx: &CancellationToken) -> Memo
     )
 }
 
+/// Record the effective memory total and its basis (host or cgroup).
+fn record_effective_memory(total_bytes: u64) {
+    let basis = crate::cgroup_resources::container_resources().basis;
+    metrics::gauge!("rustfs_memory_effective_total_bytes", "basis" => basis).set(total_bytes as f64);
+}
+
+/// Record container resource detection results.
+fn record_container_resource_detection() {
+    let res = crate::cgroup_resources::container_resources();
+
+    metrics::gauge!("rustfs_container_cpu_cores").set(res.cpu_cores as f64);
+    metrics::gauge!("rustfs_container_memory_bytes").set(res.memory_bytes as f64);
+    metrics::gauge!("rustfs_container_cgroup_detected").set(if res.cgroup_detected { 1.0 } else { 0.0 });
+    metrics::gauge!("rustfs_container_overridden").set(if res.overridden { 1.0 } else { 0.0 });
+}
+
 async fn record_memory_snapshot(process_sampler: Arc<Mutex<ProcessSampler>>) {
     match tokio::task::spawn_blocking(move || {
         let mut sampler = process_sampler.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let (resource, process) = sampler.snapshot_resource_and_system();
-        let total_memory = refresh_total_memory();
+        let effective_memory = refresh_effective_memory();
         let cgroup = read_cgroup_memory_snapshot();
         let allocator = read_allocator_memory_snapshot();
-        (resource, process, total_memory, cgroup, allocator)
+        (resource, process, effective_memory, cgroup, allocator)
     })
     .await
     {
-        Ok((resource, process, total_memory, cgroup, allocator)) => {
-            record_memory_usage(process.resident_memory_bytes, total_memory);
+        Ok((resource, process, effective_memory, cgroup, allocator)) => {
+            record_memory_usage(process.resident_memory_bytes, effective_memory);
+            record_effective_memory(effective_memory);
             record_cpu_usage(resource.cpu_percent);
             record_process_memory_split(process.resident_memory_bytes, process.virtual_memory_bytes);
 
@@ -416,6 +448,9 @@ pub fn init_memory_observability(ctx: CancellationToken) {
     let interval = Duration::from_secs(interval_secs.max(1));
     let process_sampler = Arc::new(Mutex::new(ProcessSampler::new()));
 
+    // Record container resource detection results at startup
+    record_container_resource_detection();
+
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -440,17 +475,18 @@ mod tests {
         CgroupMemorySnapshot, MEMORY_OBSERVABILITY_SERVICE_NAME, MemoryObservabilityCancellationSource,
         MemoryObservabilityController, MemoryObservabilityDesiredState, MemoryObservabilityServiceState,
         MemoryObservabilityShutdownHandle, MemoryObservabilityWorkerMutation, build_memory_observability_controller_snapshot,
-        build_memory_observability_status_snapshot, parse_kv_stats, parse_mimalloc_stats_json, read_optional_u64,
+        build_memory_observability_status_snapshot, parse_cgroup_memory_stat, parse_mimalloc_stats_json, read_optional_u64,
     };
     use std::fs;
     use std::path::PathBuf;
 
     #[test]
-    fn parse_kv_stats_extracts_numeric_pairs() {
-        let parsed = parse_kv_stats("anon 12\nfile 34\nactive_file 56\n");
-        assert_eq!(parsed.get("anon").copied(), Some(12));
-        assert_eq!(parsed.get("file").copied(), Some(34));
-        assert_eq!(parsed.get("active_file").copied(), Some(56));
+    fn parse_cgroup_memory_stat_extracts_tracked_numeric_fields() {
+        let parsed = parse_cgroup_memory_stat("anon 12\nfile 34\nactive_file 56\nignored 78\nmalformed nope\n");
+        assert_eq!(parsed.anon, Some(12));
+        assert_eq!(parsed.file, Some(34));
+        assert_eq!(parsed.active_file, Some(56));
+        assert_eq!(parsed.inactive_file, None);
     }
 
     #[test]
@@ -505,8 +541,41 @@ mod tests {
     }
 
     #[test]
+    fn parse_mimalloc_stats_json_falls_back_to_allocated_bytes_when_requested_is_zero() {
+        let parsed = parse_mimalloc_stats_json(
+            r#"{
+                "stat_version": 1,
+                "mimalloc_version": 300,
+                "reserved": { "total": 1048576, "peak": 1048576, "current": 1048576 },
+                "committed": { "total": 524288, "peak": 524288, "current": 524288 },
+                "malloc_normal": { "total": 7340032, "peak": 262144, "current": 196608 },
+                "malloc_huge": { "total": 3145728, "peak": 131072, "current": 65536 },
+                "malloc_requested": { "total": 0, "peak": 0, "current": 0 },
+                "heaps": { "total": 1, "peak": 1, "current": 1 }
+            }"#,
+        )
+        .expect("mimalloc v3 stats should parse");
+
+        assert_eq!(parsed.reserved_bytes, Some(1_048_576));
+        assert_eq!(parsed.committed_bytes, Some(524_288));
+        assert_eq!(parsed.malloc_requested_bytes, Some(262_144));
+        assert_eq!(parsed.malloc_requested_peak_bytes, Some(393_216));
+        assert_eq!(parsed.malloc_requested_total_bytes, Some(10_485_760));
+        assert_eq!(parsed.heap_count, Some(1));
+    }
+
+    #[test]
     fn parse_mimalloc_stats_json_rejects_unrecognized_payload() {
         assert_eq!(parse_mimalloc_stats_json(r#"{ "allocator": "unknown" }"#), None);
+    }
+
+    #[test]
+    fn read_allocator_memory_snapshot_uses_mimalloc_stats_json() {
+        let snapshot = super::read_allocator_memory_snapshot();
+        #[cfg(not(target_os = "windows"))]
+        assert!(snapshot.is_some(), "allocator snapshot should be available on non-Windows");
+        #[cfg(target_os = "windows")]
+        assert!(snapshot.is_none(), "allocator snapshot should be absent without mimalloc");
     }
 
     #[test]

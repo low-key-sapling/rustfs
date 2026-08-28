@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod compat_manifest;
 // SAFETY: `generated` is prost/tonic-generated protocol code. The allowance is
 // scoped to that module so generated internals do not relax lints elsewhere.
 #[allow(unsafe_code)]
@@ -168,10 +169,12 @@ pub fn internode_rpc_max_message_size() -> usize {
 }
 
 pub const HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE: usize = heal_control::RESULT_MAX_SIZE + 1024;
-pub const HEAL_CONTROL_PROTOCOL_VERSION: u32 = 2;
+pub const HEAL_CONTROL_PROTOCOL_VERSION: u32 = 3;
 pub const DYNAMIC_CONFIG_PROTOCOL_VERSION: u32 = 1;
-pub const HEAL_CONTROL_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-heal-control-capability-v2\0";
+pub const BACKGROUND_HEAL_STATUS_PROTOCOL_VERSION: u32 = 2;
+pub const HEAL_CONTROL_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-heal-control-capability-v3\0";
 pub const REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-tier-remote-version-state-capability-v1\0";
+pub const CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-cross-pool-fence-capability-v1\0";
 pub const TIER_MUTATION_RPC_MAX_PREPARE_PAYLOAD_SIZE: usize = 64 * 1024;
 pub const TIER_MUTATION_RPC_MAX_COMMIT_PAYLOAD_SIZE: usize = 1024;
 pub const TIER_MUTATION_RPC_MAX_MESSAGE_SIZE: usize = TIER_MUTATION_RPC_MAX_PREPARE_PAYLOAD_SIZE + 4096;
@@ -210,6 +213,11 @@ pub fn is_remote_version_state_capability_probe(command: &[u8]) -> bool {
         && command.starts_with(REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX)
 }
 
+pub fn is_cross_pool_fence_capability_probe(command: &[u8]) -> bool {
+    command.len() == CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX.len() + 16
+        && command.starts_with(CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX)
+}
+
 pub fn encode_remote_version_state_capability(
     topology_member: &str,
     process_epoch: &[u8; 16],
@@ -241,6 +249,18 @@ pub fn decode_remote_version_state_capability(result: &[u8]) -> Result<(&str, &[
     Ok((topology_member, process_epoch))
 }
 
+pub fn encode_cross_pool_fence_capability(
+    supported_version: u32,
+    topology_member: &str,
+    process_epoch: &[u8; 16],
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let identity = encode_remote_version_state_capability(topology_member, process_epoch)?;
+    let mut result = Vec::with_capacity(4 + identity.len());
+    result.extend_from_slice(&supported_version.to_be_bytes());
+    result.extend_from_slice(&identity);
+    Ok(result)
+}
+
 /// Builds the stable byte representation authenticated for a heal-control request.
 ///
 /// This deliberately does not reuse protobuf encoding: mixed-version peers may
@@ -250,7 +270,7 @@ pub fn canonical_heal_control_request_body(
     topology_fingerprint: &str,
     command: &[u8],
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {
-    const DOMAIN: &[u8] = b"rustfs-heal-control-v2\0";
+    const DOMAIN: &[u8] = b"rustfs-heal-control-v3\0";
 
     let fingerprint = topology_fingerprint.as_bytes();
     let mut body = Vec::with_capacity(DOMAIN.len() + 4 + 8 + fingerprint.len() + 8 + command.len());
@@ -270,7 +290,7 @@ pub fn canonical_heal_control_capability_ack(
     topology_fingerprint: &str,
     probe: &[u8],
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {
-    const DOMAIN: &[u8] = b"rustfs-heal-control-capability-ack-v2\0";
+    const DOMAIN: &[u8] = b"rustfs-heal-control-capability-ack-v3\0";
 
     let fingerprint = topology_fingerprint.as_bytes();
     let mut body = Vec::with_capacity(DOMAIN.len() + 4 + 8 + fingerprint.len() + 8 + probe.len());
@@ -289,7 +309,7 @@ pub fn canonical_heal_control_response_body(
     command: &[u8],
     result: &[u8],
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {
-    const DOMAIN: &[u8] = b"rustfs-heal-control-response-v2\0";
+    const DOMAIN: &[u8] = b"rustfs-heal-control-response-v3\0";
 
     let fingerprint = topology_fingerprint.as_bytes();
     let mut body = Vec::with_capacity(DOMAIN.len() + 4 + 8 + fingerprint.len() + 8 + command.len() + 8 + result.len());
@@ -464,6 +484,160 @@ pub fn canonical_scanner_activity_response_body(
     body.push(u8::from(response.data_movement_active));
     body.extend_from_slice(&response.dirty_usage_generation.to_be_bytes());
     body.push(u8::from(response.dirty_usage_pending));
+    Ok(body)
+}
+
+/// Builds the protocol-v7 response body.  The optional movement fields are
+/// presence-bound so a missing terminal-generation proof cannot authenticate
+/// as the value zero.
+pub fn canonical_scanner_activity_v7_response_body(
+    challenge: &[u8],
+    response: &proto_gen::node_service::ScannerActivityResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-scanner-activity-response-v3\0";
+
+    let instance_id = response.instance_id.as_bytes();
+    let topology_digest = response.topology_digest.as_ref();
+    let mut body = Vec::with_capacity(DOMAIN.len() + challenge.len() + instance_id.len() + topology_digest.len() + 4 + 8 * 8 + 4);
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.extend_from_slice(&u64::try_from(instance_id.len())?.to_be_bytes());
+    body.extend_from_slice(instance_id);
+    body.extend_from_slice(&response.namespace_generation.to_be_bytes());
+    body.extend_from_slice(&response.maintenance_generation.to_be_bytes());
+    body.extend_from_slice(&response.protocol_version.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(topology_digest.len())?.to_be_bytes());
+    body.extend_from_slice(topology_digest);
+    body.push(u8::from(response.data_movement_active));
+    body.extend_from_slice(&response.dirty_usage_generation.to_be_bytes());
+    body.push(u8::from(response.dirty_usage_pending));
+    body.push(u8::from(response.movement_generation.is_some()));
+    if let Some(generation) = response.movement_generation {
+        body.extend_from_slice(&generation.to_be_bytes());
+    }
+    body.push(u8::from(response.publication_blocked.is_some()));
+    if let Some(blocked) = response.publication_blocked {
+        body.push(u8::from(blocked));
+    }
+    Ok(body)
+}
+
+/// Builds the body authenticated by the short-lived remote scanner publication
+/// lease request. This is a separate domain from ScannerActivity so v6/v7
+/// observation proofs remain byte-for-byte compatible.
+pub fn canonical_scanner_publication_lease_request_body(
+    request: &proto_gen::node_service::ScannerPublicationLeaseRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-scanner-publication-lease-request-v1\0";
+    let challenge = request.challenge.as_ref();
+    let session_id = request.expected_session_id.as_bytes();
+    let mut body = Vec::with_capacity(DOMAIN.len() + challenge.len() + session_id.len() + 40);
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.extend_from_slice(&request.expected_movement_generation.to_be_bytes());
+    body.extend_from_slice(&request.ttl_ms.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(session_id.len())?.to_be_bytes());
+    body.extend_from_slice(session_id);
+    // Empty keeps the original acquire body byte-for-byte compatible.  A
+    // non-empty token is the authenticated validation form used immediately
+    // before a coordinator commits its final publication.
+    let token = request.token.as_ref();
+    if !token.is_empty() {
+        body.extend_from_slice(&u64::try_from(token.len())?.to_be_bytes());
+        body.extend_from_slice(token);
+    }
+    Ok(body)
+}
+
+/// Builds the body authenticated by a remote scanner publication lease
+/// release request.
+pub fn canonical_scanner_publication_lease_release_request_body(
+    request: &proto_gen::node_service::ScannerPublicationLeaseReleaseRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-scanner-publication-lease-release-request-v1\0";
+    let challenge = request.challenge.as_ref();
+    let token = request.token.as_ref();
+    let mut body = Vec::with_capacity(DOMAIN.len() + challenge.len() + token.len() + 16);
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.extend_from_slice(&u64::try_from(token.len())?.to_be_bytes());
+    body.extend_from_slice(token);
+    let owner_id = request.owner_id.as_bytes();
+    let session_id = request.session_id.as_bytes();
+    body.extend_from_slice(&u64::try_from(owner_id.len())?.to_be_bytes());
+    body.extend_from_slice(owner_id);
+    body.extend_from_slice(&u64::try_from(session_id.len())?.to_be_bytes());
+    body.extend_from_slice(session_id);
+    Ok(body)
+}
+
+pub fn canonical_scanner_publication_lease_response_body(
+    challenge: &[u8],
+    response: &proto_gen::node_service::ScannerPublicationLeaseResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-scanner-publication-lease-response-v1\0";
+    let token = response.token.as_ref();
+    let owner_id = response.owner_id.as_bytes();
+    let session_id = response.session_id.as_bytes();
+    let error_info = response.error.as_ref().map(|error| error.error_info.as_bytes());
+    let error_code = response.error.as_ref().map_or(0, |error| error.code);
+    let mut body = Vec::with_capacity(
+        DOMAIN.len() + challenge.len() + token.len() + owner_id.len() + session_id.len() + error_info.map_or(0, |v| v.len()) + 72,
+    );
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.push(u8::from(response.success));
+    body.extend_from_slice(&u64::try_from(token.len())?.to_be_bytes());
+    body.extend_from_slice(token);
+    body.extend_from_slice(&response.movement_generation.to_be_bytes());
+    body.extend_from_slice(&response.lease_ttl_ms.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(owner_id.len())?.to_be_bytes());
+    body.extend_from_slice(owner_id);
+    body.extend_from_slice(&u64::try_from(session_id.len())?.to_be_bytes());
+    body.extend_from_slice(session_id);
+    body.push(u8::from(response.error.is_some()));
+    body.extend_from_slice(&error_code.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(error_info.map_or(0, |value| value.len()))?.to_be_bytes());
+    if let Some(error_info) = error_info {
+        body.extend_from_slice(error_info);
+    }
+    Ok(body)
+}
+
+pub fn canonical_scanner_publication_lease_release_response_body(
+    challenge: &[u8],
+    request: &proto_gen::node_service::ScannerPublicationLeaseReleaseRequest,
+    response: &proto_gen::node_service::ScannerPublicationLeaseReleaseResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-scanner-publication-lease-release-response-v1\0";
+    let token = request.token.as_ref();
+    let owner_id = request.owner_id.as_bytes();
+    let session_id = request.session_id.as_bytes();
+    let error_info = response.error.as_ref().map(|error| error.error_info.as_bytes());
+    let error_code = response.error.as_ref().map_or(0, |error| error.code);
+    let mut body = Vec::with_capacity(
+        DOMAIN.len() + challenge.len() + token.len() + owner_id.len() + session_id.len() + error_info.map_or(0, |v| v.len()) + 56,
+    );
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.extend_from_slice(&u64::try_from(token.len())?.to_be_bytes());
+    body.extend_from_slice(token);
+    body.extend_from_slice(&u64::try_from(owner_id.len())?.to_be_bytes());
+    body.extend_from_slice(owner_id);
+    body.extend_from_slice(&u64::try_from(session_id.len())?.to_be_bytes());
+    body.extend_from_slice(session_id);
+    body.push(u8::from(response.success));
+    body.push(u8::from(response.error.is_some()));
+    body.extend_from_slice(&error_code.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(error_info.map_or(0, |value| value.len()))?.to_be_bytes());
+    if let Some(error_info) = error_info {
+        body.extend_from_slice(error_info);
+    }
     Ok(body)
 }
 
@@ -739,6 +913,11 @@ pub fn canonical_rename_data_request_body(
     body.push_str(&request.dst_volume)?;
     body.push_str(&request.dst_path)?;
     body.push_bytes(&request.file_info_bin)?;
+    // Keep legacy rename requests byte-for-byte compatible.  The optional
+    // token is included only for the scanner's target-side lease fence.
+    if !request.scanner_publication_lease_token.is_empty() {
+        body.push_bytes(&request.scanner_publication_lease_token)?;
+    }
     Ok(body.finish())
 }
 
@@ -821,6 +1000,9 @@ pub fn canonical_delete_request_body(
     body.push_str(&request.volume)?;
     body.push_str(&request.path)?;
     body.push_str(&request.options)?;
+    if !request.scanner_publication_lease_token.is_empty() {
+        body.push_bytes(&request.scanner_publication_lease_token)?;
+    }
     Ok(body.finish())
 }
 
@@ -983,6 +1165,7 @@ mod disk_mutation_canonical_tests {
             dst_volume: "dst-vol".into(),
             dst_path: "dst-path".into(),
             file_info_bin: vec![0x81, 0x01].into(),
+            scanner_publication_lease_token: Vec::new().into(),
         };
         let mut bodies = vec![canonical_rename_data_request_body(&baseline).unwrap()];
         for mutate in [
@@ -994,6 +1177,7 @@ mod disk_mutation_canonical_tests {
             |r: &mut RenameDataRequest| r.dst_path = "dst-path2".into(),
             |r: &mut RenameDataRequest| r.file_info_bin = vec![0x81, 0x02].into(),
             |r: &mut RenameDataRequest| r.file_info_bin = Vec::new().into(),
+            |r: &mut RenameDataRequest| r.scanner_publication_lease_token = vec![0x01; 16].into(),
         ] {
             let mut request = baseline.clone();
             mutate(&mut request);
@@ -1154,6 +1338,7 @@ mod disk_mutation_canonical_tests {
             volume: "v".into(),
             path: "p".into(),
             options: "{\"o\":1}".into(),
+            scanner_publication_lease_token: Vec::new().into(),
         };
         let mut bodies = vec![canonical_delete_request_body(&delete).unwrap()];
         for mutate in [
@@ -1161,6 +1346,7 @@ mod disk_mutation_canonical_tests {
             |r: &mut DeleteRequest| r.volume = "v2".into(),
             |r: &mut DeleteRequest| r.path = "p2".into(),
             |r: &mut DeleteRequest| r.options = "{\"recursive\":true}".into(),
+            |r: &mut DeleteRequest| r.scanner_publication_lease_token = vec![0x01; 16].into(),
         ] {
             let mut request = delete.clone();
             mutate(&mut request);
@@ -1546,8 +1732,12 @@ mod non_disk_mutation_canonical_tests {
 mod scanner_activity_tests {
     use super::{
         canonical_scanner_activity_request_body, canonical_scanner_activity_response_body,
-        canonical_scanner_activity_v4_response_body,
-        proto_gen::node_service::{ScannerActivityRequest, ScannerActivityResponse},
+        canonical_scanner_activity_v4_response_body, canonical_scanner_activity_v7_response_body,
+        canonical_scanner_publication_lease_release_request_body, canonical_scanner_publication_lease_request_body,
+        canonical_scanner_publication_lease_response_body,
+        proto_gen::node_service::{
+            ScannerActivityRequest, ScannerActivityResponse, ScannerPublicationLeaseRequest, ScannerPublicationLeaseResponse,
+        },
     };
 
     #[test]
@@ -1598,6 +1788,8 @@ mod scanner_activity_tests {
             response_proof: Vec::new().into(),
             dirty_usage_generation: 11,
             dirty_usage_pending: true,
+            movement_generation: Some(19),
+            publication_blocked: Some(false),
         };
         let baseline =
             canonical_scanner_activity_response_body(&[1; 16], &response).expect("scanner activity response should encode");
@@ -1648,6 +1840,25 @@ mod scanner_activity_tests {
             canonical_scanner_activity_response_body(&[2; 16], &response)
                 .expect("scanner activity response with a different challenge should encode")
         );
+
+        let v7_baseline =
+            canonical_scanner_activity_v7_response_body(&[1; 16], &response).expect("scanner activity v7 response should encode");
+        for variant in [
+            ScannerActivityResponse {
+                movement_generation: Some(20),
+                ..response.clone()
+            },
+            ScannerActivityResponse {
+                publication_blocked: Some(true),
+                ..response
+            },
+        ] {
+            assert_ne!(
+                v7_baseline,
+                canonical_scanner_activity_v7_response_body(&[1; 16], &variant)
+                    .expect("scanner activity v7 response variant should encode")
+            );
+        }
     }
 
     #[test]
@@ -1662,6 +1873,8 @@ mod scanner_activity_tests {
             response_proof: Vec::new().into(),
             dirty_usage_generation: 0,
             dirty_usage_pending: false,
+            movement_generation: None,
+            publication_blocked: None,
         };
         let baseline =
             canonical_scanner_activity_v4_response_body(&[1; 16], &response).expect("scanner activity v4 response should encode");
@@ -1695,16 +1908,83 @@ mod scanner_activity_tests {
                 .expect("scanner activity v4 response should ignore v5 fields")
         );
     }
+
+    #[test]
+    fn scanner_publication_lease_canonical_bodies_bind_session_owner_and_generation() {
+        let request = ScannerPublicationLeaseRequest {
+            challenge: vec![1; 16].into(),
+            expected_movement_generation: 7,
+            ttl_ms: 60_000,
+            expected_session_id: "session-a".to_string(),
+            token: Vec::new().into(),
+        };
+        let baseline = canonical_scanner_publication_lease_request_body(&request).unwrap();
+        for variant in [
+            ScannerPublicationLeaseRequest {
+                expected_movement_generation: 8,
+                ..request.clone()
+            },
+            ScannerPublicationLeaseRequest {
+                expected_session_id: "session-b".to_string(),
+                ..request.clone()
+            },
+            ScannerPublicationLeaseRequest {
+                ttl_ms: 30_000,
+                ..request.clone()
+            },
+            ScannerPublicationLeaseRequest {
+                token: vec![3; 16].into(),
+                ..request
+            },
+        ] {
+            assert_ne!(baseline, canonical_scanner_publication_lease_request_body(&variant).unwrap());
+        }
+
+        let release_a = crate::proto_gen::node_service::ScannerPublicationLeaseReleaseRequest {
+            challenge: vec![2; 16].into(),
+            token: vec![3; 16].into(),
+            owner_id: "owner-a".to_string(),
+            session_id: "session-a".to_string(),
+        };
+        let release_b = crate::proto_gen::node_service::ScannerPublicationLeaseReleaseRequest {
+            owner_id: "owner-b".to_string(),
+            ..release_a.clone()
+        };
+        assert_ne!(
+            canonical_scanner_publication_lease_release_request_body(&release_a).unwrap(),
+            canonical_scanner_publication_lease_release_request_body(&release_b).unwrap()
+        );
+
+        let response = ScannerPublicationLeaseResponse {
+            success: true,
+            token: vec![4; 16].into(),
+            movement_generation: 7,
+            lease_ttl_ms: 60_000,
+            error: None,
+            response_proof: Vec::new().into(),
+            owner_id: "owner-a".to_string(),
+            session_id: "session-a".to_string(),
+        };
+        let response_changed = ScannerPublicationLeaseResponse {
+            owner_id: "owner-b".to_string(),
+            ..response.clone()
+        };
+        assert_ne!(
+            canonical_scanner_publication_lease_response_body(&[1; 16], &response).unwrap(),
+            canonical_scanner_publication_lease_response_body(&[1; 16], &response_changed).unwrap()
+        );
+    }
 }
 
 #[cfg(test)]
 mod heal_control_tests {
     use super::{
-        HEAL_CONTROL_CAPABILITY_PROBE_PREFIX, HEAL_CONTROL_PROTOCOL_VERSION, REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX,
-        canonical_heal_control_capability_ack, canonical_heal_control_request_body, canonical_heal_control_response_body,
-        decode_remote_version_state_capability, encode_remote_version_state_capability, heal_control_capability_probe,
-        heal_control_coordinator_epoch, heal_control_execution_timeout, heal_control_execution_timeout_for,
-        internode_rpc_timeout, is_heal_control_capability_probe, is_remote_version_state_capability_probe,
+        CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX, HEAL_CONTROL_CAPABILITY_PROBE_PREFIX, HEAL_CONTROL_PROTOCOL_VERSION,
+        REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX, canonical_heal_control_capability_ack, canonical_heal_control_request_body,
+        canonical_heal_control_response_body, decode_remote_version_state_capability, encode_cross_pool_fence_capability,
+        encode_remote_version_state_capability, heal_control_capability_probe, heal_control_coordinator_epoch,
+        heal_control_execution_timeout, heal_control_execution_timeout_for, internode_rpc_timeout,
+        is_cross_pool_fence_capability_probe, is_heal_control_capability_probe, is_remote_version_state_capability_probe,
         normalize_internode_rpc_timeout, remote_version_state_capability_probe,
     };
     use crate::heal_control;
@@ -1713,7 +1993,7 @@ mod heal_control_tests {
     #[test]
     fn canonical_heal_control_body_binds_every_field_and_boundary() {
         let baseline = canonical_heal_control_request_body(1, "ab", b"c").expect("small request should encode");
-        let mut golden = b"rustfs-heal-control-v2\0".to_vec();
+        let mut golden = b"rustfs-heal-control-v3\0".to_vec();
         golden.extend_from_slice(&1_u32.to_be_bytes());
         golden.extend_from_slice(&2_u64.to_be_bytes());
         golden.extend_from_slice(b"ab");
@@ -1741,11 +2021,11 @@ mod heal_control_tests {
 
     #[test]
     fn canonical_capability_ack_binds_version_and_topology() {
-        assert_eq!(HEAL_CONTROL_PROTOCOL_VERSION, 2);
-        assert!(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX.starts_with(b"rustfs-heal-control-capability-v2"));
+        assert_eq!(HEAL_CONTROL_PROTOCOL_VERSION, 3);
+        assert!(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX.starts_with(b"rustfs-heal-control-capability-v3"));
         let probe = heal_control_capability_probe(&[7; 16]);
         let ack = canonical_heal_control_capability_ack(1, "ab", &probe).expect("small acknowledgement should encode");
-        let mut golden = b"rustfs-heal-control-capability-ack-v2\0".to_vec();
+        let mut golden = b"rustfs-heal-control-capability-ack-v3\0".to_vec();
         golden.extend_from_slice(&1_u32.to_be_bytes());
         golden.extend_from_slice(&2_u64.to_be_bytes());
         golden.extend_from_slice(b"ab");
@@ -1783,6 +2063,26 @@ mod heal_control_tests {
             encode_remote_version_state_capability("node-a", &[7; 16]).expect("small capability response should encode");
         invalid_utf8[8] = 0xff;
         assert!(decode_remote_version_state_capability(&invalid_utf8).is_err());
+    }
+
+    #[test]
+    fn cross_pool_fence_capability_binds_version_member_and_epoch() {
+        assert_eq!(CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX, b"rustfs-cross-pool-fence-capability-v1\0");
+        let mut probe = b"rustfs-cross-pool-fence-capability-v1\0".to_vec();
+        probe.extend_from_slice(&[7; 16]);
+        assert!(is_cross_pool_fence_capability_probe(&probe));
+        assert!(!is_cross_pool_fence_capability_probe(CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX));
+        let mut wrong_prefix = probe.clone();
+        wrong_prefix[0] ^= 1;
+        assert!(!is_cross_pool_fence_capability_probe(&wrong_prefix));
+
+        let encoded = encode_cross_pool_fence_capability(0x0102_0304, "node-a:9000", &[7; 16])
+            .expect("small capability response should encode");
+        let mut expected_response = vec![1, 2, 3, 4];
+        expected_response.extend_from_slice(&11_u64.to_be_bytes());
+        expected_response.extend_from_slice(b"node-a:9000");
+        expected_response.extend_from_slice(&[7; 16]);
+        assert_eq!(encoded, expected_response);
     }
 
     #[test]
@@ -2067,6 +2367,9 @@ pub enum ChannelClass {
     Bulk,
 }
 
+// Keep multiplexed unary RPCs below h2's per-connection small-frame budget.
+const INTERNODE_RPC_CONCURRENCY_LIMIT: usize = 64;
+
 /// Whether control/bulk channel isolation is enabled (env-gated, default off for safe rollout).
 fn channel_isolation_enabled() -> bool {
     rustfs_utils::get_env_bool(
@@ -2149,6 +2452,7 @@ async fn build_channel(dial_addr: &str, cache_key: &str) -> Result<Channel, Box<
     let mut connector = Endpoint::from_shared(dial_addr.to_string())?
         // Fast connection timeout for dead peer detection
         .connect_timeout(connect_timeout)
+        .concurrency_limit(INTERNODE_RPC_CONCURRENCY_LIMIT)
         // TCP-level keepalive - OS will probe connection
         .tcp_keepalive(Some(tcp_keepalive))
         // Disable Nagle so latency-sensitive control-plane RPCs (locks/health) are not batched
@@ -2303,180 +2607,29 @@ pub async fn evict_failed_connection_with_log_level(addr: &str, log_level: Conne
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message as _;
     use std::sync::Mutex;
 
     static INTERNODE_RPC_MSGPACK_ONLY_ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-    struct CompatPayloadField {
-        message: &'static str,
-        json_field: &'static str,
-        bin_field: &'static str,
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct BackgroundHealStatusRequestV1 {}
+
+    #[test]
+    fn background_heal_status_request_remains_rolling_upgrade_compatible() {
+        let current = proto_gen::node_service::BackgroundHealStatusRequest {
+            protocol_version: BACKGROUND_HEAL_STATUS_PROTOCOL_VERSION,
+        };
+        let encoded = current.encode_to_vec();
+        BackgroundHealStatusRequestV1::decode(encoded.as_slice()).expect("v1 server should ignore the version field");
+
+        let encoded = BackgroundHealStatusRequestV1 {}.encode_to_vec();
+        let decoded = proto_gen::node_service::BackgroundHealStatusRequest::decode(encoded.as_slice())
+            .expect("v2 server should accept a v1 request");
+        assert_eq!(decoded.protocol_version, 0);
     }
 
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum RequestJsonPolicy {
-        MsgpackOnlyEligible,
-        AlwaysDualWriteUntilFallbackZero,
-    }
-
-    #[derive(Clone, Copy, Debug)]
-    struct RequestCompatSendSite {
-        field: CompatPayloadField,
-        json_encoder: &'static str,
-        policy: RequestJsonPolicy,
-    }
-
-    #[derive(Clone, Copy, Debug)]
-    struct ResponseCompatSendSite {
-        field: CompatPayloadField,
-        json_encoder: &'static str,
-    }
-
-    const REQUEST_COMPAT_SEND_SITES: &[RequestCompatSendSite] = &[
-        RequestCompatSendSite {
-            field: CompatPayloadField {
-                message: "BatchReadVersionRequest",
-                json_field: "batch_read_version_req",
-                bin_field: "batch_read_version_req_bin",
-            },
-            json_encoder: "let batch_read_version_req = compat_json(&req)?;",
-            policy: RequestJsonPolicy::MsgpackOnlyEligible,
-        },
-        RequestCompatSendSite {
-            field: CompatPayloadField {
-                message: "DeleteVersionRequest",
-                json_field: "file_info",
-                bin_field: "file_info_bin",
-            },
-            json_encoder: "let file_info = serde_json::to_string(&fi)?;",
-            policy: RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,
-        },
-        RequestCompatSendSite {
-            field: CompatPayloadField {
-                message: "DeleteVersionRequest",
-                json_field: "opts",
-                bin_field: "opts_bin",
-            },
-            json_encoder: "let opts = serde_json::to_string(&opts)?;",
-            policy: RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,
-        },
-        RequestCompatSendSite {
-            field: CompatPayloadField {
-                message: "DeleteVersionsRequest",
-                json_field: "opts",
-                bin_field: "opts_bin",
-            },
-            json_encoder: "let opts = match serde_json::to_string(&opts) {",
-            policy: RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,
-        },
-        RequestCompatSendSite {
-            field: CompatPayloadField {
-                message: "DeleteVersionsRequest",
-                json_field: "versions",
-                bin_field: "versions_bin",
-            },
-            json_encoder: "versions_str.push(match serde_json::to_string(file_info_versions) {",
-            policy: RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,
-        },
-        RequestCompatSendSite {
-            field: CompatPayloadField {
-                message: "ReadMultipleRequest",
-                json_field: "read_multiple_req",
-                bin_field: "read_multiple_req_bin",
-            },
-            json_encoder: "let read_multiple_req = compat_json(&req)?;",
-            policy: RequestJsonPolicy::MsgpackOnlyEligible,
-        },
-        RequestCompatSendSite {
-            field: CompatPayloadField {
-                message: "ReadVersionRequest",
-                json_field: "opts",
-                bin_field: "opts_bin",
-            },
-            json_encoder: "let opts_str = compat_json(opts)?;",
-            policy: RequestJsonPolicy::MsgpackOnlyEligible,
-        },
-        RequestCompatSendSite {
-            field: CompatPayloadField {
-                message: "RenameDataRequest",
-                json_field: "file_info",
-                bin_field: "file_info_bin",
-            },
-            json_encoder: "let file_info = compat_json(&fi)?;",
-            policy: RequestJsonPolicy::MsgpackOnlyEligible,
-        },
-        RequestCompatSendSite {
-            field: CompatPayloadField {
-                message: "UpdateMetadataRequest",
-                json_field: "file_info",
-                bin_field: "file_info_bin",
-            },
-            json_encoder: "let file_info = compat_json(&fi)?;",
-            policy: RequestJsonPolicy::MsgpackOnlyEligible,
-        },
-        RequestCompatSendSite {
-            field: CompatPayloadField {
-                message: "UpdateMetadataRequest",
-                json_field: "opts",
-                bin_field: "opts_bin",
-            },
-            json_encoder: "let opts_str = compat_json(&opts)?;",
-            policy: RequestJsonPolicy::MsgpackOnlyEligible,
-        },
-        RequestCompatSendSite {
-            field: CompatPayloadField {
-                message: "WriteMetadataRequest",
-                json_field: "file_info",
-                bin_field: "file_info_bin",
-            },
-            json_encoder: "let file_info = compat_json(&fi)?;",
-            policy: RequestJsonPolicy::MsgpackOnlyEligible,
-        },
-    ];
-
-    const RESPONSE_COMPAT_SEND_SITES: &[ResponseCompatSendSite] = &[
-        ResponseCompatSendSite {
-            field: CompatPayloadField {
-                message: "BatchReadVersionResponse",
-                json_field: "batch_read_version_resps",
-                bin_field: "batch_read_version_resps_bin",
-            },
-            json_encoder: "compat_response_json(batch_read_version_resp)",
-        },
-        ResponseCompatSendSite {
-            field: CompatPayloadField {
-                message: "ReadMultipleResponse",
-                json_field: "read_multiple_resps",
-                bin_field: "read_multiple_resps_bin",
-            },
-            json_encoder: "compat_response_json(read_multiple_resp)",
-        },
-        ResponseCompatSendSite {
-            field: CompatPayloadField {
-                message: "ReadVersionResponse",
-                json_field: "file_info",
-                bin_field: "file_info_bin",
-            },
-            json_encoder: "let file_info_json = compat_response_json(&file_info);",
-        },
-        ResponseCompatSendSite {
-            field: CompatPayloadField {
-                message: "ReadXLResponse",
-                json_field: "raw_file_info",
-                bin_field: "raw_file_info_bin",
-            },
-            json_encoder: "let raw_file_info_json = compat_response_json(&raw_file_info);",
-        },
-        ResponseCompatSendSite {
-            field: CompatPayloadField {
-                message: "RenameDataResponse",
-                json_field: "rename_data_resp",
-                bin_field: "rename_data_resp_bin",
-            },
-            json_encoder: "let rename_data_resp_json = compat_response_json(&rename_data_resp);",
-        },
-    ];
+    use crate::compat_manifest::{CompatPayloadField, REQUEST_COMPAT_SEND_SITES, RESPONSE_COMPAT_SEND_SITES, RequestJsonPolicy};
 
     fn proto_bin_json_fields(message_suffix: &str) -> Vec<CompatPayloadField> {
         let proto = include_str!("node.proto");
@@ -2516,13 +2669,6 @@ mod tests {
         fields
     }
 
-    fn production_source(source: &'static str, file_name: &str) -> &'static str {
-        source
-            .split("\n#[cfg(test)]")
-            .next()
-            .unwrap_or_else(|| panic!("{file_name} should contain production source before tests"))
-    }
-
     #[test]
     fn request_compat_send_site_manifest_covers_node_proto_bin_fields() {
         let mut manifest_fields = REQUEST_COMPAT_SEND_SITES
@@ -2538,31 +2684,6 @@ mod tests {
             "duplicate request send-site manifest entry"
         );
         assert_eq!(manifest_fields, proto_bin_json_fields("Request"));
-    }
-
-    #[test]
-    fn request_compat_send_site_manifest_pins_json_policy_and_encoder() {
-        let source = production_source(include_str!("../../ecstore/src/cluster/rpc/remote_disk.rs"), "remote_disk.rs");
-        let msgpack_only_eligible = REQUEST_COMPAT_SEND_SITES
-            .iter()
-            .filter(|send_site| send_site.policy == RequestJsonPolicy::MsgpackOnlyEligible)
-            .count();
-        let always_dual_write = REQUEST_COMPAT_SEND_SITES
-            .iter()
-            .filter(|send_site| send_site.policy == RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero)
-            .count();
-
-        assert_eq!(msgpack_only_eligible, 7);
-        assert_eq!(always_dual_write, 4);
-        for send_site in REQUEST_COMPAT_SEND_SITES {
-            assert!(
-                source.contains(send_site.json_encoder),
-                "{}.{} must keep its manifest encoder: {}",
-                send_site.field.message,
-                send_site.field.json_field,
-                send_site.json_encoder
-            );
-        }
     }
 
     #[test]
@@ -2610,21 +2731,6 @@ mod tests {
             "duplicate response send-site manifest entry"
         );
         assert_eq!(manifest_fields, proto_bin_json_fields("Response"));
-    }
-
-    #[test]
-    fn response_compat_send_site_manifest_pins_json_encoder() {
-        let source = production_source(include_str!("../../../rustfs/src/storage/rpc/node_service/disk.rs"), "disk.rs");
-
-        for send_site in RESPONSE_COMPAT_SEND_SITES {
-            assert!(
-                source.contains(send_site.json_encoder),
-                "{}.{} must keep its manifest encoder: {}",
-                send_site.field.message,
-                send_site.field.json_field,
-                send_site.json_encoder
-            );
-        }
     }
 
     #[test]

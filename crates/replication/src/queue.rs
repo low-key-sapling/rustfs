@@ -232,7 +232,7 @@ impl ReplicationPriority {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ReplicationOperation {
     Object(Box<ReplicateObjectInfo>),
     Delete(Box<DeletedObjectReplicationInfo>),
@@ -358,6 +358,48 @@ mod tests {
             worker_queue_for_replication_type(&ReplicationType::Delete),
             ReplicationWorkerQueue::Regular
         );
+    }
+
+    /// P1-20 truth-table pin (rustfs/backlog#1675): when no target replicates
+    /// — the decision is empty because ExistingObjectReplication is Disabled
+    /// for a never-replicated object, or because the object is an inbound
+    /// REPLICA (must_replicate returns an empty decision for those) — the
+    /// heal pass must skip entirely, whatever the recorded status says. The
+    /// scanner never compensates these objects.
+    #[test]
+    fn heal_queue_action_skips_when_no_target_replicates() {
+        for status in [
+            ReplicationStatusType::Empty,
+            ReplicationStatusType::Failed,
+            ReplicationStatusType::Replica,
+        ] {
+            let mut roi = ReplicateObjectInfo {
+                bucket: "bucket".to_string(),
+                name: "object".to_string(),
+                replication_status: status,
+                dsc: ReplicateDecision::new(),
+                ..Default::default()
+            };
+
+            let action = replication_heal_queue_action(&mut roi);
+
+            assert!(
+                matches!(action, ReplicationHealQueueAction::Skip),
+                "an empty replicate decision must skip heal queueing (status {:?})",
+                roi.replication_status
+            );
+        }
+    }
+
+    /// P1-20 truth-table pin: a Completed object with no resync decision has
+    /// nothing left to heal — the scanner must not requeue it.
+    #[test]
+    fn heal_queue_action_skips_completed_object_without_resync() {
+        let mut roi = replicate_object_info(ReplicationStatusType::Completed);
+
+        let action = replication_heal_queue_action(&mut roi);
+
+        assert!(matches!(action, ReplicationHealQueueAction::Skip));
     }
 
     #[test]

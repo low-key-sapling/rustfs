@@ -386,7 +386,7 @@ where
         .parse::<T>()
         .map_err(|_| {
             log_once(&format!("env_invalid_value:{used_key}"), || {
-                format!("Invalid {} value for {used_key}: {value}. Treating as unset.", type_name::<T>())
+                format!("Invalid {} value for {used_key}. Treating as unset.", type_name::<T>())
             });
         })
         .ok()
@@ -688,7 +688,7 @@ where
         Ok(parsed) => EnvParseOutcome::Parsed(parsed),
         Err(_) => {
             log_once(&format!("env_invalid_value:{used_key}"), || {
-                format!("Invalid {} value for {used_key}: {value}. Treating as unset.", type_name::<T>())
+                format!("Invalid {} value for {used_key}. Treating as unset.", type_name::<T>())
             });
             EnvParseOutcome::Invalid
         }

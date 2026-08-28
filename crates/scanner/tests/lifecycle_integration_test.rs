@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![recursion_limit = "256"]
+
 use futures::FutureExt;
 use rustfs_config::ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT;
 use rustfs_scanner::scanner_folder::ScannerItem;
@@ -204,7 +206,6 @@ async fn setup_isolated_test_env(init_expiry: bool) -> (Vec<PathBuf>, Arc<ECStor
 }
 
 /// Test helper: Create a test bucket
-#[allow(dead_code)]
 async fn create_test_bucket(ecstore: &Arc<ECStore>, bucket_name: &str) {
     (**ecstore)
         .make_bucket(bucket_name, &Default::default())
@@ -249,7 +250,6 @@ async fn modeled_versioned_delete_opts(bucket: &str, object: &str) -> ObjectOpti
 }
 
 /// Test helper: Set bucket lifecycle configuration
-#[allow(dead_code)]
 async fn set_bucket_lifecycle(bucket_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Create a simple lifecycle configuration XML with 0 days expiry for immediate testing
     let lifecycle_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -272,7 +272,6 @@ async fn set_bucket_lifecycle(bucket_name: &str) -> Result<(), Box<dyn std::erro
 }
 
 /// Test helper: Set bucket lifecycle configuration
-#[allow(dead_code)]
 async fn set_bucket_lifecycle_deletemarker(bucket_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Create lifecycle rule that targets delete-marker cleanup only.
     // Keep Expiration.Days unset to avoid expiring live transitioned object versions.
@@ -295,7 +294,6 @@ async fn set_bucket_lifecycle_deletemarker(bucket_name: &str) -> Result<(), Box<
     Ok(())
 }
 
-#[allow(dead_code)]
 async fn set_bucket_lifecycle_delmarker_expiration(bucket_name: &str, days: i64) -> Result<(), Box<dyn std::error::Error>> {
     let lifecycle_xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -318,7 +316,6 @@ async fn set_bucket_lifecycle_delmarker_expiration(bucket_name: &str, days: i64)
     Ok(())
 }
 
-#[allow(dead_code)]
 async fn set_bucket_lifecycle_transition_with_tier(
     bucket_name: &str,
     storage_class: &str,
@@ -366,7 +363,6 @@ async fn object_exists(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> bo
 }
 
 /// Test helper: Check if object exists
-#[allow(dead_code)]
 async fn object_is_delete_marker(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> bool {
     if let Ok(oi) = (**ecstore).get_object_info(bucket, object, &ObjectOptions::default()).await {
         println!("oi: {oi:?}");
@@ -377,7 +373,6 @@ async fn object_is_delete_marker(ecstore: &Arc<ECStore>, bucket: &str, object: &
     }
 }
 
-#[allow(dead_code)]
 async fn wait_for_object_absence(ecstore: &Arc<ECStore>, bucket: &str, object: &str, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
 
@@ -703,7 +698,11 @@ mod serial_tests {
             action: IlmAction::DeleteAction,
             ..Default::default()
         };
-        expire_transitioned_object(ecstore.clone(), &oi, &lc_event, &LcEventSrc::Scanner)
+        let bucket_incarnation_id = ecstore
+            .bucket_incarnation_id(bucket_name.as_str())
+            .await
+            .expect("read bucket incarnation");
+        expire_transitioned_object(ecstore.clone(), &oi, &lc_event, &LcEventSrc::Scanner, bucket_incarnation_id)
             .await
             .expect("expire_transitioned_object should succeed");
 
@@ -1059,10 +1058,27 @@ mod serial_tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[test]
     #[serial]
     #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
-    async fn test_transition_and_restore_flows() {
+    fn test_transition_and_restore_flows() {
+        std::thread::Builder::new()
+            .name("scanner-transition-restore-flows".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("transition and restore test runtime should build");
+
+                runtime.block_on(test_transition_and_restore_flows_inner());
+            })
+            .expect("transition and restore test thread should spawn")
+            .join()
+            .expect("transition and restore test thread should finish");
+    }
+
+    async fn test_transition_and_restore_flows_inner() {
         let (disk_paths, ecstore) = setup_test_env().await;
 
         let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
@@ -2186,7 +2202,11 @@ mod serial_tests {
             action: IlmAction::DeleteRestoredAction,
             ..Default::default()
         };
-        expire_transitioned_object(ecstore.clone(), &restored, &lc_event, &LcEventSrc::Scanner)
+        let bucket_incarnation_id = ecstore
+            .bucket_incarnation_id(bucket_name.as_str())
+            .await
+            .expect("read bucket incarnation");
+        expire_transitioned_object(ecstore.clone(), &restored, &lc_event, &LcEventSrc::Scanner, bucket_incarnation_id)
             .await
             .expect("restore-expiry cleanup should succeed");
 

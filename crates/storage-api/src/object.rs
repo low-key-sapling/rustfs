@@ -167,7 +167,15 @@ impl VersionMarker {
         if marker == NULL_VERSION_MARKER {
             Ok(Self::Null)
         } else {
-            Ok(Self::Version(Uuid::parse_str(marker)?))
+            let version = Uuid::parse_str(marker)?;
+            // Older releases advertised the null version as a nil UUID
+            // (issue #6745); a stored null version has no UUID, so resuming
+            // by `Version(nil)` could never match. Fold it into `Null`.
+            if version.is_nil() {
+                Ok(Self::Null)
+            } else {
+                Ok(Self::Version(version))
+            }
         }
     }
 }
@@ -213,6 +221,20 @@ pub struct DeletedObject {
     pub replication_state: Option<ReplicationState>,
     pub found: bool,
     pub force_delete: bool,
+    pub force_delete_id: Option<Uuid>,
+    pub force_delete_target_arns: Vec<String>,
+    pub force_delete_generation: Option<i64>,
+}
+
+/// Accounting identity returned by the internal commit-time delete path.
+///
+/// This is carried separately from [`DeletedObject`] so adding quota details
+/// does not change the source shape of the public S3 delete result contract.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DeleteAccounting {
+    pub size: Option<u64>,
+    pub version_id: Option<Uuid>,
+    pub removed_current_object: bool,
 }
 
 impl DeletedObject {
@@ -338,6 +360,19 @@ pub trait ObjectOperations: Send + Sync + fmt::Debug {
         objects: Vec<Self::ObjectToDelete>,
         opts: Self::ObjectOptions,
     ) -> (Vec<Self::DeletedObject>, Vec<Option<Self::Error>>);
+    /// Delete objects and optionally return commit-time accounting identities.
+    /// The default preserves the ordinary delete contract for implementations
+    /// that do not expose storage-level accounting details.
+    async fn delete_objects_with_accounting(
+        &self,
+        bucket: &str,
+        objects: Vec<Self::ObjectToDelete>,
+        opts: Self::ObjectOptions,
+    ) -> (Vec<Self::DeletedObject>, Vec<Option<Self::Error>>, Vec<Option<DeleteAccounting>>) {
+        let object_count = objects.len();
+        let (deleted, errors) = self.delete_objects(bucket, objects, opts).await;
+        (deleted, errors, vec![None; object_count])
+    }
     async fn put_object_metadata(
         &self,
         bucket: &str,
@@ -686,6 +721,19 @@ fn is_modified_since(mod_time: &OffsetDateTime, given_time: &OffsetDateTime) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_marker_parse_folds_null_and_nil_uuid_into_null() {
+        assert_eq!(VersionMarker::parse("null"), Ok(VersionMarker::Null));
+        // Older releases advertised the null version as a nil UUID
+        // (issue #6745); it must resume as the null marker, not a UUID no
+        // stored version carries.
+        assert_eq!(VersionMarker::parse(Uuid::nil().to_string()), Ok(VersionMarker::Null));
+
+        let version = Uuid::from_u128(7);
+        assert_eq!(VersionMarker::parse(version.to_string()), Ok(VersionMarker::Version(version)));
+        assert!(VersionMarker::parse("not-a-version").is_err());
+    }
 
     #[test]
     fn http_preconditions_ignore_empty_etag_headers() {

@@ -21,6 +21,17 @@ message Error {
   string error_info = 2;
 }
 
+// Typed control-plane error discriminants carried alongside the legacy
+// error_info string on control-plane responses. Rolling-upgrade compat:
+// old peers ignore the field and keep reading error_info.
+// RUSTFS_COMPAT_TODO(not-initialized-error-code-v1): legacy string dual-write. Remove after the minimum supported RustFS peer version always sends error_code.
+enum ControlPlaneErrorCode {
+  CONTROL_PLANE_ERROR_UNSPECIFIED = 0;
+  // The peer answered but its storage/IAM layer is not initialized yet
+  // (legacy string form: "errServerNotInitialized").
+  CONTROL_PLANE_ERROR_NOT_INITIALIZED = 1;
+}
+
 message PingRequest {
   uint64 version = 1;
   bytes body = 2;
@@ -111,6 +122,9 @@ message DeleteRequest {
   string volume = 2;
   string path = 3;
   string options = 4;
+  // Optional scanner publication lease token. When present, the target binds
+  // the complete delete operation to its movement read admission.
+  bytes scanner_publication_lease_token = 5;
 }
 
 message DeleteResponse {
@@ -281,6 +295,10 @@ message RenameDataRequest {
   string dst_volume = 5;
   string dst_path = 6;
   bytes file_info_bin = 7;
+  // Optional target-side scanner publication lease.  Empty preserves the
+  // legacy rename request body; a non-empty token is checked at the target's
+  // rename linearization point.
+  bytes scanner_publication_lease_token = 8;
 }
 
 message RenameDataResponse {
@@ -493,6 +511,9 @@ message DeleteVersionsResponse {
   bool success = 1;
   repeated string errors = 2;
   optional Error error = 3;
+  // Senders dual-write the legacy strings and typed entries. Receivers prefer typed entries
+  // when present and fall back to strings for peers that predate this field. Code zero means success.
+  repeated Error item_errors = 4;
 }
 
 message ReadMultipleRequest {
@@ -570,6 +591,7 @@ message LocalStorageInfoResponse {
   bool success = 1;
   bytes storage_info = 2;
   optional string error_info = 3;
+  optional ControlPlaneErrorCode error_code = 4;
 }
 
 message ServerInfoRequest {
@@ -716,6 +738,7 @@ message LoadBucketMetadataRequest {
 message LoadBucketMetadataResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message DeleteBucketMetadataRequest {
@@ -734,6 +757,7 @@ message DeletePolicyRequest {
 message DeletePolicyResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message LoadPolicyRequest {
@@ -743,6 +767,7 @@ message LoadPolicyRequest {
 message LoadPolicyResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message LoadPolicyMappingRequest {
@@ -754,6 +779,7 @@ message LoadPolicyMappingRequest {
 message LoadPolicyMappingResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message DeleteUserRequest {
@@ -763,6 +789,7 @@ message DeleteUserRequest {
 message DeleteUserResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message DeleteServiceAccountRequest {
@@ -772,6 +799,7 @@ message DeleteServiceAccountRequest {
 message DeleteServiceAccountResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message LoadUserRequest {
@@ -782,6 +810,7 @@ message LoadUserRequest {
 message LoadUserResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message LoadServiceAccountRequest {
@@ -791,6 +820,7 @@ message LoadServiceAccountRequest {
 message LoadServiceAccountResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message LoadGroupRequest {
@@ -800,6 +830,7 @@ message LoadGroupRequest {
 message LoadGroupResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message ReloadSiteReplicationConfigRequest {}
@@ -807,6 +838,7 @@ message ReloadSiteReplicationConfigRequest {}
 message ReloadSiteReplicationConfigResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message SignalServiceRequest {
@@ -841,14 +873,72 @@ message ScannerActivityResponse {
   bytes response_proof = 7;
   uint64 dirty_usage_generation = 8;
   bool dirty_usage_pending = 9;
+  // v7 fields.  They are optional so v6 peers can continue to decode the
+  // response shape while newer readers fail closed when they are absent.
+  optional uint64 movement_generation = 10;
+  optional bool publication_blocked = 11;
 }
 
-message BackgroundHealStatusRequest {}
+// A short-lived storage-owned read admission used only around a final
+// scanner metadata publication.  It is intentionally separate from the
+// ScannerActivity observation wire so v6/v7 rolling compatibility remains
+// unchanged.
+message ScannerPublicationLeaseRequest {
+  bytes challenge = 1;
+  uint64 expected_movement_generation = 2;
+  uint64 ttl_ms = 3;
+  // The activity instance is a process session nonce.  It is intentionally
+  // separate from the storage-owned deployment identity returned by the
+  // lease response so a restart cannot reuse an old session token.
+  string expected_session_id = 4;
+  // A non-empty token turns the acquire RPC into an in-place validation of an
+  // existing lease.  Keeping this on the existing RPC lets old peers reject
+  // the proof without changing the v7 activity wire shape.
+  bytes token = 5;
+}
+
+message ScannerPublicationLeaseResponse {
+  bool success = 1;
+  bytes token = 2;
+  uint64 movement_generation = 3;
+  uint64 lease_ttl_ms = 4;
+  optional Error error = 5;
+  bytes response_proof = 6;
+  string owner_id = 7;
+  string session_id = 8;
+}
+
+message ScannerPublicationLeaseReleaseRequest {
+  bytes challenge = 1;
+  bytes token = 2;
+  string owner_id = 3;
+  string session_id = 4;
+}
+
+message ScannerPublicationLeaseReleaseResponse {
+  bool success = 1;
+  optional Error error = 2;
+  bytes response_proof = 3;
+}
+
+message BackgroundHealStatusRequest {
+  uint32 protocol_version = 1;
+}
 
 message BackgroundHealStatusResponse {
   bool success = 1;
   bytes bg_heal_state = 2;
   optional string error_info = 3;
+  optional ControlPlaneErrorCode error_code = 4;
+}
+
+message ReplacementRecoveryStatusRequest {}
+
+message ReplacementRecoveryStatusResponse {
+  bool success = 1;
+  bytes recovery_status = 2;
+  optional string error_info = 3;
+  optional ControlPlaneErrorCode error_code = 4;
 }
 
 message HealControlRequest {
@@ -889,6 +979,7 @@ message ReloadPoolMetaRequest {}
 message ReloadPoolMetaResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message StopRebalanceRequest {
@@ -898,6 +989,7 @@ message StopRebalanceRequest {
 message StopRebalanceResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message LoadRebalanceMetaRequest {
@@ -907,6 +999,7 @@ message LoadRebalanceMetaRequest {
 message LoadRebalanceMetaResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message StartDecommissionRequest {
@@ -916,6 +1009,7 @@ message StartDecommissionRequest {
 message StartDecommissionResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message CancelDecommissionRequest {
@@ -925,6 +1019,7 @@ message CancelDecommissionRequest {
 message CancelDecommissionResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message ClearDecommissionRequest {
@@ -934,6 +1029,7 @@ message ClearDecommissionRequest {
 message ClearDecommissionResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message LoadTransitionTierConfigRequest {}
@@ -941,6 +1037,7 @@ message LoadTransitionTierConfigRequest {}
 message LoadTransitionTierConfigResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message TierMutationPrepareRequest {
@@ -1083,7 +1180,10 @@ service NodeService {
   // rpc CommitBinary() returns () {};
   rpc SignalService(SignalServiceRequest) returns (SignalServiceResponse) {}; // auth-policy: body-bound
   rpc ScannerActivity(ScannerActivityRequest) returns (ScannerActivityResponse) {}; // auth-policy: body-bound
+  rpc AcquireScannerPublicationLease(ScannerPublicationLeaseRequest) returns (ScannerPublicationLeaseResponse) {}; // auth-policy: body-bound
+  rpc ReleaseScannerPublicationLease(ScannerPublicationLeaseReleaseRequest) returns (ScannerPublicationLeaseReleaseResponse) {}; // auth-policy: body-bound
   rpc BackgroundHealStatus(BackgroundHealStatusRequest) returns (BackgroundHealStatusResponse) {}; // auth-policy: read-only
+  rpc ReplacementRecoveryStatus(ReplacementRecoveryStatusRequest) returns (ReplacementRecoveryStatusResponse) {}; // auth-policy: read-only
   rpc GetMetacacheListing(GetMetacacheListingRequest) returns (GetMetacacheListingResponse) {}; // auth-policy: unimplemented
   rpc UpdateMetacacheListing(UpdateMetacacheListingRequest) returns (UpdateMetacacheListingResponse) {}; // auth-policy: unimplemented
   rpc ReloadPoolMeta(ReloadPoolMetaRequest) returns (ReloadPoolMetaResponse) {}; // auth-policy: body-bound

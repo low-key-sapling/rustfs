@@ -13,6 +13,9 @@
 // limitations under the License.
 
 use super::is_admin::IsAdminHandler;
+use crate::admin::handlers::account_audit::AccountAuditContext;
+use crate::admin::handlers::mfa::verify_for_session as mfa_verify_for_session;
+use crate::admin::runtime_sources::object_store_from_req;
 use crate::admin::service::federated_identity::DefaultFederatedSessionBinding;
 use crate::admin::service::session_policy::populate_session_policy;
 use crate::admin::storage_api::bucket::utils::serialize;
@@ -32,7 +35,9 @@ use hyper::Method;
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_iam::federation::{FederatedSessionBindingError, FederationError};
-use rustfs_madmin::{SITE_REPL_API_VERSION, SRIAMItem, SRSTSCredential};
+use rustfs_iam::mfa::service as mfa_service;
+use rustfs_madmin::account::{ERR_MFA_REQUIRED, IdentityType};
+use rustfs_madmin::{SITE_REPL_API_VERSION, SR_IAM_ITEM_STS_ACC, SRIAMItem, SRSTSCredential};
 use rustfs_policy::{
     auth::get_new_credentials_with_metadata,
     policy::{
@@ -40,6 +45,7 @@ use rustfs_policy::{
         action::{Action, StsAction},
     },
 };
+use rustfs_utils::MaskedAccessKey;
 use s3s::{
     Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
     dto::{AssumeRoleOutput, Credentials, Timestamp},
@@ -49,7 +55,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use serde_urlencoded::from_bytes;
 use time::{Duration, OffsetDateTime};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 const ASSUME_ROLE_ACTION: &str = "AssumeRole";
 const ASSUME_ROLE_WITH_WEB_IDENTITY_ACTION: &str = "AssumeRoleWithWebIdentity";
@@ -73,6 +79,33 @@ fn clamp_assume_role_duration(duration_seconds: usize) -> usize {
         STS_DEFAULT_DURATION_SECS
     } else {
         duration_seconds.clamp(STS_MIN_DURATION_SECS, STS_MAX_DURATION_SECS)
+    }
+}
+
+/// Record that AssumeRole assembled its session claims without echoing any claim values.
+///
+/// Claims carry caller-supplied identity material (parent user, session policy, arbitrary
+/// JWT fields); interpolating them into logs repeats the GHSA-r54g-49rx-98cr /
+/// GHSA-8cm2-h255-v749 credential-leak class. Only derived metadata may be logged here.
+fn trace_assume_role_claims(claims: &std::collections::HashMap<String, Value>) {
+    debug!(claim_count = claims.len(), "AssumeRole assembled session claims");
+}
+
+/// Build the site-replication IAM item that mirrors an AssumeRole temporary credential to peers.
+fn assume_role_site_replication_item(cred: &rustfs_credentials::Credentials, updated_at: OffsetDateTime) -> SRIAMItem {
+    SRIAMItem {
+        r#type: SR_IAM_ITEM_STS_ACC.to_string(),
+        sts_credential: Some(SRSTSCredential {
+            access_key: cred.access_key.clone(),
+            secret_key: cred.secret_key.clone(),
+            session_token: cred.session_token.clone(),
+            parent_user: cred.parent_user.clone(),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        }),
+        updated_at: Some(updated_at),
+        api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        ..Default::default()
     }
 }
 
@@ -117,13 +150,27 @@ pub struct AssumeRoleRequest {
     pub policy: String,
     pub external_id: String,
     pub web_identity_token: String,
+    /// The login challenge from `GET /v3/mfa/challenge`, echoed back.
+    ///
+    /// AWS uses `SerialNumber` to name an MFA device; RustFS has one virtual
+    /// device per identity, so the field carries the challenge instead. It is
+    /// optional: a client that skips the challenge round trip and sends only a
+    /// `TokenCode` still authenticates.
+    pub serial_number: String,
+    /// A six-digit TOTP code or a recovery code.
+    pub token_code: String,
 }
 
 pub struct AssumeRoleHandle {}
 #[async_trait::async_trait]
 impl Operation for AssumeRoleHandle {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle AssumeRoleHandle");
+        debug!("handle AssumeRoleHandle");
+
+        // Captured before the body is consumed: the second-factor gate needs the
+        // object store, and its audit entries need the request metadata.
+        let store = object_store_from_req(&req);
+        let audit = AccountAuditContext::from_request(&req);
 
         let mut input = req.input;
 
@@ -140,7 +187,7 @@ impl Operation for AssumeRoleHandle {
         match body.action.as_str() {
             ASSUME_ROLE_ACTION => {
                 let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-                handle_assume_role(req.credentials, req.uri, req.headers, remote_addr, body).await
+                handle_assume_role(req.credentials, req.uri, req.headers, remote_addr, body, store, &audit).await
             }
             ASSUME_ROLE_WITH_WEB_IDENTITY_ACTION => handle_assume_role_with_web_identity(body).await,
             _ => Err(s3_error!(InvalidArgument, "unsupported Action")),
@@ -155,6 +202,8 @@ async fn handle_assume_role(
     headers: http::HeaderMap,
     remote_addr: Option<std::net::SocketAddr>,
     body: AssumeRoleRequest,
+    store: Option<std::sync::Arc<crate::admin::storage_api::runtime::ECStore>>,
+    audit: &AccountAuditContext,
 ) -> S3Result<S3Response<(StatusCode, Body)>> {
     let Some(user) = credentials else {
         return Err(s3_error!(InvalidRequest, "get cred failed"));
@@ -196,7 +245,29 @@ async fn handle_assume_role(
         return Err(s3_error!(InvalidArgument, "not support version"));
     }
 
+    // Second-factor gate.
+    //
+    // This is the only place a second factor can be enforced, because minting an
+    // STS session is the only interactive login RustFS has. Note what is
+    // deliberately *not* gated: a request signed directly with a long-term
+    // access key. Gating that would break every script and CLI the moment a
+    // human enabled 2FA on their own account, and it would not add protection —
+    // whoever holds the secret key already has full access without ever
+    // presenting a code. Making 2FA meaningful for direct API access needs a
+    // policy condition on the session, which is tracked separately.
+    //
+    // An identity with no enrollment takes no new code path at all, so the
+    // behaviour of every existing deployment is unchanged.
+    let mfa_verified = enforce_second_factor(&cred.access_key, &body, store, audit).await?;
+
     let mut claims = cred.claims.unwrap_or_default();
+
+    if mfa_verified {
+        // Recorded on the session so a later policy condition can require it,
+        // and so an audit consumer can tell a two-factor session from a
+        // single-factor one.
+        claims.insert(MFA_VERIFIED_CLAIM.to_string(), Value::Bool(true));
+    }
 
     populate_session_policy(&mut claims, &body.policy)?;
 
@@ -223,7 +294,7 @@ async fn handle_assume_role(
         return Err(s3_error!(InvalidArgument, "global active sk not init"));
     };
 
-    info!("AssumeRole get claims {:?}", &claims);
+    trace_assume_role_claims(&claims);
 
     let mut new_cred = get_new_credentials_with_metadata(&claims, &secret)
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("get new cred failed {e}")))?;
@@ -244,21 +315,7 @@ async fn handle_assume_role(
 
     let root_access_key = current_action_credentials().map(|cred| cred.access_key);
     if root_access_key.as_deref() != Some(new_cred.parent_user.as_str())
-        && let Err(err) = site_replication_iam_change_hook(SRIAMItem {
-            r#type: "sts-credential".to_string(),
-            sts_credential: Some(SRSTSCredential {
-                access_key: new_cred.access_key.clone(),
-                secret_key: new_cred.secret_key.clone(),
-                session_token: new_cred.session_token.clone(),
-                parent_user: new_cred.parent_user.clone(),
-                api_version: Some(SITE_REPL_API_VERSION.to_string()),
-                ..Default::default()
-            }),
-            updated_at: Some(updated_at),
-            api_version: Some(SITE_REPL_API_VERSION.to_string()),
-            ..Default::default()
-        })
-        .await
+        && let Err(err) = site_replication_iam_change_hook(assume_role_site_replication_item(&new_cred, updated_at)).await
     {
         warn!("site replication STS hook failed, err: {err}");
     }
@@ -282,6 +339,61 @@ async fn handle_assume_role(
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize assume role output failed: {e}")))?;
 
     Ok(S3Response::new((StatusCode::OK, Body::from(output))))
+}
+
+/// Session claim marking a session that presented a second factor.
+///
+/// Namespaced with the `x-rustfs-` prefix so it cannot collide with an OIDC
+/// claim of the same name arriving from an identity provider.
+pub(crate) const MFA_VERIFIED_CLAIM: &str = "x-rustfs-mfa-verified";
+
+/// Require and verify a second factor when `access_key` has one enrolled.
+///
+/// Returns whether a factor was actually presented and verified. `false` means
+/// the identity has no enrollment, not that verification was skipped.
+async fn enforce_second_factor(
+    access_key: &str,
+    body: &AssumeRoleRequest,
+    store: Option<std::sync::Arc<crate::admin::storage_api::runtime::ECStore>>,
+    audit: &AccountAuditContext,
+) -> S3Result<bool> {
+    let Some(store) = store else {
+        // Failing closed here would make every login depend on the store being
+        // reachable, but failing *open* would let a store outage disable the
+        // second factor. The store is required for the lookup, so an
+        // unavailable one is reported as unavailable.
+        return Err(crate::admin::storage_api::s3::error(
+            S3ErrorCode::ServiceUnavailable,
+            "the object store is not ready",
+        ));
+    };
+
+    let now = OffsetDateTime::now_utc();
+    let required = mfa_service::is_enabled(store.clone(), access_key, now)
+        .await
+        .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, err.to_string()))?;
+
+    if !required {
+        return Ok(false);
+    }
+
+    if body.token_code.is_empty() {
+        debug!(
+            access_key = %MaskedAccessKey(access_key),
+            "AssumeRole requires a second factor"
+        );
+        // The message carries the sentinel clients match on to decide whether to
+        // prompt for a code rather than report a failed login.
+        return Err(S3Error::with_message(
+            S3ErrorCode::AccessDenied,
+            format!("{ERR_MFA_REQUIRED}: a second authentication factor is required"),
+        ));
+    }
+
+    let challenge = (!body.serial_number.is_empty()).then_some(body.serial_number.as_str());
+    mfa_verify_for_session(store, audit, access_key, IdentityType::Iam, challenge, &body.token_code).await?;
+
+    Ok(true)
 }
 
 /// Handle the AssumeRoleWithWebIdentity action.
@@ -383,6 +495,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn assume_role_claims_log_never_echoes_claim_values() {
+        #[derive(Clone, Default)]
+        struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        struct CapturedLogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for CapturedLogWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("captured log lock").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedLog {
+            type Writer = CapturedLogWriter;
+
+            fn make_writer(&'writer self) -> Self::Writer {
+                CapturedLogWriter(self.0.clone())
+            }
+        }
+
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(captured.clone())
+            .finish();
+
+        let mut claims = std::collections::HashMap::new();
+        claims.insert("parent".to_string(), Value::String("sensitive-parent-user".to_string()));
+        claims.insert("sessionPolicy".to_string(), Value::String("eyJzZWNyZXQtcG9saWN5LWJsb2Ii".to_string()));
+        claims.insert("sub".to_string(), Value::String("sensitive-subject-id".to_string()));
+
+        tracing::subscriber::with_default(subscriber, || {
+            trace_assume_role_claims(&claims);
+        });
+
+        let logs = String::from_utf8(captured.0.lock().expect("captured log lock").clone()).expect("captured logs must be UTF-8");
+        assert!(
+            logs.contains("claim_count"),
+            "expected the redacted claims log line to be emitted: {logs}"
+        );
+        for secret in [
+            "sensitive-parent-user",
+            "eyJzZWNyZXQtcG9saWN5LWJsb2Ii",
+            "sensitive-subject-id",
+            "sessionPolicy",
+        ] {
+            assert!(!logs.contains(secret), "AssumeRole claims log leaked {secret}: {logs}");
+        }
+    }
+
+    #[test]
     fn test_xml_escape() {
         assert_eq!(xml_escape("hello"), "hello");
         assert_eq!(xml_escape("<script>"), "&lt;script&gt;");
@@ -420,6 +590,30 @@ mod tests {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let exp = now.saturating_add(clamp_assume_role_duration(ten_years_secs) as i64);
         assert!(exp - now <= STS_MAX_DURATION_SECS as i64);
+    }
+
+    #[test]
+    fn assume_role_replication_item_uses_minio_sts_account_type() {
+        let cred = rustfs_credentials::Credentials {
+            access_key: "ASSUMEROLETESTACCESS".to_string(),
+            secret_key: "assumeRoleTestSecret123".to_string(),
+            session_token: "assume-role-test-session-token".to_string(),
+            parent_user: "assume-role-parent".to_string(),
+            ..Default::default()
+        };
+
+        let item = assume_role_site_replication_item(&cred, OffsetDateTime::UNIX_EPOCH);
+
+        // MinIO madmin-go `SRIAMItemSTSAcc`: any other value is rejected by MinIO peers.
+        assert_eq!(item.r#type, "sts-account");
+        assert_eq!(item.updated_at, Some(OffsetDateTime::UNIX_EPOCH));
+        assert_eq!(item.api_version.as_deref(), Some(SITE_REPL_API_VERSION));
+        let sts = item.sts_credential.expect("replication item should carry the STS credential");
+        assert_eq!(sts.access_key, cred.access_key);
+        assert_eq!(sts.secret_key, cred.secret_key);
+        assert_eq!(sts.session_token, cred.session_token);
+        assert_eq!(sts.parent_user, cred.parent_user);
+        assert_eq!(sts.api_version.as_deref(), Some(SITE_REPL_API_VERSION));
     }
 
     #[test]

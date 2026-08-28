@@ -173,20 +173,28 @@ pub async fn lookup_config() -> Result<Args, OpaConfigError> {
 
 impl AuthZPlugin {
     pub fn new(config: Args) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .connect_timeout(Duration::from_secs(1))
-            .pool_max_idle_per_host(10)
-            .pool_idle_timeout(Some(Duration::from_secs(60)))
-            .tcp_keepalive(Some(Duration::from_secs(30)))
-            .tcp_nodelay(true)
-            .http2_keep_alive_interval(Some(Duration::from_secs(30)))
-            .http2_keep_alive_timeout(Duration::from_secs(15))
-            .build()
-            .unwrap_or_else(|err| {
-                error!("failed to build OPA HTTP client, falling back to default reqwest client: {err}");
-                reqwest::Client::new()
-            });
+        let builder = || {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .connect_timeout(Duration::from_secs(1))
+                .pool_max_idle_per_host(10)
+                .pool_idle_timeout(Some(Duration::from_secs(60)))
+                .tcp_keepalive(Some(Duration::from_secs(30)))
+                .tcp_nodelay(true)
+                .http2_keep_alive_interval(Some(Duration::from_secs(30)))
+                .http2_keep_alive_timeout(Duration::from_secs(15))
+        };
+        // Never fall back to `reqwest::Client::new()`: it panics for the same
+        // reason the first build failed (e.g. no system CA bundle, issue
+        // #6734). Retry with an explicit empty trust store instead — an HTTP
+        // OPA endpoint keeps working, an HTTPS one fails closed per request.
+        let client = builder().build().unwrap_or_else(|err| {
+            error!("failed to build OPA HTTP client ({err}); continuing with an empty trust store");
+            builder()
+                .tls_certs_only(std::iter::empty::<reqwest::Certificate>())
+                .build()
+                .expect("HTTP client construction must succeed with an explicit empty trust store")
+        });
 
         Self { client, args: config }
     }
@@ -274,7 +282,9 @@ impl AuthZPlugin {
                     "context": {
                         "conditions": args.conditions,
                         "deny_only": args.deny_only,
-                        "timestamp": chrono::Utc::now().to_rfc3339()
+                        "timestamp": jiff::Timestamp::now()
+                            .display_with_offset(jiff::tz::Offset::UTC)
+                            .to_string()
                     }
             }
         })
@@ -437,6 +447,43 @@ mod tests {
             assert_reqwest_client(&plugin.client);
             assert_eq!(plugin.args.url, endpoint);
         }
+    }
+
+    #[test]
+    fn test_build_opa_input_timestamp_serializes_as_rfc3339_utc() {
+        let plugin = AuthZPlugin::new(Args {
+            url: "http://127.0.0.1:8181/v1/data/rustfs/authz/allow".to_string(),
+            auth_token: String::new(),
+        });
+        let groups = Some(vec!["developers".to_string()]);
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let args = PArgs {
+            account: "account",
+            groups: &groups,
+            action: crate::policy::action::Action::None,
+            bucket: "bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "object",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        let payload = plugin.build_opa_input(&args);
+        let timestamp = payload
+            .pointer("/input/context/timestamp")
+            .and_then(|value| value.as_str())
+            .expect("OPA input should include a timestamp string");
+
+        timestamp
+            .parse::<jiff::Timestamp>()
+            .expect("OPA timestamp should remain RFC3339-compatible");
+        assert!(timestamp.contains('T'), "OPA timestamp should use RFC3339 date-time form: {timestamp}");
+        assert!(
+            timestamp.ends_with("+00:00"),
+            "OPA timestamp should preserve chrono::DateTime::to_rfc3339 UTC offset form: {timestamp}"
+        );
     }
 
     #[test]

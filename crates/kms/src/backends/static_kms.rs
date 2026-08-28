@@ -26,7 +26,7 @@
 
 use crate::backends::{BackendCapabilities, KmsBackend, empty_key_page, list_keys_page_size};
 use crate::config::{BackendConfig, KmsConfig};
-use crate::encryption::DataKeyEnvelope;
+use crate::encryption::{DataKeyEnvelope, context_aad, generate_key_material};
 use crate::error::{KmsError, Result};
 use crate::types::*;
 use aes_gcm::{
@@ -36,7 +36,7 @@ use aes_gcm::{
 use async_trait::async_trait;
 use jiff::Zoned;
 use rand::RngExt;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use tracing::debug;
 use zeroize::Zeroizing;
 
@@ -44,11 +44,6 @@ use zeroize::Zeroizing;
 const NONCE_SIZE: usize = 12;
 /// AES-256 key size in bytes.
 const KEY_SIZE: usize = 32;
-
-fn context_aad(context: &HashMap<String, String>) -> Result<Vec<u8>> {
-    let canonical: BTreeMap<&str, &str> = context.iter().map(|(key, value)| (key.as_str(), value.as_str())).collect();
-    serde_json::to_vec(&canonical).map_err(Into::into)
-}
 
 /// Static single-key KMS backend.
 ///
@@ -59,6 +54,18 @@ pub struct StaticKmsBackend {
     key_id: String,
     /// The raw 32-byte AES-256 key material (zeroed on drop).
     key: Zeroizing<[u8; KEY_SIZE]>,
+    /// When this backend was constructed, reported as the key's creation date.
+    ///
+    /// A statically configured key has no creation event to report, but the
+    /// value still has to be *stable*: reading it from the clock on each call
+    /// made `describe_key` and `list_keys` answer differently every time, so no
+    /// caller could diff an inventory or cache a description.
+    ///
+    /// The stability this buys is per process. The reported date still moves
+    /// across a restart and differs between nodes of one cluster, because there
+    /// is no creation event to anchor it to; callers must treat it as "when this
+    /// node loaded the key", not as the key's birth date.
+    created_at: Zoned,
 }
 
 impl StaticKmsBackend {
@@ -82,6 +89,7 @@ impl StaticKmsBackend {
         Ok(Self {
             key_id: static_config.key_id.clone(),
             key: key.into(),
+            created_at: Zoned::now(),
         })
     }
 
@@ -92,7 +100,7 @@ impl StaticKmsBackend {
             key_state: KeyState::Enabled,
             key_usage: KeyUsage::EncryptDecrypt,
             description: Some("Static single-key KMS backend".to_string()),
-            creation_date: Zoned::now(),
+            creation_date: self.created_at.clone(),
             deletion_date: None,
             origin: "EXTERNAL".to_string(),
             key_manager: "STATIC".to_string(),
@@ -113,9 +121,10 @@ impl StaticKmsBackend {
         let mut nonce_bytes = [0u8; NONCE_SIZE];
         rand::rng().fill(&mut nonce_bytes[..]);
 
-        // Generate 32 random bytes as plaintext DEK
-        let mut plaintext = [0u8; KEY_SIZE];
-        rand::rng().fill(&mut plaintext[..]);
+        // The requested spec decides the DEK length; a caller that asked for
+        // AES_128 and silently got 256 bits would build objects whose recorded
+        // spec does not match their key material.
+        let plaintext = generate_key_material(&request.key_spec)?;
 
         // Encrypt DEK with AES-256-GCM using the static key directly
         let key = Key::<Aes256Gcm>::from(*self.key);
@@ -127,7 +136,7 @@ impl StaticKmsBackend {
             .encrypt(
                 &nonce,
                 Payload {
-                    msg: plaintext.as_ref(),
+                    msg: plaintext.as_slice(),
                     aad: &aad,
                 },
             )
@@ -143,13 +152,17 @@ impl StaticKmsBackend {
             created_at: Zoned::now(),
             // The static backend has a single fixed key with no rotation.
             master_key_version: None,
+            // The context is already bound as AAD by the Static cipher path
+            // unconditionally; this field describes only the DekCrypto-layer
+            // binding, which Static envelopes never use.
+            context_binding: None,
         };
         let ciphertext = serde_json::to_vec(&envelope)?;
 
         Ok(DataKeyInfo::new(
             self.key_id.clone(),
             0,
-            Some(plaintext.to_vec()),
+            Some(plaintext),
             ciphertext,
             request.key_spec.clone(),
         ))
@@ -190,6 +203,10 @@ impl StaticKmsBackend {
             created_at: Zoned::now(),
             // The static backend has a single fixed key with no rotation.
             master_key_version: None,
+            // The context is already bound as AAD by the Static cipher path
+            // unconditionally; this field describes only the DekCrypto-layer
+            // binding, which Static envelopes never use.
+            context_binding: None,
         };
         let ciphertext = serde_json::to_vec(&envelope)?;
 
@@ -260,6 +277,9 @@ impl StaticKmsBackend {
             created_at: metadata.creation_date,
             rotated_at: None,
             created_by: None,
+            rotation_due: false,
+            rotation_due_reason: None,
+            wrap_budget_reserved: None,
         })
     }
 
@@ -272,19 +292,9 @@ impl StaticKmsBackend {
             return Ok(empty_key_page());
         }
 
-        let key_info = KeyInfo {
-            key_id: self.key_id.clone(),
-            description: Some("Static single-key KMS backend".to_string()),
-            algorithm: "AES_256".to_string(),
-            usage: KeyUsage::EncryptDecrypt,
-            status: KeyStatus::Active,
-            version: 1,
-            metadata: HashMap::new(),
-            tags: HashMap::new(),
-            created_at: Zoned::now(),
-            rotated_at: None,
-            created_by: None,
-        };
+        // Built through the same constructor `describe_key` uses, so a listed
+        // key and a described key can never drift apart.
+        let key_info = self.configured_key_info(&self.key_id)?;
 
         // The marker is an exclusive lower bound on the identifier, as it is
         // for every other backend.
@@ -311,6 +321,9 @@ impl StaticKmsBackend {
             keys: vec![key_info],
             next_marker: None,
             truncated: false,
+            // The configured key is described from memory, so it can never be
+            // present-but-unreadable.
+            unreadable_key_ids: Vec::new(),
         })
     }
 }
@@ -347,17 +360,20 @@ impl KmsBackend for StaticKmsBackend {
             encryption_context: request.encryption_context,
             grant_tokens: Vec::new(),
         };
-        let data_key = self.generate_data_key_envelope(&gen_req)?;
+        let mut data_key = self.generate_data_key_envelope(&gen_req)?;
 
+        // Fields are taken, not destructured or cloned: `DataKeyInfo` has a
+        // `Drop` impl, and a clone would leave a second un-zeroized plaintext
+        // DEK on the heap.
         let plaintext_key = data_key
             .plaintext
-            .clone()
+            .take()
             .ok_or_else(|| KmsError::internal_error("Generated data key is missing plaintext"))?;
 
         Ok(GenerateDataKeyResponse {
-            key_id: data_key.key_id.clone(),
+            key_id: std::mem::take(&mut data_key.key_id),
             plaintext_key,
-            ciphertext_blob: data_key.ciphertext.clone(),
+            ciphertext_blob: std::mem::take(&mut data_key.ciphertext),
         })
     }
 
@@ -405,7 +421,9 @@ impl KmsBackend for StaticKmsBackend {
 
     fn capabilities(&self) -> BackendCapabilities {
         // Static KMS is a read-only single-key backend: it only performs
-        // cryptographic operations and rejects every lifecycle mutation.
+        // cryptographic operations and rejects every lifecycle mutation. Its
+        // key material comes straight from configuration, so like Local it is
+        // a development/testing backend and never production_supported.
         BackendCapabilities::minimal()
     }
 }
@@ -416,8 +434,7 @@ mod tests {
     use crate::backends::KmsBackend as KmsBackendTrait;
     use crate::config::{BackendConfig, KmsBackend, StaticConfig};
     use crate::encryption::is_data_key_envelope;
-    use base64::Engine as _;
-    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64_simd::STANDARD as BASE64;
 
     /// Generate a random 32-byte key and return (key_id, raw_key).
     fn random_static_key(key_id: &str) -> (String, [u8; 32]) {
@@ -429,7 +446,7 @@ mod tests {
     fn static_config(key_id: &str, raw_key: &[u8; 32]) -> StaticConfig {
         StaticConfig {
             key_id: key_id.to_string(),
-            secret_key: BASE64.encode(raw_key),
+            secret_key: BASE64.encode_to_string(raw_key),
         }
     }
 
@@ -828,5 +845,38 @@ mod tests {
             .await
             .expect_err("create_key for configured key should return KeyAlreadyExists");
         assert!(create_err.to_string().contains("already exists"));
+    }
+
+    /// The configured key's reported creation date must not move within a
+    /// process.
+    ///
+    /// It used to be read from the clock inside every describe and every list,
+    /// so two reads of the same unchanged key disagreed and no caller could
+    /// diff an inventory or cache a description. It also made `describe_key`
+    /// and `list_keys` report different dates for the one key that exists.
+    /// Stability across restarts and across nodes is not claimed — see the
+    /// field's own doc for why there is nothing to anchor it to.
+    #[tokio::test]
+    async fn configured_key_reports_a_stable_creation_date_within_a_process() {
+        let (backend, key_id, _key) = create_test_backend().await;
+
+        let first = KmsBackendTrait::describe_key(&backend, DescribeKeyRequest { key_id: key_id.clone() })
+            .await
+            .expect("describe_key should succeed")
+            .key_metadata
+            .creation_date;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let second = KmsBackendTrait::describe_key(&backend, DescribeKeyRequest { key_id: key_id.clone() })
+            .await
+            .expect("describe_key should succeed")
+            .key_metadata
+            .creation_date;
+        assert_eq!(first, second, "describing the same unchanged key twice must report one date");
+
+        let listed = KmsBackendTrait::list_keys(&backend, ListKeysRequest::default())
+            .await
+            .expect("list_keys should succeed");
+        let listed = listed.keys.first().expect("the configured key must be listed");
+        assert_eq!(listed.created_at, first, "the listed key must report the described date");
     }
 }

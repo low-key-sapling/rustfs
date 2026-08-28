@@ -87,6 +87,10 @@ fn emit_fatal_stderr(context: &str, error: impl std::fmt::Display) {
 async fn async_main(command_result: CommandResult, env_compat_report: rustfs_utils::ExternalEnvCompatReport) -> Result<()> {
     hotpath::tokio_runtime!();
 
+    // Log container resource detection early in startup
+    // This helps operators verify that ZfFS correctly detected cgroup limits
+    crate::cgroup_resources::log_container_resources();
+
     // Execute subcommand, or prepare config for `server` subcommand
     let config = match command_result {
         CommandResult::Info(opts) => {
@@ -97,6 +101,21 @@ async fn async_main(command_result: CommandResult, env_compat_report: rustfs_uti
         // Diagnose short-circuits before observability init on purpose:
         // the report goes to stdout and must not be wrapped by the JSON logger.
         CommandResult::Diagnose(opts) => return crate::diagnose::execute_diagnose(&opts),
+        // Inspect is offline like diagnose: read-only against drive paths, output
+        // to stdout/--out, and must run before any observability/storage init.
+        CommandResult::Inspect(opts) => return crate::inspect::execute_inspect(&opts).await,
+        CommandResult::ConnectRegister(opts) => {
+            let registered = crate::connect::register_from_protected_input(
+                &opts.endpoint,
+                &opts.ca_file,
+                &opts.state_dir,
+                opts.token_file.as_deref(),
+            )
+            .await
+            .map_err(Error::other)?;
+            println!("device={} cluster={}", registered.device_uid, registered.cluster_name);
+            return Ok(());
+        }
         CommandResult::Server(config) => config,
     };
 
@@ -154,6 +173,8 @@ async fn run(config: Config) -> Result<()> {
         shutdown_token: ctx,
     } = init_startup_storage_runtime(server_addr, &endpoint_pools, readiness.clone(), instance_ctx).await?;
 
+    let capacity_tasks = crate::capacity::capacity_integration::init_capacity_management_managed().await;
+
     let service_runtime = init_startup_runtime_services(
         &config,
         endpoint_pools,
@@ -170,6 +191,7 @@ async fn run(config: Config) -> Result<()> {
         state_manager,
         s3_shutdown_tx,
         console_shutdown_tx,
+        capacity_tasks,
         service_runtime,
         store,
         shutdown_token: ctx,

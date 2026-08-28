@@ -52,10 +52,6 @@ if [ -z "${RUSTFS_UNSAFE_BYPASS_DISK_CHECK+x}" ] && [ -z "${MINIO_CI+x}" ]; then
     export RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true
 fi
 
-if [ -z "${RUSTFS_ALLOCATOR_RECLAIM_ENABLED+x}" ]; then
-    export RUSTFS_ALLOCATOR_RECLAIM_ENABLED=true
-fi
-
 export RUSTFS_VOLUMES="${RUSTFS_VOLUMES:-./target/volume/test{1...4}}"
 # export RUSTFS_VOLUMES="./target/volume/test"
 export RUSTFS_ADDRESS="${RUSTFS_ADDRESS:-127.0.0.1:9000}"
@@ -209,6 +205,7 @@ export RUSTFS_NS_SCANNER_INTERVAL=60  # Object scanning interval in seconds
 
 # Storage level compression (compression at object storage level)
 # export RUSTFS_COMPRESSION_ENABLED=true # Whether to enable storage-level compression for objects
+# export RUSTFS_COMPRESSION_MULTIPART_ENABLED=true # Additionally compress multipart uploads (staged rollout switch: enable only after the whole fleet runs a build with the resumable decompressor; see docs/architecture/compat-cleanup-register.md)
 
 # HTTP Response Compression (whitelist-based, aligned with MinIO)
 # By default, HTTP response compression is DISABLED (aligned with MinIO behavior)

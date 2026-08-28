@@ -14,110 +14,55 @@
 
 use super::NodeService;
 use crate::storage::storage_api::rpc_consumer::node_service::{
-    BatchReadVersionReq, BatchReadVersionResp, DeleteOptions, DiskError, DiskInfoOptions, DiskStore, FileInfoVersions,
-    ReadMultipleReq, ReadMultipleResp, ReadOptions, StorageDiskRpcExt as _, UpdateMetadataOpts,
-    validate_batch_read_version_item_count,
+    BatchReadVersionReq, BatchReadVersionResp, DeleteOptions, DiskError, DiskInfoOptions, FileInfoVersions, ReadMultipleReq,
+    ReadMultipleResp, ReadOptions, StorageDiskRpcExt as _, UpdateMetadataOpts, validate_batch_read_version_item_count,
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
-use crate::storage::storage_api::{PartTransactionAction, SnapshotLeaseToken, verify_tonic_mutation_body_digest};
+use crate::storage::storage_api::{PartTransactionAction, RenameDataResp, SnapshotLeaseToken, verify_tonic_mutation_body_digest};
 use bytes::Bytes;
 use rustfs_filemeta::FileInfo;
 use rustfs_io_metrics::internode_metrics::{
     INTERNODE_MSGPACK_CODEC_JSON, INTERNODE_MSGPACK_CODEC_MSGPACK, INTERNODE_MSGPACK_DIRECTION_REQUEST,
-    INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC,
-    global_internode_metrics,
+    INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION, INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_READ_VERSION,
+    INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_STAGE_BATCH_READ_VERSION_DISK_READ,
+    INTERNODE_STAGE_BATCH_READ_VERSION_REQUEST_DECODE, INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_JSON_ENCODE,
+    INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_MSGPACK_ENCODE, INTERNODE_STAGE_READ_VERSION_DISK_READ,
+    INTERNODE_STAGE_READ_VERSION_REQUEST_DECODE, INTERNODE_STAGE_READ_VERSION_RESPONSE_JSON_ENCODE,
+    INTERNODE_STAGE_READ_VERSION_RESPONSE_MSGPACK_ENCODE, INTERNODE_TRANSPORT_BACKEND_GRPC, global_internode_metrics,
 };
 use rustfs_protos::proto_gen::node_service::*;
 use serde::de::DeserializeOwned;
-use std::{collections::HashMap, io::Cursor, time::Duration};
-use tokio::sync::mpsc;
-use tokio_util::time::DelayQueue;
+use std::io::Cursor;
+use std::time::Instant;
 use tonic::{Request, Response, Status};
 use tracing::debug;
+use uuid::Uuid;
 
-/// Initial capacity hint (bytes) for msgpack encode buffers, sized to cover a typical single-
-/// version `FileInfo` without repeated growth reallocations. Larger payloads still grow as needed.
+/// Initial capacity hint (bytes) for typical small msgpack requests and responses.
 const MSGPACK_ENCODE_CAPACITY_HINT: usize = 512;
+const FILE_INFO_MSGPACK_ENCODE_CAPACITY_HINT: usize = 1024;
 const SNAPSHOT_LEASE_PROTOCOL_VERSION: u32 = 1;
-const SNAPSHOT_LEASE_MIN_TTL: Duration = Duration::from_secs(5);
-const SNAPSHOT_LEASE_MAX_TTL: Duration = Duration::from_secs(5 * 60);
 
-struct SnapshotLeaseExpiry {
-    disk: DiskStore,
-    volume: String,
-    path: String,
-    token: SnapshotLeaseToken,
-}
-
-pub(super) struct SnapshotLeaseExpiryScheduler {
-    tx: mpsc::UnboundedSender<SnapshotLeaseExpiryCommand>,
-}
-
-enum SnapshotLeaseExpiryCommand {
-    Schedule(SnapshotLeaseExpiry, Duration),
-    Cancel(SnapshotLeaseToken),
-}
-
-impl SnapshotLeaseExpiryScheduler {
-    pub(super) fn new() -> Self {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        tokio::spawn(async move {
-            let mut expirations: DelayQueue<SnapshotLeaseExpiry> = DelayQueue::new();
-            let mut keys = HashMap::new();
-            loop {
-                tokio::select! {
-                    Some(command) = rx.recv() => {
-                        match command {
-                            SnapshotLeaseExpiryCommand::Schedule(expiry, ttl) => {
-                                if let Some(key) = keys.remove(&expiry.token) {
-                                    expirations.remove(&key);
-                                }
-                                let token = expiry.token;
-                                let key = expirations.insert(expiry, ttl);
-                                keys.insert(token, key);
-                            }
-                            SnapshotLeaseExpiryCommand::Cancel(token) => {
-                                if let Some(key) = keys.remove(&token) {
-                                    expirations.remove(&key);
-                                }
-                            }
-                        }
-                    }
-                    Some(expired) = futures_util::StreamExt::next(&mut expirations), if !expirations.is_empty() => {
-                        let expiry = expired.into_inner();
-                        keys.remove(&expiry.token);
-                        let _ = expiry
-                            .disk
-                            .release_snapshot_lease(&expiry.volume, &expiry.path, expiry.token)
-                            .await;
-                    }
-                    else => break,
-                }
-            }
-        });
-        Self { tx }
-    }
-
-    fn schedule(&self, expiry: SnapshotLeaseExpiry, ttl: Duration) -> Result<(), SnapshotLeaseExpiry> {
-        self.tx
-            .send(SnapshotLeaseExpiryCommand::Schedule(expiry, ttl))
-            .map_err(|err| match err.0 {
-                SnapshotLeaseExpiryCommand::Schedule(expiry, _) => expiry,
-                SnapshotLeaseExpiryCommand::Cancel(_) => unreachable!(),
-            })
-    }
-
-    fn cancel(&self, token: SnapshotLeaseToken) {
-        let _ = self.tx.send(SnapshotLeaseExpiryCommand::Cancel(token));
+fn snapshot_lease_response(result: Result<SnapshotLeaseToken, DiskError>) -> Response<SnapshotLeaseResponse> {
+    match result {
+        Ok(token) => Response::new(SnapshotLeaseResponse {
+            success: true,
+            token: token.as_bytes().to_vec().into(),
+            protocol_version: SNAPSHOT_LEASE_PROTOCOL_VERSION,
+            error: None,
+        }),
+        Err(err) => Response::new(SnapshotLeaseResponse {
+            success: false,
+            token: Bytes::new(),
+            protocol_version: SNAPSHOT_LEASE_PROTOCOL_VERSION,
+            error: Some(err.into()),
+        }),
     }
 }
 
-fn snapshot_lease_ttl(ttl_ms: u64) -> Result<Duration, Status> {
-    let ttl = Duration::from_millis(ttl_ms);
-    if !(SNAPSHOT_LEASE_MIN_TTL..=SNAPSHOT_LEASE_MAX_TTL).contains(&ttl) {
-        return Err(Status::invalid_argument("snapshot lease TTL is outside the supported range"));
-    }
-    Ok(ttl)
+struct DecodedRpcPayload<T> {
+    value: T,
+    from_msgpack: bool,
 }
 
 fn decode_msgpack_or_json<T: DeserializeOwned>(
@@ -125,6 +70,14 @@ fn decode_msgpack_or_json<T: DeserializeOwned>(
     json: &str,
     value_name: &'static str,
 ) -> std::result::Result<T, DiskError> {
+    Ok(decode_msgpack_or_json_with_source(binary, json, value_name)?.value)
+}
+
+fn decode_msgpack_or_json_with_source<T: DeserializeOwned>(
+    binary: &[u8],
+    json: &str,
+    value_name: &'static str,
+) -> std::result::Result<DecodedRpcPayload<T>, DiskError> {
     if !binary.is_empty() {
         let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(binary));
         return match T::deserialize(&mut deserializer) {
@@ -134,7 +87,10 @@ fn decode_msgpack_or_json<T: DeserializeOwned>(
                     value_name,
                     INTERNODE_MSGPACK_CODEC_MSGPACK,
                 );
-                Ok(value)
+                Ok(DecodedRpcPayload {
+                    value,
+                    from_msgpack: true,
+                })
             }
             Err(err) => {
                 global_internode_metrics().record_msgpack_json_decode_error(
@@ -157,7 +113,10 @@ fn decode_msgpack_or_json<T: DeserializeOwned>(
                 value_name,
                 INTERNODE_MSGPACK_CODEC_JSON,
             );
-            Ok(value)
+            Ok(DecodedRpcPayload {
+                value,
+                from_msgpack: false,
+            })
         }
         Err(err) => {
             global_internode_metrics().record_msgpack_json_decode_error(
@@ -170,12 +129,47 @@ fn decode_msgpack_or_json<T: DeserializeOwned>(
     }
 }
 
-fn encode_msgpack<T: serde::Serialize>(value: &T, value_name: &str) -> std::result::Result<Vec<u8>, DiskError> {
-    let mut serializer = rmp_serde::Serializer::new(Vec::with_capacity(MSGPACK_ENCODE_CAPACITY_HINT));
+fn encode_msgpack_with_capacity<T: serde::Serialize>(
+    value: &T,
+    value_name: &str,
+    capacity: usize,
+) -> std::result::Result<Vec<u8>, DiskError> {
+    let mut serializer = rmp_serde::Serializer::new(Vec::with_capacity(capacity));
     value
         .serialize(&mut serializer)
         .map_err(|err| DiskError::other(format!("encode {value_name} msgpack failed: {err}")))?;
     Ok(serializer.into_inner())
+}
+
+fn encode_msgpack<T: serde::Serialize>(value: &T, value_name: &str) -> std::result::Result<Vec<u8>, DiskError> {
+    encode_msgpack_with_capacity(value, value_name, MSGPACK_ENCODE_CAPACITY_HINT)
+}
+
+fn encode_file_info_msgpack(value: &FileInfo) -> std::result::Result<Vec<u8>, DiskError> {
+    encode_msgpack_with_capacity(value, "FileInfo", FILE_INFO_MSGPACK_ENCODE_CAPACITY_HINT)
+}
+
+fn encode_delete_versions_errors(disk_errors: Vec<Option<DiskError>>) -> (Vec<String>, Vec<Error>) {
+    let mut errors = Vec::with_capacity(disk_errors.len());
+    let mut item_errors = Vec::with_capacity(disk_errors.len());
+    for error in disk_errors {
+        match error {
+            Some(error) => {
+                let code = match &error {
+                    DiskError::Io(source) if source.kind() == std::io::ErrorKind::NotFound => DiskError::FileNotFound.to_u32(),
+                    _ => error.to_u32(),
+                };
+                let error_info = error.to_string();
+                errors.push(error_info.clone());
+                item_errors.push(Error { code, error_info });
+            }
+            None => {
+                errors.push(String::new());
+                item_errors.push(Error::default());
+            }
+        }
+    }
+    (errors, item_errors)
 }
 
 fn encode_msgpack_named<T: serde::Serialize>(value: &T, value_name: &str) -> std::result::Result<Vec<u8>, DiskError> {
@@ -204,11 +198,16 @@ fn verify_disk_mutation_digest<T>(
         .map_err(|err| Status::permission_denied(format!("{op} authentication failed: {err}")))
 }
 
-/// JSON compatibility string for a dual-encoded response field. Returns an empty string only when
-/// msgpack-only mode and its explicit fleet confirmation guard are both enabled; otherwise the
-/// legacy JSON encoding is retained for old peers. The paired `_bin` field is always sent.
-fn compat_response_json<T: serde::Serialize>(value: &T) -> std::result::Result<String, serde_json::Error> {
-    if rustfs_protos::internode_rpc_msgpack_only() {
+/// JSON compatibility string for a dual-encoded response field. Returns an empty string when
+/// msgpack-only mode and its explicit fleet confirmation guard are both enabled, or when
+/// request-local `_bin` payloads prove the caller can consume the paired response `_bin` field,
+/// while legacy JSON-only callers still need the compatibility response string during rollout.
+/// The paired `_bin` field is always sent.
+fn compat_response_json<T: serde::Serialize>(
+    value: &T,
+    request_had_msgpack_payload: bool,
+) -> std::result::Result<String, serde_json::Error> {
+    if request_had_msgpack_payload || rustfs_protos::internode_rpc_msgpack_only() {
         return Ok(String::new());
     }
     serde_json::to_string(value)
@@ -222,7 +221,7 @@ fn encode_read_multiple_response_payloads(
 
     for read_multiple_resp in read_multiple_resps {
         read_multiple_resps_json.push(
-            compat_response_json(read_multiple_resp)
+            compat_response_json(read_multiple_resp, false)
                 .map_err(|err| DiskError::other(format!("encode ReadMultipleResp json failed: {err}")))?,
         );
         read_multiple_resps_bin.push(Bytes::from(encode_msgpack(read_multiple_resp, "ReadMultipleResp")?));
@@ -231,21 +230,76 @@ fn encode_read_multiple_response_payloads(
     Ok((read_multiple_resps_json, read_multiple_resps_bin))
 }
 
+fn internode_stage_timer(attribution_enabled: bool) -> Option<Instant> {
+    attribution_enabled.then(Instant::now)
+}
+
+fn record_read_version_stage(stage: &'static str, started_at: Option<Instant>) {
+    if let Some(started_at) = started_at {
+        global_internode_metrics().record_stage_duration_for_operation_and_backend(
+            INTERNODE_OPERATION_GRPC_READ_VERSION,
+            INTERNODE_TRANSPORT_BACKEND_GRPC,
+            stage,
+            started_at.elapsed(),
+        );
+    }
+}
+
+fn record_batch_read_version_stage(stage: &'static str, started_at: Option<Instant>) {
+    if let Some(started_at) = started_at {
+        global_internode_metrics().record_stage_duration_for_operation_and_backend(
+            INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION,
+            INTERNODE_TRANSPORT_BACKEND_GRPC,
+            stage,
+            started_at.elapsed(),
+        );
+    }
+}
+
 fn encode_batch_read_version_response_payloads(
     batch_read_version_resps: &[BatchReadVersionResp],
+    request_decoded_from_msgpack: bool,
 ) -> std::result::Result<(Vec<String>, Vec<Bytes>), DiskError> {
+    let attribution_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
     let mut batch_read_version_resps_json = Vec::with_capacity(batch_read_version_resps.len());
-    let mut batch_read_version_resps_bin = Vec::with_capacity(batch_read_version_resps.len());
-
+    let json_encode_started = internode_stage_timer(attribution_enabled);
     for batch_read_version_resp in batch_read_version_resps {
         batch_read_version_resps_json.push(
-            compat_response_json(batch_read_version_resp)
+            compat_response_json(batch_read_version_resp, request_decoded_from_msgpack)
                 .map_err(|err| DiskError::other(format!("encode BatchReadVersionResp json failed: {err}")))?,
         );
-        batch_read_version_resps_bin.push(Bytes::from(encode_msgpack(batch_read_version_resp, "BatchReadVersionResp")?));
     }
+    record_batch_read_version_stage(INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_JSON_ENCODE, json_encode_started);
+
+    let mut batch_read_version_resps_bin = Vec::with_capacity(batch_read_version_resps.len());
+    let msgpack_encode_started = internode_stage_timer(attribution_enabled);
+    for batch_read_version_resp in batch_read_version_resps {
+        batch_read_version_resps_bin.push(Bytes::from(encode_msgpack_with_capacity(
+            batch_read_version_resp,
+            "BatchReadVersionResp",
+            FILE_INFO_MSGPACK_ENCODE_CAPACITY_HINT,
+        )?));
+    }
+    record_batch_read_version_stage(INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_MSGPACK_ENCODE, msgpack_encode_started);
 
     Ok((batch_read_version_resps_json, batch_read_version_resps_bin))
+}
+
+fn decode_rename_data_request_file_info(
+    binary: &[u8],
+    json: &str,
+) -> std::result::Result<DecodedRpcPayload<FileInfo>, DiskError> {
+    decode_msgpack_or_json_with_source(binary, json, "FileInfo")
+}
+
+fn encode_rename_data_response_payloads(
+    rename_data_resp: &RenameDataResp,
+    request_decoded_from_msgpack: bool,
+) -> std::result::Result<(String, Vec<u8>), DiskError> {
+    let rename_data_resp_json = compat_response_json(rename_data_resp, request_decoded_from_msgpack)
+        .map_err(|err| DiskError::other(format!("encode RenameDataResp json failed: {err}")))?;
+    let rename_data_resp_bin = encode_msgpack_named(rename_data_resp, "RenameDataResp")?;
+    Ok((rename_data_resp_json, rename_data_resp_bin))
 }
 
 impl NodeService {
@@ -259,46 +313,11 @@ impl NodeService {
             "acquire_snapshot_lease",
         )?;
         let request = request.into_inner();
-        let ttl = snapshot_lease_ttl(request.ttl_ms)?;
-        let Some(disk) = self.find_disk(&request.disk).await else {
-            return Ok(Response::new(SnapshotLeaseResponse {
-                success: false,
-                token: Bytes::new(),
-                protocol_version: SNAPSHOT_LEASE_PROTOCOL_VERSION,
-                error: Some(DiskError::other("cannot find disk").into()),
-            }));
+        let result = match self.find_disk(&request.disk).await {
+            Some(disk) => disk.acquire_snapshot_lease(&request.volume, &request.path).await,
+            None => Err(DiskError::other("cannot find disk")),
         };
-        match disk.acquire_snapshot_lease(&request.volume, &request.path).await {
-            Ok(token) => {
-                if let Err(expiry) = self.snapshot_lease_expiry.schedule(
-                    SnapshotLeaseExpiry {
-                        disk,
-                        volume: request.volume,
-                        path: request.path,
-                        token,
-                    },
-                    ttl,
-                ) {
-                    let _ = expiry
-                        .disk
-                        .release_snapshot_lease(&expiry.volume, &expiry.path, expiry.token)
-                        .await;
-                    return Err(Status::internal("snapshot lease expiry scheduler is unavailable"));
-                }
-                Ok(Response::new(SnapshotLeaseResponse {
-                    success: true,
-                    token: Bytes::copy_from_slice(token.as_bytes()),
-                    protocol_version: SNAPSHOT_LEASE_PROTOCOL_VERSION,
-                    error: None,
-                }))
-            }
-            Err(err) => Ok(Response::new(SnapshotLeaseResponse {
-                success: false,
-                token: Bytes::new(),
-                protocol_version: SNAPSHOT_LEASE_PROTOCOL_VERSION,
-                error: Some(err.into()),
-            })),
-        }
+        Ok(snapshot_lease_response(result))
     }
 
     pub(super) async fn handle_renew_snapshot_lease(
@@ -311,49 +330,13 @@ impl NodeService {
             "renew_snapshot_lease",
         )?;
         let request = request.into_inner();
-        let ttl = snapshot_lease_ttl(request.ttl_ms)?;
         let token =
             SnapshotLeaseToken::from_slice(&request.token).map_err(|_| Status::invalid_argument("invalid lease token"))?;
-        let Some(disk) = self.find_disk(&request.disk).await else {
-            return Ok(Response::new(SnapshotLeaseResponse {
-                success: false,
-                token: Bytes::new(),
-                protocol_version: SNAPSHOT_LEASE_PROTOCOL_VERSION,
-                error: Some(DiskError::other("cannot find disk").into()),
-            }));
+        let result = match self.find_disk(&request.disk).await {
+            Some(disk) => disk.renew_snapshot_lease(&request.volume, &request.path, token).await,
+            None => Err(DiskError::other("cannot find disk")),
         };
-        match disk.renew_snapshot_lease(&request.volume, &request.path, token).await {
-            Ok(renewed) => {
-                if let Err(expiry) = self.snapshot_lease_expiry.schedule(
-                    SnapshotLeaseExpiry {
-                        disk,
-                        volume: request.volume,
-                        path: request.path,
-                        token: renewed,
-                    },
-                    ttl,
-                ) {
-                    let _ = expiry
-                        .disk
-                        .release_snapshot_lease(&expiry.volume, &expiry.path, expiry.token)
-                        .await;
-                    return Err(Status::internal("snapshot lease expiry scheduler is unavailable"));
-                }
-                self.snapshot_lease_expiry.cancel(token);
-                Ok(Response::new(SnapshotLeaseResponse {
-                    success: true,
-                    token: Bytes::copy_from_slice(renewed.as_bytes()),
-                    protocol_version: SNAPSHOT_LEASE_PROTOCOL_VERSION,
-                    error: None,
-                }))
-            }
-            Err(err) => Ok(Response::new(SnapshotLeaseResponse {
-                success: false,
-                token: Bytes::new(),
-                protocol_version: SNAPSHOT_LEASE_PROTOCOL_VERSION,
-                error: Some(err.into()),
-            })),
-        }
+        Ok(snapshot_lease_response(result))
     }
 
     pub(super) async fn handle_release_snapshot_lease(
@@ -366,8 +349,11 @@ impl NodeService {
             "release_snapshot_lease",
         )?;
         let request = request.into_inner();
-        let token =
-            SnapshotLeaseToken::from_slice(&request.token).map_err(|_| Status::invalid_argument("invalid lease token"))?;
+        let token = if request.token.as_ref() == SnapshotLeaseToken::revoke_all().as_bytes() {
+            SnapshotLeaseToken::revoke_all()
+        } else {
+            SnapshotLeaseToken::from_slice(&request.token).map_err(|_| Status::invalid_argument("invalid lease token"))?
+        };
         let Some(disk) = self.find_disk(&request.disk).await else {
             return Ok(Response::new(SnapshotLeaseMutationResponse {
                 success: false,
@@ -375,13 +361,10 @@ impl NodeService {
             }));
         };
         match disk.release_snapshot_lease(&request.volume, &request.path, token).await {
-            Ok(()) => {
-                self.snapshot_lease_expiry.cancel(token);
-                Ok(Response::new(SnapshotLeaseMutationResponse {
-                    success: true,
-                    error: None,
-                }))
-            }
+            Ok(()) => Ok(Response::new(SnapshotLeaseMutationResponse {
+                success: true,
+                error: None,
+            })),
             Err(err) => Ok(Response::new(SnapshotLeaseMutationResponse {
                 success: false,
                 error: Some(err.into()),
@@ -523,15 +506,37 @@ impl NodeService {
         &self,
         request: Request<BatchReadVersionRequest>,
     ) -> Result<Response<BatchReadVersionResponse>, Status> {
+        let attribution_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
         let request = request.into_inner();
+        if attribution_enabled {
+            let metrics = global_internode_metrics();
+            metrics.record_incoming_request_for_operation_and_backend(
+                INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION,
+                INTERNODE_TRANSPORT_BACKEND_GRPC,
+            );
+            metrics.record_recv_bytes_for_operation_and_backend(
+                INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION,
+                INTERNODE_TRANSPORT_BACKEND_GRPC,
+                request
+                    .disk
+                    .len()
+                    .saturating_add(request.batch_read_version_req.len())
+                    .saturating_add(request.batch_read_version_req_bin.len()),
+            );
+        }
         if let Some(disk) = self.find_disk(&request.disk).await {
-            let batch_read_version_req: BatchReadVersionReq = match decode_msgpack_or_json(
+            let decode_started = internode_stage_timer(attribution_enabled);
+            let decoded_batch_read_version_req: DecodedRpcPayload<BatchReadVersionReq> = match decode_msgpack_or_json_with_source(
                 &request.batch_read_version_req_bin,
                 &request.batch_read_version_req,
                 "BatchReadVersionReq",
             ) {
-                Ok(batch_read_version_req) => batch_read_version_req,
+                Ok(batch_read_version_req) => {
+                    record_batch_read_version_stage(INTERNODE_STAGE_BATCH_READ_VERSION_REQUEST_DECODE, decode_started);
+                    batch_read_version_req
+                }
                 Err(err) => {
+                    record_batch_read_version_stage(INTERNODE_STAGE_BATCH_READ_VERSION_REQUEST_DECODE, decode_started);
                     return Ok(Response::new(BatchReadVersionResponse {
                         success: false,
                         batch_read_version_resps: Vec::new(),
@@ -540,6 +545,8 @@ impl NodeService {
                     }));
                 }
             };
+            let request_decoded_from_msgpack = decoded_batch_read_version_req.from_msgpack;
+            let batch_read_version_req = decoded_batch_read_version_req.value;
 
             if let Err(err) = validate_batch_read_version_item_count(batch_read_version_req.items.len()) {
                 return Ok(Response::new(BatchReadVersionResponse {
@@ -550,10 +557,13 @@ impl NodeService {
                 }));
             }
 
+            let disk_read_started = internode_stage_timer(attribution_enabled);
             match disk.batch_read_version(batch_read_version_req).await {
                 Ok(batch_read_version_resps) => {
+                    record_batch_read_version_stage(INTERNODE_STAGE_BATCH_READ_VERSION_DISK_READ, disk_read_started);
                     let (batch_read_version_resps, batch_read_version_resps_bin) =
-                        match encode_batch_read_version_response_payloads(&batch_read_version_resps) {
+                        match encode_batch_read_version_response_payloads(&batch_read_version_resps, request_decoded_from_msgpack)
+                        {
                             Ok(payloads) => payloads,
                             Err(err) => {
                                 return Ok(Response::new(BatchReadVersionResponse {
@@ -572,12 +582,15 @@ impl NodeService {
                         error: None,
                     }))
                 }
-                Err(err) => Ok(Response::new(BatchReadVersionResponse {
-                    success: false,
-                    batch_read_version_resps: Vec::new(),
-                    batch_read_version_resps_bin: Vec::new(),
-                    error: Some(err.into()),
-                })),
+                Err(err) => {
+                    record_batch_read_version_stage(INTERNODE_STAGE_BATCH_READ_VERSION_DISK_READ, disk_read_started);
+                    Ok(Response::new(BatchReadVersionResponse {
+                        success: false,
+                        batch_read_version_resps: Vec::new(),
+                        batch_read_version_resps_bin: Vec::new(),
+                        error: Some(err.into()),
+                    }))
+                }
             }
         } else {
             Ok(Response::new(BatchReadVersionResponse {
@@ -610,6 +623,7 @@ impl NodeService {
                             success: false,
                             errors: Vec::new(),
                             error: Some(DiskError::other(format!("decode FileInfoVersions failed: {err}")).into()),
+                            item_errors: Vec::new(),
                         }));
                     }
                 };
@@ -621,30 +635,26 @@ impl NodeService {
                         success: false,
                         errors: Vec::new(),
                         error: Some(DiskError::other(format!("decode DeleteOptions failed: {err}")).into()),
+                        item_errors: Vec::new(),
                     }));
                 }
             };
 
-            let errors = disk
-                .delete_versions(&request.volume, versions, opts)
-                .await
-                .into_iter()
-                .map(|error| match error {
-                    Some(e) => e.to_string(),
-                    None => "".to_string(),
-                })
-                .collect();
+            let (errors, item_errors) =
+                encode_delete_versions_errors(disk.delete_versions(&request.volume, versions, opts).await);
 
             Ok(Response::new(DeleteVersionsResponse {
                 success: true,
                 errors,
                 error: None,
+                item_errors,
             }))
         } else {
             Ok(Response::new(DeleteVersionsResponse {
                 success: false,
                 errors: Vec::new(),
                 error: Some(DiskError::other("cannot find disk".to_string()).into()),
+                item_errors: Vec::new(),
             }))
         }
     }
@@ -716,7 +726,7 @@ impl NodeService {
         if let Some(disk) = self.find_disk(&request.disk).await {
             match disk.read_xl(&request.volume, &request.path, request.read_data).await {
                 Ok(raw_file_info) => {
-                    let raw_file_info_json = compat_response_json(&raw_file_info);
+                    let raw_file_info_json = compat_response_json(&raw_file_info, false);
                     let raw_file_info_bin = encode_msgpack(&raw_file_info, "RawFileInfo");
                     match (raw_file_info_json, raw_file_info_bin) {
                         (Ok(raw_file_info), Ok(raw_file_info_bin)) => Ok(Response::new(ReadXlResponse {
@@ -760,11 +770,43 @@ impl NodeService {
         &self,
         request: Request<ReadVersionRequest>,
     ) -> Result<Response<ReadVersionResponse>, Status> {
+        let metrics = global_internode_metrics();
+        let read_version_attribution_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
         let request = request.into_inner();
+        if read_version_attribution_enabled {
+            metrics.record_incoming_request_for_operation_and_backend(
+                INTERNODE_OPERATION_GRPC_READ_VERSION,
+                INTERNODE_TRANSPORT_BACKEND_GRPC,
+            );
+            metrics.record_recv_bytes_for_operation_and_backend(
+                INTERNODE_OPERATION_GRPC_READ_VERSION,
+                INTERNODE_TRANSPORT_BACKEND_GRPC,
+                request
+                    .disk
+                    .len()
+                    .saturating_add(request.volume.len())
+                    .saturating_add(request.path.len())
+                    .saturating_add(request.version_id.len())
+                    .saturating_add(request.opts.len())
+                    .saturating_add(request.opts_bin.len()),
+            );
+        }
         if let Some(disk) = self.find_disk(&request.disk).await {
+            let request_had_msgpack_payload = !request.opts_bin.is_empty();
+            let decode_started = internode_stage_timer(read_version_attribution_enabled);
             let opts = match decode_msgpack_or_json::<ReadOptions>(&request.opts_bin, &request.opts, "ReadOptions") {
-                Ok(options) => options,
+                Ok(options) => {
+                    record_read_version_stage(INTERNODE_STAGE_READ_VERSION_REQUEST_DECODE, decode_started);
+                    options
+                }
                 Err(err) => {
+                    record_read_version_stage(INTERNODE_STAGE_READ_VERSION_REQUEST_DECODE, decode_started);
+                    if read_version_attribution_enabled {
+                        metrics.record_error_for_operation_and_backend(
+                            INTERNODE_OPERATION_GRPC_READ_VERSION,
+                            INTERNODE_TRANSPORT_BACKEND_GRPC,
+                        );
+                    }
                     return Ok(Response::new(ReadVersionResponse {
                         success: false,
                         file_info: String::new(),
@@ -773,42 +815,88 @@ impl NodeService {
                     }));
                 }
             };
+            let disk_read_started = internode_stage_timer(read_version_attribution_enabled);
             match disk
                 .read_version("", &request.volume, &request.path, &request.version_id, &opts)
                 .await
             {
                 Ok(file_info) => {
-                    let file_info_json = compat_response_json(&file_info);
-                    let file_info_bin = encode_msgpack(&file_info, "FileInfo");
+                    record_read_version_stage(INTERNODE_STAGE_READ_VERSION_DISK_READ, disk_read_started);
+                    let json_encode_started = internode_stage_timer(read_version_attribution_enabled);
+                    let file_info_json = compat_response_json(&file_info, request_had_msgpack_payload);
+                    record_read_version_stage(INTERNODE_STAGE_READ_VERSION_RESPONSE_JSON_ENCODE, json_encode_started);
+                    let msgpack_encode_started = internode_stage_timer(read_version_attribution_enabled);
+                    let file_info_bin = encode_file_info_msgpack(&file_info);
+                    record_read_version_stage(INTERNODE_STAGE_READ_VERSION_RESPONSE_MSGPACK_ENCODE, msgpack_encode_started);
                     match (file_info_json, file_info_bin) {
-                        (Ok(file_info), Ok(file_info_bin)) => Ok(Response::new(ReadVersionResponse {
-                            success: true,
-                            file_info,
-                            file_info_bin: file_info_bin.into(),
-                            error: None,
-                        })),
-                        (Err(err), _) => Ok(Response::new(ReadVersionResponse {
-                            success: false,
-                            file_info: String::new(),
-                            file_info_bin: Vec::new().into(),
-                            error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
-                        })),
-                        (_, Err(err)) => Ok(Response::new(ReadVersionResponse {
-                            success: false,
-                            file_info: String::new(),
-                            file_info_bin: Vec::new().into(),
-                            error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
-                        })),
+                        (Ok(file_info), Ok(file_info_bin)) => {
+                            if read_version_attribution_enabled {
+                                metrics.record_sent_bytes_for_operation_and_backend(
+                                    INTERNODE_OPERATION_GRPC_READ_VERSION,
+                                    INTERNODE_TRANSPORT_BACKEND_GRPC,
+                                    file_info.len().saturating_add(file_info_bin.len()),
+                                );
+                            }
+                            Ok(Response::new(ReadVersionResponse {
+                                success: true,
+                                file_info,
+                                file_info_bin: file_info_bin.into(),
+                                error: None,
+                            }))
+                        }
+                        (Err(err), _) => {
+                            if read_version_attribution_enabled {
+                                metrics.record_error_for_operation_and_backend(
+                                    INTERNODE_OPERATION_GRPC_READ_VERSION,
+                                    INTERNODE_TRANSPORT_BACKEND_GRPC,
+                                );
+                            }
+                            Ok(Response::new(ReadVersionResponse {
+                                success: false,
+                                file_info: String::new(),
+                                file_info_bin: Vec::new().into(),
+                                error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
+                            }))
+                        }
+                        (_, Err(err)) => {
+                            if read_version_attribution_enabled {
+                                metrics.record_error_for_operation_and_backend(
+                                    INTERNODE_OPERATION_GRPC_READ_VERSION,
+                                    INTERNODE_TRANSPORT_BACKEND_GRPC,
+                                );
+                            }
+                            Ok(Response::new(ReadVersionResponse {
+                                success: false,
+                                file_info: String::new(),
+                                file_info_bin: Vec::new().into(),
+                                error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
+                            }))
+                        }
                     }
                 }
-                Err(err) => Ok(Response::new(ReadVersionResponse {
-                    success: false,
-                    file_info: String::new(),
-                    file_info_bin: Vec::new().into(),
-                    error: Some(err.into()),
-                })),
+                Err(err) => {
+                    record_read_version_stage(INTERNODE_STAGE_READ_VERSION_DISK_READ, disk_read_started);
+                    if read_version_attribution_enabled {
+                        metrics.record_error_for_operation_and_backend(
+                            INTERNODE_OPERATION_GRPC_READ_VERSION,
+                            INTERNODE_TRANSPORT_BACKEND_GRPC,
+                        );
+                    }
+                    Ok(Response::new(ReadVersionResponse {
+                        success: false,
+                        file_info: String::new(),
+                        file_info_bin: Vec::new().into(),
+                        error: Some(err.into()),
+                    }))
+                }
             }
         } else {
+            if read_version_attribution_enabled {
+                metrics.record_error_for_operation_and_backend(
+                    INTERNODE_OPERATION_GRPC_READ_VERSION,
+                    INTERNODE_TRANSPORT_BACKEND_GRPC,
+                );
+            }
             Ok(Response::new(ReadVersionResponse {
                 success: false,
                 file_info: String::new(),
@@ -1101,6 +1189,16 @@ impl NodeService {
         &self,
         request: Request<RenameDataRequest>,
     ) -> Result<Response<RenameDataResponse>, Status> {
+        if !request.get_ref().scanner_publication_lease_token.is_empty() {
+            let has_body_digest = request
+                .metadata()
+                .get("x-rustfs-content-sha256")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value != "UNSIGNED-PAYLOAD");
+            if !has_body_digest {
+                return Err(Status::permission_denied("scanner publication lease rename requires a body-bound digest"));
+            }
+        }
         verify_disk_mutation_digest(
             &request,
             rustfs_protos::canonical_rename_data_request_body(request.get_ref()),
@@ -1108,7 +1206,7 @@ impl NodeService {
         )?;
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
-            let file_info = match decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo") {
+            let decoded_file_info = match decode_rename_data_request_file_info(&request.file_info_bin, &request.file_info) {
                 Ok(file_info) => file_info,
                 Err(err) => {
                     return Ok(Response::new(RenameDataResponse {
@@ -1119,31 +1217,66 @@ impl NodeService {
                     }));
                 }
             };
+            let scanner_publication_lease_token = if request.scanner_publication_lease_token.is_empty() {
+                None
+            } else {
+                let token = Uuid::from_slice(&request.scanner_publication_lease_token)
+                    .map_err(|_| Status::invalid_argument("scanner publication lease token must be a UUID"))?;
+                if token.is_nil() {
+                    return Err(Status::invalid_argument("scanner publication lease token must not be nil"));
+                }
+                Some(token)
+            };
+            // The target owns this read guard.  It must span the complete
+            // disk rename, not merely the preflight, so a movement transition
+            // cannot restart after validation and before rename linearization.
+            let _scanner_publication_lease_guard = if let Some(token) = scanner_publication_lease_token {
+                let Some(store) = self.resolve_object_store() else {
+                    return Ok(Response::new(RenameDataResponse {
+                        success: false,
+                        rename_data_resp: String::new(),
+                        rename_data_resp_bin: Vec::new().into(),
+                        error: Some(DiskError::other("scanner publication lease owner is unavailable").into()),
+                    }));
+                };
+                match store.acquire_scanner_publication_lease_guard(token).await {
+                    Ok(guard) => Some(guard),
+                    Err(err) => {
+                        return Ok(Response::new(RenameDataResponse {
+                            success: false,
+                            rename_data_resp: String::new(),
+                            rename_data_resp_bin: Vec::new().into(),
+                            error: Some(DiskError::other(err.to_string()).into()),
+                        }));
+                    }
+                }
+            } else {
+                None
+            };
+            let request_decoded_from_msgpack = decoded_file_info.from_msgpack;
             match disk
-                .rename_data(&request.src_volume, &request.src_path, file_info, &request.dst_volume, &request.dst_path)
+                .rename_data(
+                    &request.src_volume,
+                    &request.src_path,
+                    &decoded_file_info.value,
+                    &request.dst_volume,
+                    &request.dst_path,
+                )
                 .await
             {
                 Ok(rename_data_resp) => {
-                    let rename_data_resp_json = compat_response_json(&rename_data_resp);
-                    let rename_data_resp_bin = encode_msgpack_named(&rename_data_resp, "RenameDataResp");
-                    match (rename_data_resp_json, rename_data_resp_bin) {
-                        (Ok(rename_data_resp), Ok(rename_data_resp_bin)) => Ok(Response::new(RenameDataResponse {
+                    match encode_rename_data_response_payloads(&rename_data_resp, request_decoded_from_msgpack) {
+                        Ok((rename_data_resp, rename_data_resp_bin)) => Ok(Response::new(RenameDataResponse {
                             success: true,
                             rename_data_resp,
                             rename_data_resp_bin: rename_data_resp_bin.into(),
                             error: None,
                         })),
-                        (Err(err), _) => Ok(Response::new(RenameDataResponse {
+                        Err(err) => Ok(Response::new(RenameDataResponse {
                             success: false,
                             rename_data_resp: String::new(),
                             rename_data_resp_bin: Vec::new().into(),
-                            error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
-                        })),
-                        (_, Err(err)) => Ok(Response::new(RenameDataResponse {
-                            success: false,
-                            rename_data_resp: String::new(),
-                            rename_data_resp_bin: Vec::new().into(),
-                            error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
+                            error: Some(err.into()),
                         })),
                     }
                 }
@@ -1473,6 +1606,16 @@ impl NodeService {
     }
 
     pub(super) async fn handle_delete(&self, request: Request<DeleteRequest>) -> Result<Response<DeleteResponse>, Status> {
+        if !request.get_ref().scanner_publication_lease_token.is_empty() {
+            let has_body_digest = request
+                .metadata()
+                .get("x-rustfs-content-sha256")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value != "UNSIGNED-PAYLOAD");
+            if !has_body_digest {
+                return Err(Status::permission_denied("scanner publication lease delete requires a body-bound digest"));
+            }
+        }
         verify_disk_mutation_digest(&request, rustfs_protos::canonical_delete_request_body(request.get_ref()), "delete")?;
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
@@ -1484,6 +1627,38 @@ impl NodeService {
                         error: Some(DiskError::other(format!("decode DeleteOptions failed: {err}")).into()),
                     }));
                 }
+            };
+            let scanner_publication_lease_token = if request.scanner_publication_lease_token.is_empty() {
+                None
+            } else {
+                let token = Uuid::from_slice(&request.scanner_publication_lease_token)
+                    .map_err(|_| Status::invalid_argument("scanner publication lease token must be a UUID"))?;
+                if token.is_nil() {
+                    return Err(Status::invalid_argument("scanner publication lease token must not be nil"));
+                }
+                Some(token)
+            };
+            // The target-side guard spans the complete delete operation. A
+            // lease expiry or movement transition cannot occur between this
+            // validation and the disk delete linearization point.
+            let _scanner_publication_lease_guard = if let Some(token) = scanner_publication_lease_token {
+                let Some(store) = self.resolve_object_store() else {
+                    return Ok(Response::new(DeleteResponse {
+                        success: false,
+                        error: Some(DiskError::other("scanner publication lease owner is unavailable").into()),
+                    }));
+                };
+                match store.acquire_scanner_publication_lease_guard(token).await {
+                    Ok(guard) => Some(guard),
+                    Err(err) => {
+                        return Ok(Response::new(DeleteResponse {
+                            success: false,
+                            error: Some(DiskError::other(err.to_string()).into()),
+                        }));
+                    }
+                }
+            } else {
+                None
             };
             match disk.delete(&request.volume, &request.path, options).await {
                 Ok(_) => Ok(Response::new(DeleteResponse {
@@ -1592,14 +1767,21 @@ impl NodeService {
 #[cfg(test)]
 mod tests {
     use super::{
-        SNAPSHOT_LEASE_MAX_TTL, SNAPSHOT_LEASE_MIN_TTL, compat_response_json, decode_msgpack_or_json,
-        encode_batch_read_version_response_payloads, encode_msgpack, encode_msgpack_named,
-        encode_read_multiple_response_payloads, snapshot_lease_ttl,
+        compat_response_json, decode_msgpack_or_json, decode_rename_data_request_file_info,
+        encode_batch_read_version_response_payloads, encode_delete_versions_errors, encode_file_info_msgpack, encode_msgpack,
+        encode_msgpack_named, encode_read_multiple_response_payloads, encode_rename_data_response_payloads,
     };
+    use crate::storage::DiskError;
+    use crate::storage::rpc::node_service::make_server;
     use crate::storage::storage_api::ReadMultipleResp;
+    use crate::storage::storage_api::RenameDataResp;
     use crate::storage::storage_api::rpc_consumer::node_service::BatchReadVersionResp;
+    use rustfs_filemeta::FileInfo;
     use rustfs_io_metrics::internode_metrics::global_internode_metrics;
+    use rustfs_protos::proto_gen::node_service::ReadVersionRequest;
     use serde::{Deserialize, Serialize};
+    use serial_test::serial;
+    use tonic::Request;
 
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
     struct SamplePayload {
@@ -1608,11 +1790,65 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_lease_ttl_rejects_values_outside_server_bounds() {
-        assert!(snapshot_lease_ttl(4_999).is_err());
-        assert_eq!(snapshot_lease_ttl(5_000).unwrap(), SNAPSHOT_LEASE_MIN_TTL);
-        assert_eq!(snapshot_lease_ttl(300_000).unwrap(), SNAPSHOT_LEASE_MAX_TTL);
-        assert!(snapshot_lease_ttl(300_001).is_err());
+    fn response_compat_send_sites_keep_manifest_json_encoders() {
+        // Rolling-upgrade contract (rustfs-protos compat manifest): every
+        // dual-write response field must keep producing its JSON side with the
+        // exact encoder the manifest pins. The manifest itself is pinned
+        // against node.proto by tests in rustfs-protos; this test keeps the
+        // send-site assertion in the crate that owns the source file.
+        let source = rustfs_protos::compat_manifest::production_source(include_str!("disk.rs"), "disk.rs");
+
+        for send_site in rustfs_protos::compat_manifest::RESPONSE_COMPAT_SEND_SITES {
+            assert!(
+                source.contains(send_site.json_encoder),
+                "{}.{} must keep its manifest encoder: {}",
+                send_site.field.message,
+                send_site.field.json_field,
+                send_site.json_encoder
+            );
+        }
+    }
+
+    #[test]
+    fn delete_versions_response_dual_writes_typed_item_errors() {
+        let raw_not_found = super::DiskError::Io(std::io::Error::from(std::io::ErrorKind::NotFound));
+        let (errors, item_errors) = encode_delete_versions_errors(vec![Some(raw_not_found), None]);
+
+        assert!(errors[0].starts_with("io error "));
+        assert!(errors[1].is_empty());
+        assert_eq!(item_errors[0].code, super::DiskError::FileNotFound.to_u32());
+        assert_eq!(item_errors[0].error_info, errors[0]);
+        assert_eq!(item_errors[1].code, 0);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_read_version_records_attribution_for_missing_disk() {
+        let metrics = global_internode_metrics();
+        let previous_stage_metrics = rustfs_io_metrics::get_stage_metrics_enabled();
+        metrics.reset_for_test();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+
+        let response = make_server()
+            .handle_read_version(Request::new(ReadVersionRequest {
+                disk: "missing-disk".to_string(),
+                volume: "bucket".to_string(),
+                path: "object".to_string(),
+                version_id: String::new(),
+                opts: String::new(),
+                opts_bin: Vec::new().into(),
+            }))
+            .await
+            .expect("ReadVersion handler should return a response")
+            .into_inner();
+
+        rustfs_io_metrics::set_get_stage_metrics_enabled(previous_stage_metrics);
+        let snapshot = metrics.snapshot();
+        assert!(!response.success);
+        assert_eq!(snapshot.incoming_requests_total, 1);
+        assert_eq!(snapshot.errors_total, 1);
+        assert!(snapshot.recv_bytes_total > 0);
+        metrics.reset_for_test();
     }
 
     #[test]
@@ -1669,7 +1905,7 @@ mod tests {
                     name: "legacy-json".to_string(),
                     count: 9,
                 };
-                let json = compat_response_json(&payload).expect("compat response json should encode");
+                let json = compat_response_json(&payload, false).expect("compat response json should encode");
 
                 assert!(!json.is_empty(), "old JSON clients must remain compatible without fleet confirmation");
                 assert_eq!(json, serde_json::to_string(&payload).expect("json should encode"));
@@ -1689,7 +1925,7 @@ mod tests {
                     name: "msgpack-only".to_string(),
                     count: 10,
                 };
-                let json = compat_response_json(&payload).expect("compat response json should encode");
+                let json = compat_response_json(&payload, false).expect("compat response json should encode");
 
                 assert!(json.is_empty(), "msgpack-only may empty JSON only after explicit fleet confirmation");
             },
@@ -1709,7 +1945,7 @@ mod tests {
                 (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("true")),
             ],
             || {
-                let json = compat_response_json(&payload).expect("compat response json should encode");
+                let json = compat_response_json(&payload, false).expect("compat response json should encode");
 
                 assert!(json.is_empty(), "both gates should enter msgpack-only response mode");
             },
@@ -1726,12 +1962,93 @@ mod tests {
             ],
         ] {
             with_internode_msgpack_env(vars, || {
-                let json = compat_response_json(&payload).expect("compat response json should encode");
+                let json = compat_response_json(&payload, false).expect("compat response json should encode");
 
                 assert!(!json.is_empty(), "removing either gate should restore old-peer JSON compatibility");
                 assert_eq!(json, serde_json::to_string(&payload).expect("json should encode"));
             });
         }
+    }
+
+    #[test]
+    fn compat_response_json_omits_json_for_msgpack_capable_request_without_fleet_gate() {
+        with_internode_msgpack_env(
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, None::<&str>),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, None::<&str>),
+            ],
+            || {
+                let payload = SamplePayload {
+                    name: "request-local-bin".to_string(),
+                    count: 13,
+                };
+                let json = compat_response_json(&payload, true).expect("compat response json should encode");
+
+                assert!(json.is_empty(), "a request-local msgpack payload may receive a bin-only response");
+            },
+        );
+    }
+
+    #[test]
+    fn compat_response_json_keeps_json_for_legacy_json_request() {
+        with_internode_msgpack_env(
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, None::<&str>),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, None::<&str>),
+            ],
+            || {
+                let payload = SamplePayload {
+                    name: "legacy-request-json".to_string(),
+                    count: 14,
+                };
+                let json = compat_response_json(&payload, false).expect("compat response json should encode");
+
+                assert!(!json.is_empty(), "legacy JSON-only callers must keep receiving response JSON");
+                assert_eq!(json, serde_json::to_string(&payload).expect("json should encode"));
+            },
+        );
+    }
+
+    #[test]
+    fn rename_data_response_payloads_follow_successful_request_codec() {
+        with_internode_msgpack_env(
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, None::<&str>),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, None::<&str>),
+            ],
+            || {
+                let response = RenameDataResp::default();
+                let file_info = FileInfo::default();
+                let legacy_file_info_json = serde_json::to_string(&file_info).expect("FileInfo JSON should encode");
+                let legacy_request = decode_rename_data_request_file_info(&[], &legacy_file_info_json)
+                    .expect("legacy FileInfo JSON should decode");
+
+                let (legacy_json, legacy_bin) = encode_rename_data_response_payloads(&response, legacy_request.from_msgpack)
+                    .expect("legacy response payloads should encode");
+                assert!(!legacy_json.is_empty(), "JSON-only requests must retain response JSON");
+                assert!(!legacy_bin.is_empty(), "all callers must receive response msgpack");
+
+                let file_info_bin = encode_file_info_msgpack(&file_info).expect("FileInfo msgpack should encode");
+                let msgpack_request = decode_rename_data_request_file_info(&file_info_bin, &legacy_file_info_json)
+                    .expect("FileInfo msgpack should decode");
+                let (msgpack_json, msgpack_bin) = encode_rename_data_response_payloads(&response, msgpack_request.from_msgpack)
+                    .expect("msgpack response payloads should encode");
+                assert!(msgpack_json.is_empty(), "successfully decoded msgpack requests may omit response JSON");
+                let decoded: RenameDataResp =
+                    rmp_serde::from_slice(&msgpack_bin).expect("response msgpack should remain decodable");
+                assert_eq!(decoded.old_data_dir, response.old_data_dir);
+                assert_eq!(decoded.rollback_data_dir, response.rollback_data_dir);
+                assert_eq!(decoded.cleanup_data_dir, response.cleanup_data_dir);
+                assert_eq!(decoded.sign, response.sign);
+                assert_eq!(decoded.old_current_size, response.old_current_size);
+
+                let error = match decode_rename_data_request_file_info(b"not-msgpack", &legacy_file_info_json) {
+                    Ok(_) => panic!("malformed request msgpack must fail closed before response negotiation"),
+                    Err(error) => error,
+                };
+                assert!(error.to_string().contains("decode FileInfo msgpack failed"), "unexpected error: {error}");
+            },
+        );
     }
 
     #[test]
@@ -1868,12 +2185,13 @@ mod tests {
             path: "object-a".to_string(),
             version_id: "version-a".to_string(),
             success: false,
-            error: "file version not found".to_string(),
+            error: DiskError::FileVersionNotFound.to_string(),
+            error_code: DiskError::FileVersionNotFound.to_u32(),
             ..Default::default()
         }];
 
         let (json_payloads, msgpack_payloads) =
-            encode_batch_read_version_response_payloads(&responses).expect("batch read version responses should encode");
+            encode_batch_read_version_response_payloads(&responses, false).expect("batch read version responses should encode");
 
         assert_eq!(json_payloads.len(), responses.len());
         assert_eq!(msgpack_payloads.len(), responses.len());
@@ -1884,8 +2202,43 @@ mod tests {
             .expect("msgpack batch read version response should decode");
 
         assert_eq!(json_decoded.index, responses[0].index);
+        assert_eq!(json_decoded.error_code, responses[0].error_code);
         assert_eq!(msgpack_decoded.path, responses[0].path);
         assert_eq!(msgpack_decoded.error, responses[0].error);
+        assert_eq!(msgpack_decoded.error_code, responses[0].error_code);
+    }
+
+    #[test]
+    fn batch_read_version_response_decode_accepts_legacy_payload_without_error_code() {
+        #[derive(Serialize)]
+        struct LegacyBatchReadVersionResp {
+            index: usize,
+            path: String,
+            version_id: String,
+            success: bool,
+            file_info: FileInfo,
+            error: String,
+        }
+
+        let legacy = LegacyBatchReadVersionResp {
+            index: 2,
+            path: "object-legacy".to_string(),
+            version_id: "version-legacy".to_string(),
+            success: false,
+            file_info: FileInfo::default(),
+            error: "legacy error".to_string(),
+        };
+        let legacy_json = serde_json::to_string(&legacy).expect("legacy json should encode");
+        let legacy_msgpack = encode_msgpack(&legacy, "LegacyBatchReadVersionResp").expect("legacy msgpack should encode");
+
+        let json_decoded: BatchReadVersionResp =
+            decode_msgpack_or_json(&[], &legacy_json, "BatchReadVersionResp").expect("legacy json should decode");
+        let msgpack_decoded: BatchReadVersionResp =
+            decode_msgpack_or_json(&legacy_msgpack, "", "BatchReadVersionResp").expect("legacy msgpack should decode");
+
+        assert_eq!(json_decoded.error_code, 0);
+        assert_eq!(msgpack_decoded.error_code, 0);
+        assert_eq!(msgpack_decoded.error, legacy.error);
     }
 
     #[test]
@@ -1904,8 +2257,8 @@ mod tests {
                 (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("true")),
             ],
             || {
-                let (json_payloads, msgpack_payloads) =
-                    encode_batch_read_version_response_payloads(&responses).expect("batch read version responses should encode");
+                let (json_payloads, msgpack_payloads) = encode_batch_read_version_response_payloads(&responses, false)
+                    .expect("batch read version responses should encode");
 
                 assert_eq!(json_payloads, vec![String::new()]);
                 assert_eq!(msgpack_payloads.len(), responses.len());
@@ -1921,14 +2274,42 @@ mod tests {
                 (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("true")),
             ],
             || {
-                let (json_payloads, msgpack_payloads) =
-                    encode_batch_read_version_response_payloads(&responses).expect("batch read version responses should encode");
+                let (json_payloads, msgpack_payloads) = encode_batch_read_version_response_payloads(&responses, false)
+                    .expect("batch read version responses should encode");
 
                 assert!(!json_payloads[0].is_empty(), "rollback should restore response JSON");
                 assert_eq!(msgpack_payloads.len(), responses.len());
                 let json_decoded: BatchReadVersionResp =
                     serde_json::from_str(&json_payloads[0]).expect("json batch read version response should decode");
                 assert_eq!(json_decoded.path, responses[0].path);
+            },
+        );
+    }
+
+    #[test]
+    fn encode_batch_read_version_response_payloads_omits_json_for_msgpack_decoded_request() {
+        let responses = vec![BatchReadVersionResp {
+            index: 5,
+            path: "object-c".to_string(),
+            version_id: "version-c".to_string(),
+            success: true,
+            ..Default::default()
+        }];
+
+        with_internode_msgpack_env(
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, None::<&str>),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, None::<&str>),
+            ],
+            || {
+                let (json_payloads, msgpack_payloads) = encode_batch_read_version_response_payloads(&responses, true)
+                    .expect("batch read version responses should encode");
+
+                assert_eq!(json_payloads, vec![String::new()]);
+                assert_eq!(msgpack_payloads.len(), responses.len());
+                let decoded = decode_msgpack_or_json::<BatchReadVersionResp>(&msgpack_payloads[0], "", "BatchReadVersionResp")
+                    .expect("msgpack batch read version response should decode");
+                assert_eq!(decoded.path, responses[0].path);
             },
         );
     }

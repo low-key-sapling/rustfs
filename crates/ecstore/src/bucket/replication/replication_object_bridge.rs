@@ -77,6 +77,10 @@ impl ReplicationObjectBridge {
         load_delete_request_config_in(ctx, bucket).await
     }
 
+    #[allow(
+        dead_code,
+        reason = "declared boundary surface for the ECStore replication split plan; no caller in this port (backlog#1823)"
+    )]
     pub(crate) async fn delete_config_snapshot_in(
         ctx: &ReplicationInstanceContext,
         bucket: &str,
@@ -87,6 +91,13 @@ impl ReplicationObjectBridge {
 
     pub fn has_active_delete_rule(snapshot: &DeleteReplicationConfigSnapshot, object: &str) -> bool {
         snapshot.has_active_rule(object)
+    }
+
+    pub fn force_delete_target_set(
+        snapshot: &DeleteReplicationConfigSnapshot,
+        prefix: &str,
+    ) -> Option<(Vec<String>, time::OffsetDateTime)> {
+        snapshot.force_delete_target_set(prefix)
     }
 
     pub fn check_delete_with_snapshot(

@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(dead_code)]
-
 use crate::{MetricDescriptor, MetricName, new_gauge_md, subsystems};
 use std::sync::LazyLock;
 
@@ -71,6 +69,15 @@ pub static USAGE_BUCKETS_COUNT_MD: LazyLock<MetricDescriptor> = LazyLock::new(||
     new_gauge_md(
         MetricName::UsageBucketsCount,
         "Total cluster buckets count",
+        &[],
+        subsystems::CLUSTER_USAGE_OBJECTS,
+    )
+});
+
+pub static USAGE_SNAPSHOT_CONVERGED_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::UsageSnapshotConverged,
+        "Whether the selected admin usage snapshot is converged (1) or observational (0)",
         &[],
         subsystems::CLUSTER_USAGE_OBJECTS,
     )

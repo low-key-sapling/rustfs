@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use super::{cluster_snapshot, metrics};
-use crate::admin::auth::validate_admin_request;
+use crate::admin::auth::authorize_admin_request;
+use crate::admin::handlers::account::{ACCOUNT_INFO_ROUTE, ACCOUNT_PASSWORD_ROUTE};
+use crate::admin::handlers::mfa::{ACCOUNT_MFA_ROUTE, MFA_CHALLENGE_ROUTE, USER_MFA_ROUTE};
 use crate::admin::route_policy::{
     ADMIN_ROUTE_POLICY_SPECS, DEFERRED_ADMIN_ROUTE_POLICIES, DeferredAdminRoutePolicy, DeferredRoutePolicyReason,
 };
@@ -29,10 +31,9 @@ use crate::admin::storage_api::cluster::{
     CapabilityState, CapabilityStatus, ObservabilitySnapshotProvider, TopologySnapshot, TopologySnapshotProvider,
 };
 use crate::admin::storage_api::storageclass as storage_class_contract;
-use crate::auth::{check_key_valid, get_session_token};
 use crate::product;
 use crate::runtime_capabilities::{EndpointTopologySnapshotProvider, RustFsObservabilitySnapshotProvider};
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::server::ADMIN_PREFIX;
 use crate::workload_admission::workload_admission_registry_snapshot;
 use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
@@ -71,6 +72,12 @@ const SITE_REPLICATION_EDIT_ROUTE: &str = "/rustfs/admin/v3/site-replication/edi
 const SITE_REPLICATION_RESYNC_ROUTE: &str = "/rustfs/admin/v3/site-replication/resync/op";
 const SITE_REPLICATION_REPAIR_ROUTE: &str = "/rustfs/admin/v3/site-replication/repair";
 const SITE_REPLICATION_REPAIR_STATUS_ROUTE: &str = "/rustfs/admin/v3/site-replication/repair/status";
+const IAM_POLICY_ATTACH_ROUTE: &str = "/rustfs/admin/v3/idp/builtin/policy/attach";
+const IAM_POLICY_DETACH_ROUTE: &str = "/rustfs/admin/v3/idp/builtin/policy/detach";
+const IAM_POLICY_ENTITIES_ROUTE: &str = "/rustfs/admin/v3/idp/builtin/policy-entities";
+const IAM_ACCESS_KEYS_BULK_ROUTE: &str = "/rustfs/admin/v3/list-access-keys-bulk";
+const IAM_ACCESS_KEYS_BULK_LDAP_ROUTE: &str = "/rustfs/admin/v3/idp/ldap/list-access-keys-bulk";
+const IAM_ACCESS_KEYS_BULK_OPENID_ROUTE: &str = "/rustfs/admin/v3/idp/openid/list-access-keys-bulk";
 
 macro_rules! log_system_request_rejected {
     ($operation:expr, $reason:expr) => {
@@ -241,10 +248,10 @@ fn request_graceful_shutdown() {}
 #[async_trait::async_trait]
 impl Operation for ServiceHandle {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(input_cred) = req.credentials.as_ref() else {
+        if req.credentials.is_none() {
             log_system_request_rejected!("service_handle", "missing_credentials");
             return Err(s3_error!(InvalidRequest, "get cred failed"));
-        };
+        }
 
         let Some(action) = service_action_from_uri(&req.uri) else {
             log_system_request_rejected!("service_handle", "invalid_action");
@@ -258,10 +265,7 @@ impl Operation for ServiceHandle {
             ServiceAction::Freeze | ServiceAction::Unfreeze => AdminAction::ServiceFreezeAdminAction,
         };
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-        validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(admin_action)], remote_addr).await?;
+        authorize_admin_request(&req, vec![Action::AdminAction(admin_action)]).await?;
 
         let response = match action {
             ServiceAction::Restart => {
@@ -355,22 +359,11 @@ struct ServerUpdateStatus {
 #[async_trait::async_trait]
 impl Operation for UpdateHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(input_cred) = req.credentials.as_ref() else {
+        if req.credentials.is_none() {
             log_system_request_rejected!("server_update", "missing_credentials");
             return Err(s3_error!(InvalidRequest, "get cred failed"));
-        };
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::ServerUpdateAdminAction)],
-            remote_addr,
-        )
-        .await?;
+        }
+        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::ServerUpdateAdminAction)]).await?;
 
         // MinIO's server-update downloads and swaps the binary in place. ZfFS
         // intentionally does not implement in-process self-update: binaries are
@@ -418,6 +411,13 @@ struct SystemAdminDiscovery {
 struct ServerInfoResponse {
     info: InfoMessage,
     admin_discovery: SystemAdminDiscovery,
+    /// Startup bitrot algorithm self-test outcome (rustfs/backlog#1873):
+    /// `passed` (algorithms verified at boot), `failed` (a drifted hash
+    /// implementation — the process is serving with degraded integrity
+    /// checking unless `RUSTFS_BITROT_SELFTEST_STRICT` aborted it), or
+    /// `unknown` (not yet run or disabled).
+    #[serde(rename = "bitrotSelftest")]
+    bitrot_selftest: &'static str,
 }
 
 #[derive(Serialize)]
@@ -434,27 +434,23 @@ fn system_admin_discovery(usecase: &DefaultAdminUsecase) -> SystemAdminDiscovery
     }
 }
 
+fn bitrot_selftest_status_str() -> &'static str {
+    match crate::bitrot_selftest::bitrot_selftest_passed() {
+        Some(true) => "passed",
+        Some(false) => "failed",
+        None => "unknown",
+    }
+}
+
 #[async_trait::async_trait]
 impl Operation for ServerInfoHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(input_cred) = req.credentials else {
+        if req.credentials.is_none() {
             log_system_request_rejected!("query_server_info", "missing_credentials");
             return Err(s3_error!(InvalidRequest, "get cred failed"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
-            remote_addr,
-        )
-        .await?;
+        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)]).await?;
 
         let usecase = default_admin_usecase();
         let info = usecase
@@ -465,6 +461,7 @@ impl Operation for ServerInfoHandler {
         let response = ServerInfoResponse {
             info,
             admin_discovery: system_admin_discovery(&usecase),
+            bitrot_selftest: bitrot_selftest_status_str(),
         };
 
         let data = serde_json::to_vec(&response).map_err(|e| {
@@ -513,22 +510,11 @@ impl Operation for InspectDataHandler {
         use crate::admin::storage_api::object::StorageObjectOptions;
         use tokio::io::AsyncReadExt;
 
-        let Some(input_cred) = req.credentials.as_ref() else {
+        if req.credentials.is_none() {
             log_system_request_rejected!("inspect_data", "missing_credentials");
             return Err(s3_error!(InvalidRequest, "get cred failed"));
-        };
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::InspectDataAction)],
-            remote_addr,
-        )
-        .await?;
+        }
+        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::InspectDataAction)]).await?;
 
         // MinIO's inspect-data exports a signed archive of raw drive files for a
         // `volume`/`file` glob. RustFS erasure-codes and (optionally) encrypts
@@ -585,24 +571,12 @@ pub struct StorageInfoHandler {}
 #[async_trait::async_trait]
 impl Operation for StorageInfoHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(input_cred) = req.credentials else {
+        if req.credentials.is_none() {
             log_system_request_rejected!("query_storage_info", "missing_credentials");
             return Err(s3_error!(InvalidRequest, "get cred failed"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::StorageInfoAdminAction)],
-            remote_addr,
-        )
-        .await?;
+        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::StorageInfoAdminAction)]).await?;
 
         let usecase = default_admin_usecase();
         let info = usecase.execute_query_storage_info().await.map_err(S3Error::from)?;
@@ -646,9 +620,24 @@ pub struct RuntimeCapabilitiesSummary {
     pub manual_transition_jobs: CapabilityStatus,
 }
 
+/// One named admin capability advertised to management clients
+/// (rustfs/backlog#1900). `name` is a cross-repo wire contract: the rc
+/// client gates commands on these exact strings (see rustfs/cli
+/// `IAM_POLICY_DETACH_CAPABILITY` etc.), so entries may be added but
+/// existing names must never be renamed or removed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AdvertisedAdminCapability {
+    pub name: &'static str,
+    pub status: CapabilityStatus,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RuntimeCapabilitiesResponse {
     pub summary: RuntimeCapabilitiesSummary,
+    /// Additive field: absent in responses from older servers, so clients
+    /// must treat a missing list as "no dynamic advertisement" and fall
+    /// back to their pinned per-version contract.
+    pub advertised: Vec<AdvertisedAdminCapability>,
     pub replication: ReplicationCapabilities,
     pub manual_transition_jobs: ManualTransitionJobCapabilities,
     pub diagnostic_probes: DiagnosticProbeCapabilities,
@@ -971,6 +960,7 @@ pub(crate) async fn build_runtime_capabilities_response()
 
     Ok(RuntimeCapabilitiesResponse {
         summary,
+        advertised: advertised_admin_capabilities(),
         replication: ReplicationCapabilities::current(),
         manual_transition_jobs: ManualTransitionJobCapabilities::current(),
         diagnostic_probes: DiagnosticProbeCapabilities::current(),
@@ -1062,6 +1052,31 @@ fn admin_route_capability(method: HttpMethod, path: &str) -> CapabilityStatus {
     admin_route_capability_from_inventory(method, path, ADMIN_ROUTE_POLICY_SPECS, DEFERRED_ADMIN_ROUTE_POLICIES)
 }
 
+fn advertised_admin_capabilities() -> Vec<AdvertisedAdminCapability> {
+    [
+        ("admin.iam.policy-attach", HttpMethod::Post, IAM_POLICY_ATTACH_ROUTE),
+        ("admin.iam.policy-detach", HttpMethod::Post, IAM_POLICY_DETACH_ROUTE),
+        ("admin.iam.policy-entities", HttpMethod::Get, IAM_POLICY_ENTITIES_ROUTE),
+        ("admin.iam.access-keys-bulk", HttpMethod::Get, IAM_ACCESS_KEYS_BULK_ROUTE),
+        ("admin.iam.access-keys-bulk.ldap", HttpMethod::Get, IAM_ACCESS_KEYS_BULK_LDAP_ROUTE),
+        ("admin.iam.access-keys-bulk.openid", HttpMethod::Get, IAM_ACCESS_KEYS_BULK_OPENID_ROUTE),
+        // Advertised so the console can hide the profile and 2FA surfaces
+        // against an older server instead of probing and handling a 404, and so
+        // `rc admin capabilities` reports them.
+        ("admin.account.info", HttpMethod::Get, ACCOUNT_INFO_ROUTE),
+        ("admin.account.password", HttpMethod::Post, ACCOUNT_PASSWORD_ROUTE),
+        ("admin.account.mfa", HttpMethod::Get, ACCOUNT_MFA_ROUTE),
+        ("admin.mfa.challenge", HttpMethod::Get, MFA_CHALLENGE_ROUTE),
+        ("admin.user.mfa", HttpMethod::Get, USER_MFA_ROUTE),
+    ]
+    .into_iter()
+    .map(|(name, method, route)| AdvertisedAdminCapability {
+        name,
+        status: admin_route_capability(method, route),
+    })
+    .collect()
+}
+
 fn admin_route_capability_from_inventory(
     method: HttpMethod,
     path: &str,
@@ -1114,16 +1129,12 @@ fn summarize_named_capability_statuses<const N: usize>(
 #[async_trait::async_trait]
 impl Operation for RuntimeCapabilitiesHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(input_cred) = req.credentials else {
+        if req.credentials.is_none() {
             log_system_request_rejected!("runtime_capabilities", "missing_credentials");
             return Err(s3_error!(InvalidRequest, "get cred failed"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-        validate_admin_request(&req.headers, &cred, owner, false, runtime_capabilities_gate_actions(), remote_addr).await?;
+        authorize_admin_request(&req, runtime_capabilities_gate_actions()).await?;
 
         let response = build_runtime_capabilities_response().await.map_err(|err| {
             log_system_request_failed!("runtime_capabilities", "build_runtime_capabilities_failed", err);
@@ -1143,10 +1154,10 @@ impl Operation for RuntimeCapabilitiesHandler {
     }
 }
 
-/// Authorization gate for GET datausageinfo: any-of the dedicated admin action
-/// OR the bucket listing action. Pinned by a unit test so the gate cannot
-/// silently narrow or widen (rustfs/backlog#1306).
-fn data_usage_info_gate_actions() -> Vec<Action> {
+/// Authorization gate for GET datausageinfo (and prefix usage): any-of the
+/// dedicated admin action OR the bucket listing action. Pinned by a unit test
+/// so the gate cannot silently narrow or widen (rustfs/backlog#1306).
+pub(crate) fn data_usage_info_gate_actions() -> Vec<Action> {
     vec![
         Action::AdminAction(AdminAction::DataUsageInfoAdminAction),
         Action::S3Action(S3Action::ListBucketAction),
@@ -1156,16 +1167,12 @@ fn data_usage_info_gate_actions() -> Vec<Action> {
 #[async_trait::async_trait]
 impl Operation for DataUsageInfoHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(input_cred) = req.credentials else {
+        if req.credentials.is_none() {
             log_system_request_rejected!("query_data_usage_info", "missing_credentials");
             return Err(s3_error!(InvalidRequest, "get cred failed"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-        validate_admin_request(&req.headers, &cred, owner, false, data_usage_info_gate_actions(), remote_addr).await?;
+        authorize_admin_request(&req, data_usage_info_gate_actions()).await?;
 
         let usecase = default_admin_usecase();
         let info = usecase.execute_query_data_usage_info().await.map_err(S3Error::from)?;
@@ -1186,10 +1193,11 @@ impl Operation for DataUsageInfoHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        MANUAL_TRANSITION_JOB_ROUTE, MANUAL_TRANSITION_RUN_ROUTE, OBSERVABILITY_SUMMARY_RESOLVED, RuntimeCapabilitiesHandler,
-        SITE_REPLICATION_EDIT_ROUTE, SITE_REPLICATION_INFO_ROUTE, SITE_REPLICATION_REPAIR_ROUTE,
-        SITE_REPLICATION_REPAIR_STATUS_ROUTE, SITE_REPLICATION_RESYNC_ROUTE, ServerInfoResponse, TOPOLOGY_SNAPSHOT_NOT_AVAILABLE,
-        TOPOLOGY_SUMMARY_RESOLVED, admin_route_capability_from_inventory, build_runtime_capabilities_response,
+        DataUsageInfoHandler, InspectDataHandler, MANUAL_TRANSITION_JOB_ROUTE, MANUAL_TRANSITION_RUN_ROUTE,
+        OBSERVABILITY_SUMMARY_RESOLVED, RuntimeCapabilitiesHandler, SITE_REPLICATION_EDIT_ROUTE, SITE_REPLICATION_INFO_ROUTE,
+        SITE_REPLICATION_REPAIR_ROUTE, SITE_REPLICATION_REPAIR_STATUS_ROUTE, SITE_REPLICATION_RESYNC_ROUTE, ServerInfoHandler,
+        ServerInfoResponse, ServiceHandle, StorageInfoHandler, TOPOLOGY_SNAPSHOT_NOT_AVAILABLE, TOPOLOGY_SUMMARY_RESOLVED,
+        UpdateHandler, admin_route_capability_from_inventory, build_runtime_capabilities_response,
         build_runtime_capabilities_summary, data_usage_info_gate_actions, runtime_capabilities_gate_actions,
         system_admin_discovery,
     };
@@ -1224,6 +1232,48 @@ mod tests {
         );
     }
 
+    /// Wire-contract pin (rustfs/backlog#1900): the rc client keys its
+    /// command gates on these exact capability names, and parses each
+    /// entry as `{name, status: {state, reason?}}`. Renaming or dropping
+    /// a name silently disables the corresponding rc command.
+    #[tokio::test]
+    async fn runtime_capabilities_response_advertises_iam_capabilities() {
+        let response = build_runtime_capabilities_response()
+            .await
+            .expect("runtime capabilities response should build");
+
+        let expected_supported = [
+            "admin.iam.policy-attach",
+            "admin.iam.policy-detach",
+            "admin.iam.policy-entities",
+            "admin.iam.access-keys-bulk",
+            "admin.iam.access-keys-bulk.ldap",
+            "admin.iam.access-keys-bulk.openid",
+        ];
+        for name in expected_supported {
+            let entry = response
+                .advertised
+                .iter()
+                .find(|capability| capability.name == name)
+                .unwrap_or_else(|| panic!("{name} must be advertised"));
+            assert_eq!(entry.status.state, CapabilityState::Supported, "{name} must be supported");
+        }
+
+        let mut names: Vec<&str> = response.advertised.iter().map(|capability| capability.name).collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "advertised capability names must be unique");
+
+        let serialized = serde_json::to_value(&response).expect("response should serialize");
+        let advertised = serialized["advertised"].as_array().expect("advertised must be an array");
+        let detach = advertised
+            .iter()
+            .find(|entry| entry["name"] == "admin.iam.policy-detach")
+            .expect("serialized detach entry must exist");
+        assert_eq!(detach["status"]["state"], "supported");
+    }
+
     #[tokio::test]
     async fn runtime_capabilities_response_reports_missing_topology_before_storage_init() {
         let response = build_runtime_capabilities_response()
@@ -1247,7 +1297,9 @@ mod tests {
         assert_eq!(response.summary.manual_transition_jobs.state, CapabilityState::Supported);
         assert_eq!(response.replication.contract_version, 1);
         assert_eq!(response.replication.bucket_replication.contract_version, 1);
-        assert_eq!(response.replication.remote_targets.contract_version, 1);
+        // v2: disableProxy moved from unsupported to writable (per-target
+        // read-proxy opt-out reached the admin API).
+        assert_eq!(response.replication.remote_targets.contract_version, 2);
         assert_eq!(response.replication.bucket_replication.status.state, CapabilityState::Supported);
         assert_eq!(response.replication.remote_targets.status.state, CapabilityState::Supported);
         assert_eq!(
@@ -1278,7 +1330,23 @@ mod tests {
                 .remote_targets
                 .fields
                 .iter()
-                .any(|field| field.name == "disableProxy" && field.state == super::ReplicationFieldState::Unsupported)
+                .any(|field| field.name == "disableProxy" && field.state == super::ReplicationFieldState::Supported)
+        );
+        assert!(
+            response
+                .replication
+                .remote_targets
+                .fields
+                .iter()
+                .any(|field| field.name == "edge" && field.state == super::ReplicationFieldState::Unsupported)
+        );
+        assert!(
+            response
+                .replication
+                .remote_targets
+                .fields
+                .iter()
+                .any(|field| field.name == "healthCheckDuration" && field.state == super::ReplicationFieldState::Supported)
         );
         assert_eq!(response.manual_transition_jobs.contract_version, 1);
         assert_eq!(response.manual_transition_jobs.status.state, CapabilityState::Supported);
@@ -1341,7 +1409,7 @@ mod tests {
         assert_eq!(value["summary"]["manual_transition_jobs"]["state"], "supported");
         assert_eq!(value["replication"]["contract_version"], 1);
         assert_eq!(value["replication"]["bucket_replication"]["contract_version"], 1);
-        assert_eq!(value["replication"]["remote_targets"]["contract_version"], 1);
+        assert_eq!(value["replication"]["remote_targets"]["contract_version"], 2);
         assert_eq!(value["replication"]["bucket_replication"]["status"]["state"], "supported");
         assert_eq!(value["replication"]["remote_targets"]["status"]["state"], "supported");
         assert_eq!(
@@ -1360,7 +1428,21 @@ mod tests {
                 .as_array()
                 .expect("remote target fields should be an array")
                 .iter()
-                .any(|field| field["name"] == "disableProxy" && field["state"] == "unsupported")
+                .any(|field| field["name"] == "disableProxy" && field["state"] == "supported")
+        );
+        assert!(
+            value["replication"]["remote_targets"]["fields"]
+                .as_array()
+                .expect("remote target fields should be an array")
+                .iter()
+                .any(|field| field["name"] == "edge" && field["state"] == "unsupported")
+        );
+        assert!(
+            value["replication"]["remote_targets"]["fields"]
+                .as_array()
+                .expect("remote target fields should be an array")
+                .iter()
+                .any(|field| field["name"] == "healthCheckDuration" && field["state"] == "supported")
         );
         assert_eq!(value["manual_transition_jobs"]["contract_version"], 1);
         assert_eq!(value["manual_transition_jobs"]["status"]["state"], "supported");
@@ -1511,6 +1593,84 @@ mod tests {
         assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
     }
 
+    /// `ServerInfoHandler` must answer an authorized admin request with the
+    /// per-pool erasure-set topology (rustfs/backlog#1839). That map is only
+    /// filled when the server-info query is issued with pools included, so a
+    /// handler that stopped asking for them would still return 200 with an
+    /// empty `pools` object instead of failing.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn server_info_response_carries_pool_topology() {
+        use crate::admin::runtime_sources::{AppContext, publish_test_app_context};
+        use crate::admin::storage_api::runtime::bootstrap_ctx;
+        use http_body_util::BodyExt as _;
+        use rustfs_iam::store::{Store as _, object::IAM_CONFIG_PREFIX};
+        use std::sync::Arc;
+
+        const ROOT_ACCESS_KEY: &str = "SERVERINFOROOTACCESSKEY";
+        const ROOT_SECRET_KEY: &str = "serverInfoRootSecret123";
+
+        let _ = rustfs_credentials::init_global_action_credentials(
+            Some(ROOT_ACCESS_KEY.to_string()),
+            Some(ROOT_SECRET_KEY.to_string()),
+        );
+
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .prefix("admin_server_info_pools")
+            .disk_count(1)
+            .init_bucket_metadata(false)
+            .build()
+            .await;
+        // Server startup owns this write in production; the test bootstrap
+        // stops short of it, and without a topology the server-info query
+        // returns before it ever looks at drives.
+        bootstrap_ctx().set_endpoints(env.endpoint_pools.clone());
+        rustfs_iam::store::object::ObjectStore::new(Arc::clone(&env.ecstore))
+            .save_iam_config(serde_json::json!({"version": 1}), format!("{}/format.json", *IAM_CONFIG_PREFIX))
+            .await
+            .expect("seed IAM format");
+        let iam = rustfs_iam::build_iam_sys(Arc::clone(&env.ecstore))
+            .await
+            .expect("build test IAM");
+        publish_test_app_context(Arc::new(AppContext::with_default_interfaces(
+            Arc::clone(&env.ecstore),
+            iam,
+            Arc::new(rustfs_kms::KmsServiceManager::new()),
+        )));
+
+        let request = S3Request {
+            input: Body::empty(),
+            method: Method::GET,
+            uri: Uri::from_static("/rustfs/admin/v3/info"),
+            headers: HeaderMap::new(),
+            extensions: Extensions::new(),
+            credentials: Some(s3s::auth::Credentials {
+                access_key: ROOT_ACCESS_KEY.to_string(),
+                secret_key: s3s::auth::SecretKey::from(ROOT_SECRET_KEY.to_string()),
+            }),
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        let (status, body) = super::ServerInfoHandler {}
+            .call(request, Params::new())
+            .await
+            .expect("root admin credentials must be served server info")
+            .output;
+        assert_eq!(status, hyper::StatusCode::OK);
+
+        let bytes = body.collect().await.expect("server info body should read").to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("server info must be json");
+        let pools = payload["info"]["pools"]
+            .as_object()
+            .expect("server info must carry a pools object");
+        assert!(
+            pools.contains_key("0"),
+            "server info must report the erasure-set topology of pool 0, got {pools:?}"
+        );
+    }
+
     /// Authorization denial for this exact action is pinned to AccessDenied by
     /// `crate::admin::auth::tests::non_admin_credential_is_denied`.
     #[test]
@@ -1519,6 +1679,18 @@ mod tests {
             runtime_capabilities_gate_actions(),
             vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)]
         );
+    }
+
+    /// The startup bitrot self-test outcome must surface in server info as one
+    /// of three closed-set strings, never an internal enum or a null
+    /// (rustfs/backlog#1873). This test pins the string mapping; whether the
+    /// process-global cell holds Some(true)/Some(false)/None is owned by
+    /// `crate::bitrot_selftest`'s own tests.
+    #[test]
+    fn bitrot_selftest_status_str_is_a_closed_set_of_operators_strings() {
+        let rendered = super::bitrot_selftest_status_str();
+        assert!(matches!(rendered, "passed" | "failed" | "unknown"));
+        assert_eq!(super::bitrot_selftest_status_str(), rendered);
     }
 
     #[test]
@@ -1542,6 +1714,7 @@ mod tests {
                 pools: None,
             },
             admin_discovery: system_admin_discovery(&usecase),
+            bitrot_selftest: super::bitrot_selftest_status_str(),
         };
 
         let value = serde_json::to_value(response).expect("server info response should serialize");
@@ -1678,5 +1851,124 @@ mod tests {
                 .unwrap_or_default()
                 .contains(TOPOLOGY_SUMMARY_RESOLVED)
         );
+    }
+
+    fn credential_less_request(method: Method, uri: &'static str) -> S3Request<Body> {
+        S3Request {
+            input: Body::empty(),
+            method,
+            uri: Uri::from_static(uri),
+            headers: HeaderMap::new(),
+            extensions: Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    async fn assert_missing_credentials(operation: &dyn Operation, method: Method, uri: &'static str) {
+        let err = operation
+            .call(credential_less_request(method, uri), Params::new())
+            .await
+            .expect_err("a system admin request without credentials must fail");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("get cred failed"));
+    }
+
+    /// Every system handler pre-checks credentials before delegating to the
+    /// shared admin gate, so the credential-less response stays byte-identical to
+    /// what it was before the deduplication. `ServiceHandle` in particular must
+    /// keep rejecting on missing credentials *before* it parses the requested
+    /// service action (rustfs/backlog#1829).
+    #[tokio::test]
+    async fn system_handlers_keep_their_missing_credentials_response() {
+        assert_missing_credentials(&ServiceHandle {}, Method::POST, "/rustfs/admin/v3/service?action=restart").await;
+        assert_missing_credentials(&ServiceHandle {}, Method::POST, "/rustfs/admin/v3/service").await;
+        assert_missing_credentials(&UpdateHandler {}, Method::POST, "/rustfs/admin/v3/update").await;
+        assert_missing_credentials(&ServerInfoHandler {}, Method::GET, "/rustfs/admin/v3/info").await;
+        assert_missing_credentials(&InspectDataHandler {}, Method::GET, "/rustfs/admin/v3/inspect-data").await;
+        assert_missing_credentials(&StorageInfoHandler {}, Method::GET, "/rustfs/admin/v3/storageinfo").await;
+        assert_missing_credentials(&RuntimeCapabilitiesHandler {}, Method::GET, "/rustfs/admin/v4/runtime/capabilities").await;
+        assert_missing_credentials(&DataUsageInfoHandler {}, Method::GET, "/rustfs/admin/v3/datausageinfo").await;
+    }
+
+    fn source_block<'a>(production: &'a str, marker: &str) -> &'a str {
+        let block = production
+            .split_once(marker)
+            .unwrap_or_else(|| panic!("{marker} should exist"))
+            .1;
+        let end = [
+            "\npub struct ",
+            "\nasync fn ",
+            "\npub(crate) async fn ",
+            "\npub fn ",
+            "\npub(crate) fn ",
+            "\nfn ",
+            "\nmod ",
+            "\n#[cfg(test)]",
+        ]
+        .into_iter()
+        .filter_map(|boundary| block.find(boundary))
+        .min()
+        .unwrap_or(block.len());
+        &block[..end]
+    }
+
+    /// Pins the gate wiring: each system handler authorizes through exactly one
+    /// `authorize_admin_request` call carrying the same action vector it used
+    /// before the deduplication. The two gate-action helpers must be passed
+    /// through by name so the vectors pinned by the tests above keep governing
+    /// the live gate (rustfs/backlog#1829).
+    #[test]
+    fn system_handlers_use_the_shared_admin_gate_with_their_actions() {
+        let production = include_str!("system.rs")
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .expect("production source must precede the test module");
+
+        let service_tokens = [
+            "AdminAction::ServiceRestartAdminAction",
+            "AdminAction::ServiceStopAdminAction",
+            "AdminAction::ServiceFreezeAdminAction",
+        ];
+        let update_tokens = ["AdminAction::ServerUpdateAdminAction"];
+        let server_info_tokens = ["AdminAction::ServerInfoAdminAction"];
+        let inspect_data_tokens = ["AdminAction::InspectDataAction"];
+        let storage_info_tokens = ["AdminAction::StorageInfoAdminAction"];
+        let runtime_capabilities_tokens = ["runtime_capabilities_gate_actions()"];
+        let data_usage_info_tokens = ["data_usage_info_gate_actions()"];
+
+        for (handler, inline_admin_actions, tokens) in [
+            ("ServiceHandle", 1usize, service_tokens.as_slice()),
+            ("UpdateHandler", 1, update_tokens.as_slice()),
+            ("ServerInfoHandler", 1, server_info_tokens.as_slice()),
+            ("InspectDataHandler", 1, inspect_data_tokens.as_slice()),
+            ("StorageInfoHandler", 1, storage_info_tokens.as_slice()),
+            ("RuntimeCapabilitiesHandler", 0, runtime_capabilities_tokens.as_slice()),
+            ("DataUsageInfoHandler", 0, data_usage_info_tokens.as_slice()),
+        ] {
+            let block = source_block(production, &format!("impl Operation for {handler}"));
+            assert_eq!(
+                block.matches("authorize_admin_request(").count(),
+                1,
+                "{handler} must use exactly one shared gate"
+            );
+            assert_eq!(
+                block.matches("Action::AdminAction(").count(),
+                inline_admin_actions,
+                "{handler} must preserve its exact inline action-vector length"
+            );
+            for token in tokens {
+                assert!(block.contains(token), "{handler} must authorize with {token}");
+            }
+            assert!(
+                !block.contains("let cred = authorize_admin_request("),
+                "{handler} does not consume the authenticated credentials"
+            );
+        }
+
+        assert!(!production.contains("check_key_valid(get_session_token"));
+        assert!(!production.contains("validate_admin_request("));
     }
 }

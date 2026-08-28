@@ -41,8 +41,7 @@ use crate::types::{
     DescribeKeyRequest, EncryptRequest, GenerateDataKeyRequest, KeySpec, KeyState, KeyUsage, ObjectEncryptionContext,
     RewrapDataKeyRequest,
 };
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64;
+use base64_simd::STANDARD as BASE64;
 use rand::RngExt as _;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -183,6 +182,7 @@ async fn assert_state_machine_contract(backend: &dyn KmsBackend, key_id: &str) {
         .await
         .expect("decrypt with a disabled key must keep working");
     assert_eq!(decrypted.plaintext, data_key.plaintext_key, "decrypt must recover the original data key");
+    assert_eq!(decrypted.key_id, key_id, "decrypt must report the master key that opened the envelope");
     // ...disable stays idempotent, cancel has nothing to cancel, and enable recovers.
     backend.disable_key(key_id).await.expect("disable must be idempotent");
     expect_invalid_key_state(backend.cancel_key_deletion(cancel_request(key_id)).await, "not pending deletion");
@@ -284,7 +284,7 @@ async fn static_backend_stateless_contract() {
     let key_id = "static-contract-key";
     let mut raw_key = [0u8; 32];
     rand::rng().fill(&mut raw_key[..]);
-    let config = KmsConfig::static_kms(key_id.to_string(), BASE64.encode(raw_key));
+    let config = KmsConfig::static_kms(key_id.to_string(), BASE64.encode_to_string(raw_key));
     let static_backend = StaticKmsBackend::new(config).await.expect("static backend should build");
     let backend: &dyn KmsBackend = &static_backend;
 

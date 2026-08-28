@@ -30,11 +30,10 @@ use crate::admin::storage_api::error::StorageError;
 use crate::storage::storage_api::lock_bucket_targets_metadata;
 use crate::{
     admin::{
-        auth::validate_admin_request,
+        auth::authorize_admin_request,
         router::{AdminOperation, Operation, S3Router},
     },
-    auth::{check_key_valid, get_session_token},
-    server::{ADMIN_PREFIX, RemoteAddr},
+    server::ADMIN_PREFIX,
 };
 use http::{HeaderMap, StatusCode};
 use hyper::Method;
@@ -117,22 +116,11 @@ impl Operation for ExportBucketMetadata {
             }
         };
 
-        let Some(input_cred) = req.credentials else {
+        if req.credentials.is_none() {
             return Err(s3_error!(InvalidRequest, "authentication required"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::ExportBucketMetadataAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::ExportBucketMetadataAction)]).await?;
 
         let Some(store) = object_store_from_extensions(&req.extensions) else {
             return Err(s3_error!(InternalError, "object store is not initialized"));
@@ -394,7 +382,6 @@ impl Operation for ExportBucketMetadata {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct ImportBucketMetadataQuery {
-    #[allow(dead_code)]
     pub bucket: String,
 }
 
@@ -413,22 +400,11 @@ impl Operation for ImportBucketMetadata {
             }
         };
 
-        let Some(input_cred) = req.credentials else {
+        if req.credentials.is_none() {
             return Err(s3_error!(InvalidRequest, "authentication required"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::ImportBucketMetadataAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::ImportBucketMetadataAction)]).await?;
 
         let mut input = req.input;
         let body = match input.store_all_limited(MAX_BUCKET_METADATA_IMPORT_SIZE).await {
@@ -464,6 +440,16 @@ impl Operation for ImportBucketMetadata {
 
             file_contents.push((file_path, content));
         }
+
+        let durable_quota_import = imported_quota_requires_fleet_proof(&file_contents)?;
+        let quota_fleet_proof =
+            if durable_quota_import {
+                Some(crate::admin::storage_api::acquire_cross_pool_fence_fleet_proof().ok_or_else(|| {
+                    s3_error!(ServiceUnavailable, "durable quota capability is not confirmed across the cluster")
+                })?)
+            } else {
+                None
+            };
 
         // Extract bucket names
         let mut bucket_names = Vec::new();
@@ -610,8 +596,17 @@ impl Operation for ImportBucketMetadata {
                     metadata.policy_config_json = content;
                     metadata.policy_config_updated_at = update_at;
                 }
-                BUCKET_NOTIFICATION_CONFIG => {
-                    if let Err(e) = deserialize::<s3s::dto::NotificationConfiguration>(&content) {
+                BUCKET_NOTIFICATION_CONFIG
+                | BUCKET_LIFECYCLE_CONFIG
+                | BUCKET_SSECONFIG
+                | BUCKET_TAGGING_CONFIG
+                | OBJECT_LOCK_CONFIG
+                | BUCKET_VERSIONING_CONFIG
+                | BUCKET_REPLICATION_CONFIG
+                | BUCKET_TARGETS_FILE => {
+                    if let Err(e) =
+                        apply_imported_bucket_config(&mut bucket_metadatas, bucket_name, conf_name, content, update_at)
+                    {
                         warn!(
                             event = EVENT_ADMIN_BUCKET_META_STATE,
                             component = LOG_COMPONENT_ADMIN,
@@ -625,103 +620,9 @@ impl Operation for ImportBucketMetadata {
                         );
                         continue;
                     }
-
-                    let metadata = match bucket_metadatas.get_mut(bucket_name) {
-                        Some(m) => m,
-                        None => continue,
-                    };
-                    metadata.notification_config_xml = content;
-                    metadata.notification_config_updated_at = update_at;
-                }
-
-                BUCKET_LIFECYCLE_CONFIG => {
-                    if let Err(e) = deserialize::<BucketLifecycleConfiguration>(&content) {
-                        warn!(
-                            event = EVENT_ADMIN_BUCKET_META_STATE,
-                            component = LOG_COMPONENT_ADMIN,
-                            subsystem = LOG_SUBSYSTEM_BUCKET_META,
-                            action = "import_bucket_metadata",
-                            result = "config_deserialize_failed",
-                            bucket = %bucket_name,
-                            config_name = %conf_name,
-                            error = %e,
-                            "admin bucket meta state"
-                        );
-                        continue;
-                    }
-
-                    let metadata = match bucket_metadatas.get_mut(bucket_name) {
-                        Some(m) => m,
-                        None => continue,
-                    };
-                    metadata.lifecycle_config_xml = content;
-                    metadata.lifecycle_config_updated_at = update_at;
-                }
-
-                BUCKET_SSECONFIG => {
-                    if let Err(e) = deserialize::<ServerSideEncryptionConfiguration>(&content) {
-                        warn!(
-                            event = EVENT_ADMIN_BUCKET_META_STATE,
-                            component = LOG_COMPONENT_ADMIN,
-                            subsystem = LOG_SUBSYSTEM_BUCKET_META,
-                            action = "import_bucket_metadata",
-                            result = "config_deserialize_failed",
-                            bucket = %bucket_name,
-                            config_name = %conf_name,
-                            error = %e,
-                            "admin bucket meta state"
-                        );
-                        continue;
-                    }
-
-                    let metadata = match bucket_metadatas.get_mut(bucket_name) {
-                        Some(m) => m,
-                        None => continue,
-                    };
-                    metadata.encryption_config_xml = content;
-                    metadata.encryption_config_updated_at = update_at;
-                }
-
-                BUCKET_TAGGING_CONFIG => {
-                    if let Err(e) = deserialize::<Tagging>(&content) {
-                        warn!(
-                            event = EVENT_ADMIN_BUCKET_META_STATE,
-                            component = LOG_COMPONENT_ADMIN,
-                            subsystem = LOG_SUBSYSTEM_BUCKET_META,
-                            action = "import_bucket_metadata",
-                            result = "config_deserialize_failed",
-                            bucket = %bucket_name,
-                            config_name = %conf_name,
-                            error = %e,
-                            "admin bucket meta state"
-                        );
-                        continue;
-                    }
-
-                    let metadata = match bucket_metadatas.get_mut(bucket_name) {
-                        Some(m) => m,
-                        None => continue,
-                    };
-                    metadata.tagging_config_xml = content;
-                    metadata.tagging_config_updated_at = update_at;
                 }
 
                 BUCKET_QUOTA_CONFIG_FILE => {
-                    if let Err(e) = serde_json::from_slice::<BucketQuota>(&content) {
-                        warn!(
-                            event = EVENT_ADMIN_BUCKET_META_STATE,
-                            component = LOG_COMPONENT_ADMIN,
-                            subsystem = LOG_SUBSYSTEM_BUCKET_META,
-                            action = "import_bucket_metadata",
-                            result = "config_deserialize_failed",
-                            bucket = %bucket_name,
-                            config_name = %conf_name,
-                            error = %e,
-                            "admin bucket meta state"
-                        );
-                        continue;
-                    }
-
                     let metadata = match bucket_metadatas.get_mut(bucket_name) {
                         Some(m) => m,
                         None => continue,
@@ -730,110 +631,10 @@ impl Operation for ImportBucketMetadata {
                     metadata.quota_config_updated_at = update_at;
                 }
 
-                OBJECT_LOCK_CONFIG => {
-                    if let Err(e) = deserialize::<ObjectLockConfiguration>(&content) {
-                        warn!(
-                            event = EVENT_ADMIN_BUCKET_META_STATE,
-                            component = LOG_COMPONENT_ADMIN,
-                            subsystem = LOG_SUBSYSTEM_BUCKET_META,
-                            action = "import_bucket_metadata",
-                            result = "config_deserialize_failed",
-                            bucket = %bucket_name,
-                            config_name = %conf_name,
-                            error = %e,
-                            "admin bucket meta state"
-                        );
-                        continue;
-                    }
-
-                    let metadata = match bucket_metadatas.get_mut(bucket_name) {
-                        Some(m) => m,
-                        None => continue,
-                    };
-                    metadata.object_lock_config_xml = content;
-                    metadata.object_lock_config_updated_at = update_at;
-                }
-
-                BUCKET_VERSIONING_CONFIG => {
-                    if let Err(e) = deserialize::<VersioningConfiguration>(&content) {
-                        warn!(
-                            event = EVENT_ADMIN_BUCKET_META_STATE,
-                            component = LOG_COMPONENT_ADMIN,
-                            subsystem = LOG_SUBSYSTEM_BUCKET_META,
-                            action = "import_bucket_metadata",
-                            result = "config_deserialize_failed",
-                            bucket = %bucket_name,
-                            config_name = %conf_name,
-                            error = %e,
-                            "admin bucket meta state"
-                        );
-                        continue;
-                    }
-
-                    let metadata = match bucket_metadatas.get_mut(bucket_name) {
-                        Some(m) => m,
-                        None => continue,
-                    };
-                    metadata.versioning_config_xml = content;
-                    metadata.versioning_config_updated_at = update_at;
-                }
-
-                BUCKET_REPLICATION_CONFIG => {
-                    if let Err(e) = deserialize::<ReplicationConfiguration>(&content) {
-                        warn!(
-                            event = EVENT_ADMIN_BUCKET_META_STATE,
-                            component = LOG_COMPONENT_ADMIN,
-                            subsystem = LOG_SUBSYSTEM_BUCKET_META,
-                            action = "import_bucket_metadata",
-                            result = "config_deserialize_failed",
-                            bucket = %bucket_name,
-                            config_name = %conf_name,
-                            error = %e,
-                            "admin bucket meta state"
-                        );
-                        continue;
-                    }
-
-                    let metadata = match bucket_metadatas.get_mut(bucket_name) {
-                        Some(m) => m,
-                        None => continue,
-                    };
-                    metadata.replication_config_xml = content;
-                    metadata.replication_config_updated_at = update_at;
-                }
-
-                BUCKET_TARGETS_FILE => {
-                    if let Err(e) = serde_json::from_slice::<BucketTargets>(&content) {
-                        warn!(
-                            event = EVENT_ADMIN_BUCKET_META_STATE,
-                            component = LOG_COMPONENT_ADMIN,
-                            subsystem = LOG_SUBSYSTEM_BUCKET_META,
-                            action = "import_bucket_metadata",
-                            result = "config_deserialize_failed",
-                            bucket = %bucket_name,
-                            config_name = %conf_name,
-                            error = %e,
-                            "admin bucket meta state"
-                        );
-                        continue;
-                    }
-
-                    let metadata = match bucket_metadatas.get_mut(bucket_name) {
-                        Some(m) => m,
-                        None => continue,
-                    };
-                    metadata.bucket_targets_config_json = content;
-                    metadata.bucket_targets_config_updated_at = update_at;
-                }
-
                 _ => {}
             }
         }
 
-        // Persist the assembled metadata to disk. Prior to this, the import only mutated the
-        // in-memory `bucket_metadatas` map and returned 200, silently dropping every imported
-        // config. `metadata_sys::update` loads the on-disk metadata, overwrites the given config
-        // field and saves it, preserving any configs not present in the import archive.
         for (bucket_name, metadata) in &bucket_metadatas {
             for (config_file, data) in imported_configs_to_persist(metadata) {
                 let site_replication_item = imported_config_to_site_replication_item(bucket_name, metadata, config_file, &data)?;
@@ -842,7 +643,21 @@ impl Operation for ImportBucketMetadata {
                 } else {
                     None
                 };
-                if let Err(e) = metadata_sys::update(bucket_name, config_file, data).await {
+                let persist_result = if config_file == BUCKET_QUOTA_CONFIG_FILE {
+                    let quota: BucketQuota =
+                        serde_json::from_slice(&data).map_err(|e| s3_error!(InvalidRequest, "invalid bucket quota: {e}"))?;
+                    if quota.uses_durable_reservations() {
+                        let proof = quota_fleet_proof.as_ref().ok_or_else(|| {
+                            s3_error!(ServiceUnavailable, "durable quota capability is not confirmed across the cluster")
+                        })?;
+                        metadata_sys::update_quota_if_incarnation(bucket_name, data, metadata.bucket_incarnation_id, proof).await
+                    } else {
+                        metadata_sys::update_if_incarnation(bucket_name, config_file, data, metadata.bucket_incarnation_id).await
+                    }
+                } else {
+                    metadata_sys::update_if_incarnation(bucket_name, config_file, data, metadata.bucket_incarnation_id).await
+                };
+                if let Err(e) = persist_result {
                     warn!(
                         event = EVENT_ADMIN_BUCKET_META_STATE,
                         component = LOG_COMPONENT_ADMIN,
@@ -883,6 +698,109 @@ impl Operation for ImportBucketMetadata {
         header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
+}
+
+fn imported_quota_requires_fleet_proof(file_contents: &[(String, Vec<u8>)]) -> S3Result<bool> {
+    let mut durable = false;
+    for (file_path, content) in file_contents {
+        let mut parts = file_path.split(SLASH_SEPARATOR);
+        let Some(_bucket) = parts.next() else {
+            continue;
+        };
+        if parts.next() != Some(BUCKET_QUOTA_CONFIG_FILE) {
+            continue;
+        }
+        let quota: BucketQuota =
+            serde_json::from_slice(content).map_err(|e| s3_error!(InvalidRequest, "invalid bucket quota: {e}"))?;
+        if quota.has_unsupported_reservation_protocol() {
+            return Err(s3_error!(InvalidRequest, "unsupported bucket quota reservation protocol"));
+        }
+        durable |= quota.uses_durable_reservations();
+    }
+    Ok(durable)
+}
+
+/// Store one imported bucket config that follows the shared validate-then-store shape: the seven
+/// validated XML configs plus the JSON bucket-targets file.
+///
+/// A single `conf_name` match owns both the type a payload must parse as and the [`BucketMetadata`]
+/// field it lands in, so a config file cannot be validated as one type but stored into another
+/// config's field. Validation runs before the metadata lookup, so an unparsable payload is rejected
+/// whether or not `bucket_name` has in-memory metadata.
+///
+/// `Err` carries the parse error's display form and leaves every bucket untouched. `Ok(false)` means
+/// nothing was stored because `conf_name` is not one of these configs, or because `bucket_name` has
+/// no in-memory metadata.
+fn apply_imported_bucket_config(
+    bucket_metadatas: &mut HashMap<String, BucketMetadata>,
+    bucket_name: &str,
+    conf_name: &str,
+    content: Vec<u8>,
+    update_at: OffsetDateTime,
+) -> Result<bool, String> {
+    macro_rules! validated_config {
+        ($validate:expr, $payload_field:ident, $updated_at_field:ident) => {{
+            $validate(&content).map_err(|e| e.to_string())?;
+            |metadata: &mut BucketMetadata, payload: Vec<u8>, updated_at: OffsetDateTime| {
+                metadata.$payload_field = payload;
+                metadata.$updated_at_field = updated_at;
+            }
+        }};
+    }
+
+    let store: fn(&mut BucketMetadata, Vec<u8>, OffsetDateTime) = match conf_name {
+        BUCKET_NOTIFICATION_CONFIG => validated_config!(
+            deserialize::<s3s::dto::NotificationConfiguration>,
+            notification_config_xml,
+            notification_config_updated_at
+        ),
+        BUCKET_LIFECYCLE_CONFIG => {
+            validated_config!(
+                deserialize::<BucketLifecycleConfiguration>,
+                lifecycle_config_xml,
+                lifecycle_config_updated_at
+            )
+        }
+        BUCKET_SSECONFIG => validated_config!(
+            deserialize::<ServerSideEncryptionConfiguration>,
+            encryption_config_xml,
+            encryption_config_updated_at
+        ),
+        BUCKET_TAGGING_CONFIG => validated_config!(deserialize::<Tagging>, tagging_config_xml, tagging_config_updated_at),
+        OBJECT_LOCK_CONFIG => {
+            validated_config!(
+                deserialize::<ObjectLockConfiguration>,
+                object_lock_config_xml,
+                object_lock_config_updated_at
+            )
+        }
+        BUCKET_VERSIONING_CONFIG => {
+            validated_config!(
+                deserialize::<VersioningConfiguration>,
+                versioning_config_xml,
+                versioning_config_updated_at
+            )
+        }
+        BUCKET_REPLICATION_CONFIG => {
+            validated_config!(
+                deserialize::<ReplicationConfiguration>,
+                replication_config_xml,
+                replication_config_updated_at
+            )
+        }
+        BUCKET_TARGETS_FILE => validated_config!(
+            serde_json::from_slice::<BucketTargets>,
+            bucket_targets_config_json,
+            bucket_targets_config_updated_at
+        ),
+        _ => return Ok(false),
+    };
+
+    let Some(metadata) = bucket_metadatas.get_mut(bucket_name) else {
+        return Ok(false);
+    };
+    store(metadata, content, update_at);
+    Ok(true)
 }
 
 /// The `(config_file, data)` pairs to persist for an imported bucket's metadata: every non-empty
@@ -985,6 +903,198 @@ fn set_imported_config_string(target: &mut Option<String>, config_file: &str, da
 }
 
 #[cfg(test)]
+mod imported_config_apply_tests {
+    use super::*;
+
+    const BUCKET: &str = "restored-bucket";
+
+    /// Distinct from every `BucketMetadata::new` default, so a written timestamp is visible.
+    fn imported_at() -> OffsetDateTime {
+        OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1_755_000_000)
+    }
+
+    /// One imported config file, the [`BucketMetadata`] field pair it owns, and payloads its type
+    /// accepts and rejects.
+    struct ImportCase {
+        conf_name: &'static str,
+        valid: &'static [u8],
+        invalid: &'static [u8],
+        payload: fn(&BucketMetadata) -> &Vec<u8>,
+        updated_at: fn(&BucketMetadata) -> OffsetDateTime,
+    }
+
+    /// The `conf_name` -> (validated type, metadata field) mapping the import handler must honour.
+    /// Storing a config file's payload into another config's field is the regression this table
+    /// pins down.
+    fn import_cases() -> Vec<ImportCase> {
+        vec![
+            ImportCase {
+                conf_name: BUCKET_NOTIFICATION_CONFIG,
+                valid: b"<NotificationConfiguration></NotificationConfiguration>",
+                invalid: b"not xml",
+                payload: |m| &m.notification_config_xml,
+                updated_at: |m| m.notification_config_updated_at,
+            },
+            ImportCase {
+                conf_name: BUCKET_LIFECYCLE_CONFIG,
+                valid: b"<LifecycleConfiguration><Rule><ID>expire</ID><Status>Enabled</Status><Filter><Prefix>logs/</Prefix></Filter><Expiration><Days>30</Days></Expiration></Rule></LifecycleConfiguration>",
+                invalid: b"not xml",
+                payload: |m| &m.lifecycle_config_xml,
+                updated_at: |m| m.lifecycle_config_updated_at,
+            },
+            ImportCase {
+                conf_name: BUCKET_SSECONFIG,
+                valid: b"<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>",
+                invalid: b"not xml",
+                payload: |m| &m.encryption_config_xml,
+                updated_at: |m| m.encryption_config_updated_at,
+            },
+            ImportCase {
+                conf_name: BUCKET_TAGGING_CONFIG,
+                valid: b"<Tagging><TagSet><Tag><Key>team</Key><Value>storage</Value></Tag></TagSet></Tagging>",
+                invalid: b"not xml",
+                payload: |m| &m.tagging_config_xml,
+                updated_at: |m| m.tagging_config_updated_at,
+            },
+            ImportCase {
+                conf_name: OBJECT_LOCK_CONFIG,
+                valid: b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>",
+                invalid: b"not xml",
+                payload: |m| &m.object_lock_config_xml,
+                updated_at: |m| m.object_lock_config_updated_at,
+            },
+            ImportCase {
+                conf_name: BUCKET_VERSIONING_CONFIG,
+                valid: b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
+                invalid: b"not xml",
+                payload: |m| &m.versioning_config_xml,
+                updated_at: |m| m.versioning_config_updated_at,
+            },
+            ImportCase {
+                conf_name: BUCKET_REPLICATION_CONFIG,
+                valid: b"<ReplicationConfiguration><Role>arn:aws:iam::123456789012:role/replication</Role><Rule><Status>Enabled</Status><Priority>1</Priority><DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication><Filter><Prefix></Prefix></Filter><Destination><Bucket>arn:aws:s3:::backup</Bucket></Destination></Rule></ReplicationConfiguration>",
+                invalid: b"not xml",
+                payload: |m| &m.replication_config_xml,
+                updated_at: |m| m.replication_config_updated_at,
+            },
+            ImportCase {
+                conf_name: BUCKET_TARGETS_FILE,
+                valid: br#"{"targets":[]}"#,
+                invalid: b"[]",
+                payload: |m| &m.bucket_targets_config_json,
+                updated_at: |m| m.bucket_targets_config_updated_at,
+            },
+        ]
+    }
+
+    fn imported_bucket() -> HashMap<String, BucketMetadata> {
+        HashMap::from([(BUCKET.to_string(), BucketMetadata::new(BUCKET))])
+    }
+
+    #[test]
+    fn a_valid_payload_lands_only_in_the_field_its_config_file_owns() {
+        for case in import_cases() {
+            let mut metadatas = imported_bucket();
+            let stored = apply_imported_bucket_config(&mut metadatas, BUCKET, case.conf_name, case.valid.to_vec(), imported_at())
+                .unwrap_or_else(|e| panic!("{} payload must validate: {e}", case.conf_name));
+            assert!(stored, "{} must be stored", case.conf_name);
+
+            let metadata = &metadatas[BUCKET];
+            assert_eq!((case.payload)(metadata), case.valid, "{} landed in the wrong field", case.conf_name);
+            assert_eq!((case.updated_at)(metadata), imported_at(), "{} timestamp was not written", case.conf_name);
+            for other in import_cases().iter().filter(|other| other.conf_name != case.conf_name) {
+                assert!(
+                    (other.payload)(metadata).is_empty(),
+                    "{} payload leaked into the {} field",
+                    case.conf_name,
+                    other.conf_name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_rejected_payload_leaves_the_field_untouched() {
+        for case in import_cases() {
+            let mut metadatas = imported_bucket();
+            let before = metadatas[BUCKET].clone();
+            let error = match apply_imported_bucket_config(
+                &mut metadatas,
+                BUCKET,
+                case.conf_name,
+                case.invalid.to_vec(),
+                imported_at(),
+            ) {
+                Ok(_) => panic!("{} must reject an unparsable payload", case.conf_name),
+                Err(e) => e,
+            };
+            assert!(!error.is_empty(), "{} must report why the payload was rejected", case.conf_name);
+
+            let metadata = &metadatas[BUCKET];
+            assert_eq!((case.payload)(metadata), (case.payload)(&before), "{} field was mutated", case.conf_name);
+            assert_eq!(
+                (case.updated_at)(metadata),
+                (case.updated_at)(&before),
+                "{} timestamp was mutated",
+                case.conf_name
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejected_payload_does_not_stop_the_remaining_configs() {
+        // The handler warns and moves to the next archive entry, so a rejected config must not
+        // keep the entries after it from being imported.
+        let mut metadatas = imported_bucket();
+        for case in import_cases() {
+            assert!(
+                apply_imported_bucket_config(&mut metadatas, BUCKET, case.conf_name, case.invalid.to_vec(), imported_at())
+                    .is_err()
+            );
+        }
+        assert!(imported_configs_to_persist(&metadatas[BUCKET]).is_empty());
+
+        for case in import_cases() {
+            assert!(
+                apply_imported_bucket_config(&mut metadatas, BUCKET, case.conf_name, case.valid.to_vec(), imported_at())
+                    .unwrap_or_else(|e| panic!("{} payload must validate: {e}", case.conf_name))
+            );
+        }
+        assert_eq!(imported_configs_to_persist(&metadatas[BUCKET]).len(), import_cases().len());
+    }
+
+    #[test]
+    fn an_absent_bucket_is_skipped_without_masking_a_parse_error() {
+        // Validation runs before the metadata lookup, so an unparsable payload is still reported
+        // for a bucket that has no in-memory metadata.
+        for case in import_cases() {
+            let mut metadatas = HashMap::new();
+            assert!(
+                !apply_imported_bucket_config(&mut metadatas, BUCKET, case.conf_name, case.valid.to_vec(), imported_at())
+                    .unwrap_or_else(|e| panic!("{} payload must validate: {e}", case.conf_name))
+            );
+            assert!(
+                apply_imported_bucket_config(&mut metadatas, BUCKET, case.conf_name, case.invalid.to_vec(), imported_at())
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn policy_and_quota_keep_their_own_handling() {
+        // Both are imported by their own match arms; this helper must not claim them.
+        for conf_name in [BUCKET_POLICY_CONFIG, BUCKET_QUOTA_CONFIG_FILE] {
+            let mut metadatas = imported_bucket();
+            assert!(
+                !apply_imported_bucket_config(&mut metadatas, BUCKET, conf_name, br#"{"quota":1024}"#.to_vec(), imported_at())
+                    .expect("configs outside the shared shape are not validated here")
+            );
+            assert!(imported_configs_to_persist(&metadatas[BUCKET]).is_empty());
+        }
+    }
+}
+
+#[cfg(test)]
 mod import_persist_tests {
     use super::*;
 
@@ -1075,5 +1185,122 @@ mod import_persist_tests {
             .is_some();
 
         assert!(!has_site_replication_item);
+    }
+
+    #[test]
+    fn quota_import_preflight_rejects_invalid_and_unknown_protocols() {
+        let missing_limit = vec![(
+            format!("bucket/{BUCKET_QUOTA_CONFIG_FILE}"),
+            br#"{"quota":0,"reservation_protocol":1}"#.to_vec(),
+        )];
+        assert!(imported_quota_requires_fleet_proof(&missing_limit).is_err());
+
+        let unknown_protocol = vec![(
+            format!("bucket/{BUCKET_QUOTA_CONFIG_FILE}"),
+            br#"{"quota":0,"reservation_protocol":2,"reservation_quota":1024}"#.to_vec(),
+        )];
+        assert!(imported_quota_requires_fleet_proof(&unknown_protocol).is_err());
+    }
+
+    #[test]
+    fn quota_import_preflight_requires_proof_only_for_durable_quota() {
+        let legacy = vec![(format!("bucket/{BUCKET_QUOTA_CONFIG_FILE}"), br#"{"quota":1024}"#.to_vec())];
+        assert!(!imported_quota_requires_fleet_proof(&legacy).expect("legacy quota should remain compatible"));
+
+        let durable = vec![(
+            format!("bucket/{BUCKET_QUOTA_CONFIG_FILE}"),
+            serde_json::to_vec(&BucketQuota::new(Some(1024))).expect("durable quota should encode"),
+        )];
+        assert!(imported_quota_requires_fleet_proof(&durable).expect("durable quota should pass preflight"));
+    }
+}
+
+#[cfg(test)]
+mod shared_gate_tests {
+    use super::*;
+    use http::Uri;
+    use s3s::S3ErrorCode;
+
+    fn credential_less_request(method: Method, uri: &'static str) -> S3Request<Body> {
+        S3Request {
+            input: Body::empty(),
+            method,
+            uri: Uri::from_static(uri),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    async fn assert_missing_credentials(operation: &dyn Operation, method: Method, uri: &'static str) {
+        let err = operation
+            .call(credential_less_request(method, uri), Params::new())
+            .await
+            .expect_err("a bucket metadata admin request without credentials must fail");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("authentication required"));
+    }
+
+    /// The shared gate reports "get cred failed"; the per-handler pre-check keeps
+    /// the message each endpoint has always returned (rustfs/backlog#1829).
+    #[tokio::test]
+    async fn bucket_metadata_handlers_keep_their_missing_credentials_response() {
+        assert_missing_credentials(&ExportBucketMetadata {}, Method::GET, "/rustfs/admin/v3/export-bucket-metadata").await;
+        assert_missing_credentials(&ImportBucketMetadata {}, Method::PUT, "/rustfs/admin/v3/import-bucket-metadata").await;
+    }
+
+    fn source_block<'a>(production: &'a str, marker: &str) -> &'a str {
+        let block = production
+            .split_once(marker)
+            .unwrap_or_else(|| panic!("{marker} should exist"))
+            .1;
+        let end = ["\npub struct ", "\nfn ", "\n#[derive(", "\n#[cfg(test)]"]
+            .into_iter()
+            .filter_map(|boundary| block.find(boundary))
+            .min()
+            .unwrap_or(block.len());
+        &block[..end]
+    }
+
+    fn assert_shared_gate_wiring(block: &str, item: &str, actions: &[&str], binds_credentials: bool) {
+        assert_eq!(
+            block.matches("authorize_admin_request(").count(),
+            1,
+            "{item} must use exactly one shared gate"
+        );
+        assert_eq!(
+            block.matches("Action::AdminAction(").count(),
+            actions.len(),
+            "{item} must preserve its exact action-vector length"
+        );
+        for action in actions {
+            assert!(block.contains(&format!("AdminAction::{action}")), "{item} must authorize with {action}");
+        }
+        assert_eq!(
+            block.contains("let cred = authorize_admin_request("),
+            binds_credentials,
+            "{item} credential binding must match its payload-processing contract"
+        );
+    }
+
+    #[test]
+    fn bucket_metadata_handlers_use_the_shared_admin_gate_with_their_actions() {
+        let production = include_str!("bucket_meta.rs")
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("production source must precede tests");
+
+        for (handler, action) in [
+            ("ExportBucketMetadata", "ExportBucketMetadataAction"),
+            ("ImportBucketMetadata", "ImportBucketMetadataAction"),
+        ] {
+            let block = source_block(production, &format!("impl Operation for {handler}"));
+            assert_shared_gate_wiring(block, handler, &[action], false);
+        }
+
+        assert!(!production.contains("check_key_valid(get_session_token"));
     }
 }

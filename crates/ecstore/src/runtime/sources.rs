@@ -38,7 +38,6 @@ use crate::{
         set_object_layer, update_erasure_type,
     },
     services::batch_processor::{GlobalBatchProcessors, get_global_processors},
-    services::event_notification::EventNotifier,
     services::notification_sys::{NotificationSys, get_global_notification_sys},
     services::tier::tier::TierConfigMgr,
     store::ECStore,
@@ -120,8 +119,8 @@ pub(crate) fn endpoint_erasure_set_count() -> Option<usize> {
     endpoint_pools().map(|endpoints| endpoints.es_count())
 }
 
-pub(crate) fn endpoint_pool_is_local(pool_index: usize) -> bool {
-    get_global_endpoints()
+pub(crate) fn endpoint_pool_is_local(endpoints: &EndpointServerPools, pool_index: usize) -> bool {
+    endpoints
         .as_ref()
         .get(pool_index)
         .is_some_and(|pool| pool.endpoints.as_ref().first().is_some_and(|endpoint| endpoint.is_local))
@@ -143,6 +142,10 @@ pub async fn setup_is_erasure_sd() -> bool {
     is_erasure_sd().await
 }
 
+#[allow(
+    dead_code,
+    reason = "setup-type override used only by tests across this crate (backlog#1823)"
+)]
 pub(crate) async fn current_setup_type() -> SetupType {
     if setup_is_dist_erasure().await {
         SetupType::DistErasure
@@ -155,6 +158,10 @@ pub(crate) async fn current_setup_type() -> SetupType {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "setup-type override used only by tests across this crate (backlog#1823)"
+)]
 pub(crate) async fn set_setup_type(setup_type: SetupType) {
     update_erasure_type(setup_type).await;
 }
@@ -164,6 +171,9 @@ pub(crate) async fn local_node_name() -> String {
 }
 
 pub(crate) async fn set_local_node_name(node_name: String) {
+    // Also stamp the internode-metrics server label: io-metrics is a leaf
+    // crate and no longer resolves node identity itself (backlog#1834).
+    rustfs_io_metrics::internode_metrics::set_internode_server_label(node_name.as_str());
     rustfs_common::set_global_local_node_name(&node_name).await;
 }
 
@@ -229,14 +239,6 @@ pub(crate) fn ensure_test_rpc_secret() {
     let _ = rustfs_credentials::set_global_rpc_secret(TEST_RPC_SECRET.to_owned());
 }
 
-pub(crate) fn storage_class_parity(storage_class: Option<&str>) -> Option<usize> {
-    get_global_storage_class_snapshot().get_parity_for_sc(storage_class.unwrap_or_default())
-}
-
-pub(crate) fn storage_class_should_inline(shard_size: i64, versioned: bool) -> bool {
-    get_global_storage_class_snapshot().should_inline(shard_size, versioned)
-}
-
 pub(crate) fn deployment_upload_id(upload_id: &str) -> String {
     base64_simd::URL_SAFE_NO_PAD
         .encode_to_string(format!("{}.{}", get_global_deployment_id().unwrap_or_default(), upload_id).as_bytes())
@@ -244,6 +246,22 @@ pub(crate) fn deployment_upload_id(upload_id: &str) -> String {
 
 pub fn deployment_id() -> Option<String> {
     get_global_deployment_id()
+}
+
+/// Test-only inverse of [`deployment_upload_id`]: returns the raw
+/// `<uuid>x<timestamp>` suffix without the deployment-id prefix. Under plain
+/// `cargo test` (thread-parallel, shared process globals) a concurrently
+/// running test that re-initializes a store can swap the global deployment id
+/// between create time and list time, so assertions must compare only this
+/// suffix, never the full encoded upload id.
+#[cfg(test)]
+pub(crate) fn upload_uuid_suffix(upload_id: &str) -> String {
+    base64_simd::URL_SAFE_NO_PAD
+        .decode_to_vec(upload_id.as_bytes())
+        .ok()
+        .and_then(|decoded| String::from_utf8(decoded).ok())
+        .and_then(|decoded| decoded.split_once('.').map(|(_, suffix)| suffix.to_owned()))
+        .unwrap_or_else(|| upload_id.to_owned())
 }
 
 pub(crate) fn replication_pool() -> Option<Arc<DynReplicationPool>> {
@@ -313,21 +331,6 @@ pub(crate) fn storage_class_config_snapshot() -> Arc<storageclass::Config> {
     get_global_storage_class_snapshot()
 }
 
-/// Scalar STANDARD / RRS parity for backend-info reporting.
-///
-/// Retained for the rebalance/backend-info path. `get_parity_for_sc` returns
-/// `None` when the runtime config is uninitialized or (post per-pool support)
-/// when pools disagree, so STANDARD falls back to the caller's default and RRS
-/// stays `None` — matching the pre-per-pool scalar reporting.
-pub(crate) fn backend_storage_class_parities(default_standard_parity: usize) -> (Option<usize>, Option<usize>) {
-    let sc = get_global_storage_class_snapshot();
-    let standard = sc
-        .get_parity_for_sc(storageclass::CLASS_STANDARD)
-        .or(Some(default_standard_parity));
-    let reduced_redundancy = sc.get_parity_for_sc(storageclass::RRS);
-    (standard, reduced_redundancy)
-}
-
 pub(crate) fn set_storage_class_config(config: storageclass::Config) {
     set_global_storage_class(config);
 }
@@ -393,10 +396,6 @@ pub fn expiry_state_handle() -> Arc<RwLock<ExpiryState>> {
 
 pub fn transition_state_handle() -> Arc<TransitionState> {
     crate::runtime::global::current_ctx().transition_state()
-}
-
-pub(crate) fn event_notifier_handle() -> Arc<RwLock<EventNotifier>> {
-    crate::runtime::global::current_ctx().event_notifier()
 }
 
 pub(crate) async fn local_disk_by_path(path: &str) -> Option<DiskStore> {
@@ -492,30 +491,6 @@ pub(crate) async fn local_disk_set_drive(
     instance_ctx.local_disk_set_drives().read().await[pool_idx][set_idx][disk_idx].clone()
 }
 
-pub(crate) async fn local_disk_for_endpoint(endpoint: &Endpoint) -> Option<DiskStore> {
-    let set_drives = local_disk_set_drives_handle();
-    let global_set_drives = set_drives.read().await;
-    if global_set_drives.is_empty() {
-        return local_disk_map_handle()
-            .read()
-            .await
-            .get(&endpoint.to_string())
-            .cloned()
-            .unwrap_or(None);
-    }
-
-    let pool_idx = usize::try_from(endpoint.pool_idx).ok()?;
-    let set_idx = usize::try_from(endpoint.set_idx).ok()?;
-    let disk_idx = usize::try_from(endpoint.disk_idx).ok()?;
-
-    global_set_drives
-        .get(pool_idx)
-        .and_then(|sets| sets.get(set_idx))
-        .and_then(|disks| disks.get(disk_idx))
-        .cloned()
-        .unwrap_or(None)
-}
-
 pub(crate) async fn local_disk_paths() -> Vec<String> {
     local_disk_map_handle().read().await.keys().cloned().collect()
 }
@@ -549,8 +524,13 @@ pub(crate) async fn initialize_local_disk_maps(
     endpoint_pools: EndpointServerPools,
     opt: &DiskOption,
 ) -> Result<()> {
+    // Every caller passes the FULL topology, so (re)initialization must replace
+    // any previous registration wholesale: appending would leave the pool/set
+    // vectors sized for a stale topology and panic on wider disk indices (seen
+    // as cross-test contamination under single-process `cargo test`).
     let set_drives = instance_ctx.local_disk_set_drives();
     let mut global_set_drives = set_drives.write().await;
+    global_set_drives.clear();
     for pool_eps in endpoint_pools.as_ref().iter() {
         let mut set_count_drives = Vec::with_capacity(pool_eps.set_count);
         for _ in 0..pool_eps.set_count {
@@ -562,6 +542,7 @@ pub(crate) async fn initialize_local_disk_maps(
 
     let map = instance_ctx.local_disk_map();
     let mut global_local_disk_map = map.write().await;
+    global_local_disk_map.clear();
 
     for pool_eps in endpoint_pools.as_ref().iter() {
         for ep in pool_eps.endpoints.as_ref().iter() {
@@ -592,9 +573,7 @@ pub(crate) async fn initialize_local_disk_maps(
 pub(crate) async fn init_tier_config_mgr(store: Arc<ECStore>) -> Result<()> {
     let handle = get_global_tier_config_mgr();
     TierConfigMgr::reload_handle(&handle, store.clone()).await?;
-    if setup_is_dist_erasure().await {
-        tokio::spawn(TierConfigMgr::refresh_tier_config_handle(handle, store));
-    }
+    tokio::spawn(TierConfigMgr::refresh_tier_config_handle(handle, store));
     Ok(())
 }
 
@@ -726,5 +705,70 @@ mod tests {
         );
         process_ctx.local_disk_id_map().write().await.remove(&process_sentinel);
         bootstrap_ctx.local_disk_id_map().write().await.remove(&bootstrap_sentinel);
+    }
+
+    /// Re-initializing the same context with a WIDER topology must replace the
+    /// previous registration, not append to it: the stale pool-0 drive vector
+    /// (sized for the narrow topology) made `global_set_drives[0][0][disk_idx]`
+    /// panic for the wider set's higher disk indices. CI's nextest
+    /// process-per-test isolation never exercises re-init, so this pins it.
+    #[tokio::test]
+    async fn reinitializing_local_disk_maps_replaces_previous_topology() {
+        use crate::disk::DiskOption;
+        use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
+
+        let temp_dir = tempfile::tempdir().expect("reinit test directory should be created");
+        let build_pools = |label: &str, disk_count: usize| {
+            let mut endpoints = Vec::new();
+            for disk_idx in 0..disk_count {
+                let disk_path = temp_dir.path().join(format!("{label}-disk{disk_idx}"));
+                std::fs::create_dir_all(&disk_path).expect("reinit test disk should be created");
+                let mut endpoint =
+                    Endpoint::try_from(disk_path.to_str().expect("disk path should be utf8")).expect("endpoint should parse");
+                endpoint.set_pool_index(0);
+                endpoint.set_set_index(0);
+                endpoint.set_disk_index(disk_idx);
+                endpoints.push(endpoint);
+            }
+            EndpointServerPools(vec![PoolEndpoints {
+                legacy: false,
+                set_count: 1,
+                drives_per_set: disk_count,
+                endpoints: Endpoints::from(endpoints),
+                cmd_line: format!("reinit-test-{label}"),
+                platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
+            }])
+        };
+        let opt = DiskOption {
+            cleanup: false,
+            health_check: false,
+        };
+
+        let instance_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        super::initialize_local_disk_maps(&instance_ctx, build_pools("narrow", 2), &opt)
+            .await
+            .expect("narrow topology should initialize");
+        super::initialize_local_disk_maps(&instance_ctx, build_pools("wide", 4), &opt)
+            .await
+            .expect("re-initializing with a wider topology must not panic or fail");
+
+        let set_drives = instance_ctx.local_disk_set_drives();
+        let set_drives = set_drives.read().await;
+        assert_eq!(set_drives.len(), 1, "stale pools must not accumulate across re-inits");
+        assert_eq!(set_drives[0][0].len(), 4, "pool 0 set 0 must be sized for the new topology");
+        assert!(
+            set_drives[0][0].iter().all(Option::is_some),
+            "every wide-topology drive slot must be registered"
+        );
+        drop(set_drives);
+
+        let disk_map = instance_ctx.local_disk_map();
+        let disk_map = disk_map.read().await;
+        assert_eq!(disk_map.len(), 4, "stale narrow-topology disk entries must be dropped");
+        assert!(
+            disk_map.keys().all(|path| path.contains("wide-disk")),
+            "only the new topology's disks may remain registered: {:?}",
+            disk_map.keys().collect::<Vec<_>>()
+        );
     }
 }

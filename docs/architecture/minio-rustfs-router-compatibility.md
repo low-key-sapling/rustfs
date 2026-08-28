@@ -105,7 +105,7 @@ these as 部分兼容 at the client level.
 | CompleteMultipartUpload | 已实现 | `rustfs/src/storage/ecfs.rs` (`complete_multipart_upload`) |
 | AbortMultipartUpload | 已实现 | `rustfs/src/storage/ecfs.rs` (`abort_multipart_upload`) |
 | ListParts | 已实现 | `rustfs/src/storage/ecfs.rs` (`list_parts`) |
-| PostObject (POST form upload) | 已实现 | Routed via the POST-object marker into the put-object path (`rustfs/src/app/object_usecase.rs`). See the "POST Object form upload checksum handling: planned" note in `s3-compatibility-matrix.md`. |
+| PostObject (POST form upload) | 已实现 | Routed via the POST-object marker into the put-object path (`rustfs/src/app/object/put.rs`). See the "POST Object form upload checksum handling: planned" note in `s3-compatibility-matrix.md`. |
 | GetObjectTorrent | 行为不一致 | `rustfs/src/storage/ecfs.rs` (`get_object_torrent`) — returns `404 NoSuchKey` by design (not `501 NotImplemented`) so clients degrade gracefully. |
 
 For the gate-level view of which of these are covered by executable s3tests,
@@ -157,7 +157,7 @@ maps MinIO admin route families to RustFS status.
 | TLS debug (`/debug/tls/status`) | 已实现 | `rustfs/src/admin/handlers/tls_debug.rs`, `profile.rs` |
 | KMS management / dynamic / keys | 已实现 | `rustfs/src/admin/handlers/kms_management.rs`, `kms_dynamic.rs`, `kms_keys.rs` |
 | OIDC public + config | 已实现 | `rustfs/src/admin/handlers/oidc.rs` |
-| Table catalog (Iceberg) | 已实现 | `rustfs/src/admin/handlers/table_catalog.rs` |
+| Table catalog (Iceberg) | 已实现 | `rustfs/src/admin/handlers/table_catalog/mod.rs` |
 
 ### Registered-but-incomplete
 

@@ -18,6 +18,7 @@ use crate::cluster::rpc::client::{
     node_service_time_out_client,
 };
 use crate::cluster::rpc::set_tonic_mutation_body_digest;
+use crate::core::pools::{PoolMeta, PoolMetaWriteState};
 use crate::disk::error::DiskError;
 use crate::disk::error::{Error, Result};
 use crate::disk::error_reduce::{BUCKET_OP_IGNORED_ERRS, is_all_buckets_not_found, reduce_write_quorum_errs};
@@ -35,7 +36,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use futures::future::join_all;
-use rustfs_common::heal_channel::{DriveState, HealItemType, HealOpts, RUSTFS_RESERVED_BUCKET};
+use rustfs_heal_contracts::heal_channel::{DriveState, HealItemType, HealOpts, RUSTFS_RESERVED_BUCKET};
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_protos::proto_gen::node_service::node_service_client::NodeServiceClient;
 use rustfs_protos::proto_gen::node_service::{
@@ -46,7 +47,12 @@ use std::sync::{
     Mutex as StdMutex,
     atomic::{AtomicBool, Ordering},
 };
-use std::{collections::HashMap, fmt::Debug, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeSet, HashMap},
+    fmt::Debug,
+    sync::Arc,
+    time::Duration,
+};
 #[cfg(test)]
 use tokio::sync::Notify;
 use tokio::{net::TcpStream, sync::RwLock, time};
@@ -100,11 +106,86 @@ impl DeleteBucketEmptyScanBarrier {
 static DELETE_BUCKET_EMPTY_SCAN_BARRIER: StdMutex<Option<Arc<DeleteBucketEmptyScanBarrier>>> = StdMutex::new(None);
 
 #[cfg(test)]
+static HEAL_BUCKET_PRE_MUTATION_BARRIER: StdMutex<Option<Arc<DeleteBucketEmptyScanBarrier>>> = StdMutex::new(None);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum HealBucketOperation {
+    Make,
+    Delete,
+}
+
+#[cfg(test)]
+struct HealBucketOperationFailure {
+    bucket: String,
+    disk_index: usize,
+    operation: HealBucketOperation,
+}
+
+#[cfg(test)]
+type HealBucketOperationFailureKey = (String, usize, HealBucketOperation);
+
+#[cfg(test)]
+fn heal_bucket_operation_failures() -> &'static StdMutex<HashMap<HealBucketOperationFailureKey, Error>> {
+    static FAILURES: std::sync::OnceLock<StdMutex<HashMap<HealBucketOperationFailureKey, Error>>> = std::sync::OnceLock::new();
+    FAILURES.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+impl HealBucketOperationFailure {
+    fn install(bucket: &str, disk_index: usize, operation: HealBucketOperation, error: Error) -> Self {
+        let key = (bucket.to_string(), disk_index, operation);
+        let previous = heal_bucket_operation_failures()
+            .lock()
+            .expect("heal bucket failure registry should not poison")
+            .insert(key, error);
+        assert!(previous.is_none(), "heal bucket operation failure already installed");
+        Self {
+            bucket: bucket.to_string(),
+            disk_index,
+            operation,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for HealBucketOperationFailure {
+    fn drop(&mut self) {
+        heal_bucket_operation_failures()
+            .lock()
+            .expect("heal bucket failure registry should not poison")
+            .remove(&(self.bucket.clone(), self.disk_index, self.operation));
+    }
+}
+
+#[cfg(test)]
+fn injected_heal_bucket_operation_error(bucket: &str, disk_index: usize, operation: HealBucketOperation) -> Option<Error> {
+    heal_bucket_operation_failures()
+        .lock()
+        .expect("heal bucket failure registry should not poison")
+        .get(&(bucket.to_string(), disk_index, operation))
+        .cloned()
+}
+
+#[cfg(not(test))]
+fn injected_heal_bucket_operation_error(_bucket: &str, _disk_index: usize, _operation: HealBucketOperation) -> Option<Error> {
+    None
+}
+
+#[cfg(test)]
 pub(crate) fn install_delete_bucket_empty_scan_barrier() -> Arc<DeleteBucketEmptyScanBarrier> {
     let barrier = Arc::new(DeleteBucketEmptyScanBarrier::default());
     *DELETE_BUCKET_EMPTY_SCAN_BARRIER
         .lock()
         .expect("empty scan barrier lock should not be poisoned") = Some(barrier.clone());
+    barrier
+}
+
+#[cfg(test)]
+fn install_heal_bucket_pre_mutation_barrier() -> Arc<DeleteBucketEmptyScanBarrier> {
+    let barrier = Arc::new(DeleteBucketEmptyScanBarrier::default());
+    *HEAL_BUCKET_PRE_MUTATION_BARRIER
+        .lock()
+        .expect("heal bucket mutation barrier lock should not be poisoned") = Some(barrier.clone());
     barrier
 }
 
@@ -118,6 +199,20 @@ async fn pause_after_delete_bucket_empty_scan() {
         barrier.pause().await;
     }
 }
+
+#[cfg(test)]
+async fn pause_before_heal_bucket_volume_mutation() {
+    let barrier = HEAL_BUCKET_PRE_MUTATION_BARRIER
+        .lock()
+        .expect("heal bucket mutation barrier lock should not be poisoned")
+        .take();
+    if let Some(barrier) = barrier {
+        barrier.pause().await;
+    }
+}
+
+#[cfg(not(test))]
+async fn pause_before_heal_bucket_volume_mutation() {}
 
 #[derive(Clone, Debug)]
 pub struct ScannerBucketListing {
@@ -151,6 +246,21 @@ fn pool_write_quorum(participant_count: usize) -> usize {
     (participant_count / 2) + 1
 }
 
+/// Error for a peer that reported `success = false` without an error payload.
+///
+/// The message must stay identical across the peers of one operation: `reduce_errs`
+/// buckets `Error::Io` by kind plus rendered message, so any per-peer detail (address,
+/// timing) would split one shared failure into single-count buckets and downgrade a real
+/// dominant error into `ErasureWriteQuorum`.
+///
+/// `peer_rest_client` carries the same helper over `StorageError` for the same response shape.
+fn peer_failure_without_details(op: &str, bucket: Option<&str>) -> Error {
+    match bucket {
+        Some(bucket) => Error::other(format!("{op}({bucket}): peer returned failure without error details")),
+        None => Error::other(format!("{op}: peer returned failure without error details")),
+    }
+}
+
 fn reduce_pool_write_quorum_errs(per_pool_errs: &[Option<Error>]) -> Option<Error> {
     if per_pool_errs.is_empty() {
         return Some(Error::ErasureWriteQuorum);
@@ -175,9 +285,53 @@ fn resolve_heal_bucket_mode(opts: &mut HealOpts, pool_errs: &[Option<Error>]) ->
     Ok(())
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HealBucketRpcEnvelope {
+    options: HealOpts,
+    #[serde(rename = "fencedPools", default)]
+    fenced_pools: Vec<usize>,
+}
+
+pub fn encode_heal_bucket_rpc_options(opts: HealOpts, fenced_pools: &[usize]) -> Result<String> {
+    if fenced_pools.is_empty() {
+        return serde_json::to_string(&opts).map_err(Into::into);
+    }
+
+    serde_json::to_string(&HealBucketRpcEnvelope {
+        options: opts,
+        fenced_pools: fenced_pools.to_vec(),
+    })
+    .map_err(Into::into)
+}
+
+pub fn decode_heal_bucket_rpc_options(payload: &str) -> Result<(HealOpts, Vec<usize>)> {
+    match serde_json::from_str::<HealBucketRpcEnvelope>(payload) {
+        Ok(envelope) => Ok((envelope.options, envelope.fenced_pools)),
+        Err(envelope_err) => serde_json::from_str::<HealOpts>(payload)
+            .map(|options| (options, Vec::new()))
+            .map_err(|legacy_err| {
+                Error::other(format!(
+                    "decode heal bucket RPC options failed: envelope={envelope_err}; legacy={legacy_err}"
+                ))
+            }),
+    }
+}
+
 #[async_trait]
 pub trait PeerS3Client: Debug + Sync + Send + 'static {
     async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem>;
+    async fn heal_bucket_with_fence(&self, bucket: &str, opts: &HealOpts, _fenced_pools: &[usize]) -> Result<HealResultItem> {
+        self.heal_bucket(bucket, opts).await
+    }
+    async fn heal_bucket_with_fence_from_movement_guarded_coordinator(
+        &self,
+        bucket: &str,
+        opts: &HealOpts,
+        fenced_pools: &[usize],
+    ) -> Result<HealResultItem> {
+        self.heal_bucket_with_fence(bucket, opts, fenced_pools).await
+    }
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()>;
     async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>>;
     async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()>;
@@ -231,6 +385,29 @@ impl S3PeerSys {
 
 impl S3PeerSys {
     pub async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
+        self.heal_bucket_with_fence(bucket, opts, &[]).await
+    }
+
+    pub async fn heal_bucket_with_fence(&self, bucket: &str, opts: &HealOpts, fenced_pools: &[usize]) -> Result<HealResultItem> {
+        self.heal_bucket_with_fence_inner(bucket, opts, fenced_pools, false).await
+    }
+
+    pub async fn heal_bucket_with_fence_from_movement_guarded_coordinator(
+        &self,
+        bucket: &str,
+        opts: &HealOpts,
+        fenced_pools: &[usize],
+    ) -> Result<HealResultItem> {
+        self.heal_bucket_with_fence_inner(bucket, opts, fenced_pools, true).await
+    }
+
+    async fn heal_bucket_with_fence_inner(
+        &self,
+        bucket: &str,
+        opts: &HealOpts,
+        fenced_pools: &[usize],
+        movement_guard_held: bool,
+    ) -> Result<HealResultItem> {
         let mut opts = *opts;
         let mut futures = Vec::with_capacity(self.clients.len());
         for client in self.clients.iter() {
@@ -253,7 +430,14 @@ impl S3PeerSys {
             let opts_clone = opts;
             let heal_bucket_results_clone = heal_bucket_results.clone();
             futures.push(async move {
-                match client.heal_bucket(bucket, &opts_clone).await {
+                let result = if movement_guard_held {
+                    client
+                        .heal_bucket_with_fence_from_movement_guarded_coordinator(bucket, &opts_clone, fenced_pools)
+                        .await
+                } else {
+                    client.heal_bucket_with_fence(bucket, &opts_clone, fenced_pools).await
+                };
+                match result {
                     Ok(res) => {
                         heal_bucket_results_clone.write().await[idx] = res;
                         None
@@ -376,7 +560,7 @@ impl S3PeerSys {
                 }
             }
             topology_complete &= bucket_map.values().all(|count| *count >= quorum);
-            // TODO: MRF
+            // TODO(backlog): integrate MRF backlog stats into scanner bucket listing
         }
 
         let mut buckets: Vec<BucketInfo> = result_map.into_values().collect();
@@ -548,6 +732,66 @@ impl LocalPeerS3Client {
             .filter(|disk| usize::try_from(disk.endpoint().pool_idx).is_ok_and(|pool_idx| pools.contains(&pool_idx)))
             .collect()
     }
+
+    async fn heal_bucket_with_fence_inner(
+        &self,
+        bucket: &str,
+        opts: &HealOpts,
+        fenced_pools: &[usize],
+        movement_guard_held: bool,
+    ) -> Result<HealResultItem> {
+        let disks = self.local_disks_for_pools().await.into_iter().map(Some).collect();
+        let store = runtime_sources::object_store_handle().filter(|store| Arc::ptr_eq(&store.ctx, &self.instance_ctx));
+        #[cfg(not(test))]
+        if store.is_none() {
+            return Err(Error::other("bucket heal refused: pool metadata is unavailable for this instance"));
+        }
+        let movement_gate = store.as_ref().map(|store| store.ctx.data_movement_operation_gate());
+        let movement_guard = try_acquire_bucket_heal_movement_guard(movement_gate.as_ref(), movement_guard_held)?;
+        let save_guard = acquire_bucket_heal_write_guard(store.as_ref().map(|store| &store.pool_meta_save_gate)).await?;
+        let result = heal_bucket_local_on_disks_with_pool_meta(
+            bucket,
+            opts,
+            disks,
+            store.as_ref().map(|store| &store.pool_meta),
+            fenced_pools,
+        )
+        .await;
+        drop(save_guard);
+        drop(movement_guard);
+        result
+    }
+}
+
+fn try_acquire_bucket_heal_movement_guard<'a>(
+    gate: Option<&'a Arc<tokio::sync::RwLock<()>>>,
+    movement_guard_held: bool,
+) -> Result<Option<tokio::sync::RwLockReadGuard<'a, ()>>> {
+    if movement_guard_held {
+        return Ok(None);
+    }
+    let Some(gate) = gate else {
+        return Ok(None);
+    };
+    // Do not queue a receiver behind a movement writer while its coordinator
+    // holds another node's read guard; failing fast breaks that cross-node cycle.
+    // `StorageError::SlowDown` has no disk-layer identity of its own: it
+    // collapses to `TooManyOpenFiles` at this boundary (see `narrow_to_disk`).
+    // Constructed directly so the loss stays explicit at the site.
+    gate.try_read().map(Some).map_err(|_| Error::TooManyOpenFiles)
+}
+
+async fn acquire_bucket_heal_write_guard<'a>(
+    gate: Option<&'a tokio::sync::Mutex<PoolMetaWriteState>>,
+) -> Result<Option<tokio::sync::MutexGuard<'a, PoolMetaWriteState>>> {
+    let Some(gate) = gate else {
+        return Ok(None);
+    };
+    let guard = gate.lock().await;
+    guard
+        .ensure_write_safe("bucket heal cannot run while pool metadata requires recovery")
+        .map_err(|e| e.narrow_to_disk().unwrap_or_else(Error::other))?;
+    Ok(Some(guard))
 }
 
 #[async_trait]
@@ -557,8 +801,20 @@ impl PeerS3Client for LocalPeerS3Client {
     }
 
     async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
-        let disks = self.local_disks_for_pools().await.into_iter().map(Some).collect();
-        heal_bucket_local_on_disks(bucket, opts, disks).await
+        self.heal_bucket_with_fence(bucket, opts, &[]).await
+    }
+
+    async fn heal_bucket_with_fence(&self, bucket: &str, opts: &HealOpts, fenced_pools: &[usize]) -> Result<HealResultItem> {
+        self.heal_bucket_with_fence_inner(bucket, opts, fenced_pools, false).await
+    }
+
+    async fn heal_bucket_with_fence_from_movement_guarded_coordinator(
+        &self,
+        bucket: &str,
+        opts: &HealOpts,
+        fenced_pools: &[usize],
+    ) -> Result<HealResultItem> {
+        self.heal_bucket_with_fence_inner(bucket, opts, fenced_pools, true).await
     }
 
     async fn list_bucket(&self, _opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
@@ -721,7 +977,11 @@ impl PeerS3Client for LocalPeerS3Client {
 
         if opts.force_if_empty && !opts.force {
             for disk in local_disks.iter() {
-                if has_xlmeta_files(&disk.path().join(bucket)).await.map_err(Error::Io)? {
+                let Some(bucket_path) = disk.get_bucket_path_for_io_if_local(bucket) else {
+                    continue;
+                };
+                let bucket_path = bucket_path?;
+                if has_xlmeta_files(&bucket_path).await.map_err(Error::Io)? {
                     return Err(Error::VolumeNotEmpty);
                 }
             }
@@ -787,7 +1047,6 @@ impl PeerS3Client for LocalPeerS3Client {
 
 #[derive(Debug)]
 pub struct RemotePeerS3Client {
-    pub node: Option<Node>,
     pub pools: Option<Vec<usize>>,
     addr: String,
     /// Health tracker for connection monitoring
@@ -819,7 +1078,6 @@ impl RemotePeerS3Client {
     pub fn new(node: Option<Node>, pools: Option<Vec<usize>>) -> Self {
         let addr = node.as_ref().map(|v| v.url.to_string()).unwrap_or_default();
         let client = Self {
-            node,
             pools,
             addr,
             health: Arc::new(DiskHealthTracker::new()),
@@ -835,11 +1093,7 @@ impl RemotePeerS3Client {
     pub async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>> {
         node_service_time_out_client(&self.addr, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
             .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))
-    }
-
-    pub fn get_addr(&self) -> String {
-        self.addr.clone()
+            .map_err(|err| Error::RemoteClientUnavailable(err.to_string()))
     }
 
     /// Start health monitoring for the remote peer
@@ -1003,9 +1257,13 @@ impl PeerS3Client for RemotePeerS3Client {
     }
 
     async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
+        self.heal_bucket_with_fence(bucket, opts, &[]).await
+    }
+
+    async fn heal_bucket_with_fence(&self, bucket: &str, opts: &HealOpts, fenced_pools: &[usize]) -> Result<HealResultItem> {
         self.execute_with_timeout(
             || async {
-                let options: String = serde_json::to_string(opts)?;
+                let options = encode_heal_bucket_rpc_options(*opts, fenced_pools)?;
                 let mut client = self.get_client().await?;
                 let mut request = Request::new(HealBucketRequest {
                     bucket: bucket.to_string(),
@@ -1017,7 +1275,7 @@ impl PeerS3Client for RemotePeerS3Client {
                     return if let Some(err) = response.error {
                         Err(err.into())
                     } else {
-                        Err(Error::other(""))
+                        Err(peer_failure_without_details("heal_bucket", Some(bucket)))
                     };
                 }
 
@@ -1044,7 +1302,7 @@ impl PeerS3Client for RemotePeerS3Client {
                     return if let Some(err) = response.error {
                         Err(err.into())
                     } else {
-                        Err(Error::other(""))
+                        Err(peer_failure_without_details("list_bucket", None))
                     };
                 }
                 let bucket_infos = response
@@ -1075,9 +1333,7 @@ impl PeerS3Client for RemotePeerS3Client {
                     return if let Some(err) = response.error {
                         Err(err.into())
                     } else {
-                        Err(Error::other(format!(
-                            "make_bucket({bucket}): peer returned failure without error details"
-                        )))
+                        Err(peer_failure_without_details("make_bucket", Some(bucket)))
                     };
                 }
 
@@ -1101,7 +1357,7 @@ impl PeerS3Client for RemotePeerS3Client {
                     return if let Some(err) = response.error {
                         Err(err.into())
                     } else {
-                        Err(Error::other(""))
+                        Err(peer_failure_without_details("get_bucket_info", Some(bucket)))
                     };
                 }
                 let bucket_info = serde_json::from_str::<BucketInfo>(&response.bucket_info)?;
@@ -1129,7 +1385,7 @@ impl PeerS3Client for RemotePeerS3Client {
                     return if let Some(err) = response.error {
                         Err(err.into())
                     } else {
-                        Err(Error::other(""))
+                        Err(peer_failure_without_details("delete_bucket", Some(bucket)))
                     };
                 }
 
@@ -1141,6 +1397,10 @@ impl PeerS3Client for RemotePeerS3Client {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "local bucket-heal path reached only by this file's tests (backlog#1823)"
+)]
 pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
     let disks = clone_drives().await;
     heal_bucket_local_on_disks(bucket, opts, disks).await
@@ -1151,6 +1411,117 @@ pub(crate) async fn heal_bucket_local_on_disks(
     opts: &HealOpts,
     disks: Vec<Option<DiskStore>>,
 ) -> Result<HealResultItem> {
+    if let Some(store) = runtime_sources::object_store_handle() {
+        return heal_bucket_local_on_disks_with_pool_meta(bucket, opts, disks, Some(&store.pool_meta), &[]).await;
+    }
+
+    #[cfg(test)]
+    return heal_bucket_local_on_disks_with_pool_meta(bucket, opts, disks, None, &[]).await;
+
+    #[cfg(not(test))]
+    Err(Error::other("bucket heal refused: pool metadata is unavailable"))
+}
+
+fn disk_pool_index(disk: &DiskStore) -> Result<usize> {
+    usize::try_from(disk.endpoint().pool_idx)
+        .map_err(|_| Error::other(format!("invalid bucket-heal pool index {}", disk.endpoint().pool_idx)))
+}
+
+fn fenced_decommission_drive_state() -> DriveState {
+    DriveState::Unknown("skipped-decommission-suspended".to_string())
+}
+
+fn heal_bucket_fence_detail(fenced_pools: &BTreeSet<usize>) -> Option<String> {
+    if fenced_pools.is_empty() {
+        return None;
+    }
+    let pools = fenced_pools.iter().map(usize::to_string).collect::<Vec<_>>().join(", ");
+    Some(format!("skipped: bucket-volume heal fenced on decommission-suspended pool(s): {pools}"))
+}
+
+async fn snapshot_heal_bucket_fence(
+    disks: &[Option<DiskStore>],
+    pool_meta: Option<&RwLock<PoolMeta>>,
+    dispatch_fenced_pools: &[usize],
+) -> Result<(Vec<bool>, BTreeSet<usize>)> {
+    let mut fenced_disks = vec![false; disks.len()];
+    let mut fenced_pools = dispatch_fenced_pools.iter().copied().collect::<BTreeSet<_>>();
+    let pool_meta = match pool_meta {
+        Some(pool_meta) => Some(pool_meta.read().await),
+        None => None,
+    };
+    if let Some(pool_meta) = pool_meta.as_ref()
+        && let Some(pool_idx) = fenced_pools.iter().find(|pool_idx| **pool_idx >= pool_meta.pools.len())
+    {
+        return Err(Error::other(format!(
+            "bucket-heal dispatch fence pool index {pool_idx} is absent from {} pool metadata entries",
+            pool_meta.pools.len()
+        )));
+    }
+
+    for (disk_index, disk) in disks.iter().enumerate() {
+        let Some(disk) = disk else {
+            continue;
+        };
+        let pool_idx = disk_pool_index(disk)?;
+        if let Some(pool_meta) = pool_meta.as_ref() {
+            if pool_idx >= pool_meta.pools.len() {
+                return Err(Error::other(format!(
+                    "bucket-heal pool index {pool_idx} is absent from {} pool metadata entries",
+                    pool_meta.pools.len()
+                )));
+            }
+            if pool_meta.is_suspended(pool_idx) {
+                fenced_pools.insert(pool_idx);
+            }
+        }
+        if fenced_pools.contains(&pool_idx) {
+            fenced_disks[disk_index] = true;
+        }
+    }
+    Ok((fenced_disks, fenced_pools))
+}
+
+async fn run_heal_bucket_volume_mutation<F, Fut>(
+    disk: &DiskStore,
+    pool_meta: Option<&RwLock<PoolMeta>>,
+    operation: F,
+) -> Result<Option<usize>>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let Some(pool_meta) = pool_meta else {
+        operation().await?;
+        return Ok(None);
+    };
+    let pool_idx = disk_pool_index(disk)?;
+    let pool_meta = pool_meta.read().await;
+    if pool_idx >= pool_meta.pools.len() {
+        return Err(Error::other(format!(
+            "bucket-heal pool index {pool_idx} is absent from {} pool metadata entries",
+            pool_meta.pools.len()
+        )));
+    }
+    if pool_meta.is_suspended(pool_idx) {
+        return Ok(Some(pool_idx));
+    }
+
+    // Keep the metadata read guard through the disk mutation so a decommission
+    // transition cannot pass between this state check and the destructive action.
+    operation().await?;
+    Ok(None)
+}
+
+async fn heal_bucket_local_on_disks_with_pool_meta(
+    bucket: &str,
+    opts: &HealOpts,
+    disks: Vec<Option<DiskStore>>,
+    pool_meta: Option<&RwLock<PoolMeta>>,
+    dispatch_fenced_pools: &[usize],
+) -> Result<HealResultItem> {
+    let (fenced_disks, mut fenced_pool_idxs) = snapshot_heal_bucket_fence(&disks, pool_meta, dispatch_fenced_pools).await?;
+    let fenced_disks = Arc::new(fenced_disks);
     let before_state = Arc::new(RwLock::new(vec![String::new(); disks.len()]));
     let after_state = Arc::new(RwLock::new(vec![String::new(); disks.len()]));
 
@@ -1160,7 +1531,14 @@ pub(crate) async fn heal_bucket_local_on_disks(
         let bucket = bucket.to_string();
         let bs_clone = before_state.clone();
         let as_clone = after_state.clone();
+        let fenced_disks = fenced_disks.clone();
         futures.push(async move {
+            if fenced_disks[index] {
+                let skipped = fenced_decommission_drive_state().to_string();
+                bs_clone.write().await[index] = skipped.clone();
+                as_clone.write().await[index] = skipped;
+                return None;
+            }
             let disk = match disk {
                 Some(disk) => disk,
                 None => {
@@ -1207,10 +1585,6 @@ pub(crate) async fn heal_bucket_local_on_disks(
         ..Default::default()
     };
 
-    if opts.dry_run {
-        return Ok(res);
-    }
-
     for (disk, state) in disks.iter().zip(before_state.read().await.iter()) {
         res.before.drives.push(HealDriveInfo {
             uuid: "".to_string(),
@@ -1219,35 +1593,82 @@ pub(crate) async fn heal_bucket_local_on_disks(
         });
     }
 
+    if opts.dry_run {
+        for (disk, state) in disks.iter().zip(after_state.read().await.iter()) {
+            res.after.drives.push(HealDriveInfo {
+                uuid: "".to_string(),
+                endpoint: disk.clone().map(|s| s.to_string()).unwrap_or_default(),
+                state: state.to_string(),
+            });
+        }
+        if let Some(detail) = heal_bucket_fence_detail(&fenced_pool_idxs) {
+            res.detail = detail;
+        }
+        return Ok(res);
+    }
+
+    pause_before_heal_bucket_volume_mutation().await;
+
+    let mut operation_error = errs
+        .iter()
+        .filter_map(|err| match err {
+            Some(Error::VolumeNotFound) | None => None,
+            Some(err) => Some(err.clone()),
+        })
+        .next();
+
     if opts.remove && !bucket.starts_with(disk::RUSTFS_META_BUCKET) && !is_all_buckets_not_found(&errs) {
         let mut futures = Vec::new();
-        for disk in disks.iter() {
-            let disk = disk.clone();
+        for (index, disk) in disks.iter().enumerate() {
+            if fenced_disks[index] || matches!(errs[index].as_ref(), Some(Error::DiskNotFound | Error::VolumeNotFound)) {
+                continue;
+            }
+            let Some(disk) = disk.clone() else {
+                continue;
+            };
             let bucket = bucket.to_string();
-            info!("heal_bucket_local, errs: {:?}, opts: {:?}", errs, opts);
+            let mutation_disk = disk.clone();
             futures.push(async move {
-                match disk {
-                    Some(disk) => {
-                        // Non-force: a bucket that still holds object data refuses
-                        // deletion (VolumeNotEmpty) instead of being recursively
-                        // wiped, so a misclassified "dangling" bucket cannot lose
-                        // data (backlog#799 B1). Surface that refusal instead of
-                        // discarding it — it signals the bucket is not dangling.
-                        match disk.delete_volume(&bucket, false).await {
-                            Ok(()) => None,
-                            Err(Error::VolumeNotEmpty) => {
-                                warn!("heal declined to remove non-empty bucket {bucket} (not dangling)");
-                                None
-                            }
-                            Err(e) => Some(e),
-                        }
+                let result = run_heal_bucket_volume_mutation(&disk, pool_meta, || async move {
+                    if let Some(err) = injected_heal_bucket_operation_error(&bucket, index, HealBucketOperation::Delete) {
+                        return Err(err);
                     }
-                    None => Some(Error::DiskNotFound),
-                }
+                    mutation_disk.delete_volume(&bucket, false).await
+                })
+                .await;
+                (index, result)
             });
         }
 
-        let _ = join_all(futures).await;
+        for (index, result) in join_all(futures).await {
+            match result {
+                Ok(None) | Err(Error::VolumeNotFound) => {
+                    after_state.write().await[index] = DriveState::Missing.to_string();
+                }
+                Ok(Some(pool_idx)) => {
+                    fenced_pool_idxs.insert(pool_idx);
+                    after_state.write().await[index] = fenced_decommission_drive_state().to_string();
+                }
+                Err(Error::VolumeNotEmpty) => {
+                    warn!(
+                        bucket,
+                        operation = "heal_bucket_delete_volume",
+                        result = "preserved_non_empty_bucket",
+                        "heal declined to remove non-empty bucket"
+                    );
+                    after_state.write().await[index] = DriveState::Ok.to_string();
+                }
+                Err(err) => {
+                    after_state.write().await[index] = match &err {
+                        Error::DiskNotFound => DriveState::Offline.to_string(),
+                        _ => DriveState::Corrupt.to_string(),
+                    };
+                    if operation_error.is_none() {
+                        operation_error = Some(err);
+                    }
+                }
+            }
+        }
     }
 
     if !opts.remove {
@@ -1256,43 +1677,74 @@ pub(crate) async fn heal_bucket_local_on_disks(
             let disk = disk.clone();
             let bucket = bucket.to_string();
             let bs_clone = before_state.clone();
-            let as_clone = after_state.clone();
-            let errs_clone = errs.to_vec();
             futures.push(async move {
                 if bs_clone.read().await[idx] == DriveState::Missing.to_string() {
-                    let Some(disk) = disk.as_ref() else {
-                        return Some(Error::DiskNotFound);
+                    let Some(disk) = disk else {
+                        return (idx, Err(Error::DiskNotFound));
                     };
-
-                    info!("bucket not find, will recreate");
-                    match disk.make_volume(&bucket).await {
-                        Ok(_) => {
-                            as_clone.write().await[idx] = DriveState::Ok.to_string();
-                            return None;
+                    let mutation_disk = disk.clone();
+                    let result = run_heal_bucket_volume_mutation(&disk, pool_meta, || async move {
+                        if let Some(err) = injected_heal_bucket_operation_error(&bucket, idx, HealBucketOperation::Make) {
+                            return Err(err);
                         }
-                        Err(err) => {
-                            return Some(err);
+                        match mutation_disk.make_volume(&bucket).await {
+                            Ok(()) | Err(Error::VolumeExists) => Ok(()),
+                            Err(err) => Err(err),
                         }
-                    }
+                    })
+                    .await;
+                    return (idx, result);
                 }
-                errs_clone[idx].clone()
+                (idx, Ok(None))
             });
         }
 
-        let _ = join_all(futures).await;
+        for (index, result) in join_all(futures).await {
+            match result {
+                Ok(None) => {
+                    if before_state.read().await[index] == DriveState::Missing.to_string() {
+                        after_state.write().await[index] = DriveState::Ok.to_string();
+                    }
+                }
+                Ok(Some(pool_idx)) => {
+                    fenced_pool_idxs.insert(pool_idx);
+                    after_state.write().await[index] = fenced_decommission_drive_state().to_string();
+                }
+                Err(err) => {
+                    after_state.write().await[index] = match &err {
+                        Error::DiskNotFound => DriveState::Offline.to_string(),
+                        _ => DriveState::Corrupt.to_string(),
+                    };
+                    if operation_error.is_none() {
+                        operation_error = Some(err);
+                    }
+                }
+            }
+        }
     }
 
     for (disk, state) in disks.iter().zip(after_state.read().await.iter()) {
-        res.before.drives.push(HealDriveInfo {
+        res.after.drives.push(HealDriveInfo {
             uuid: "".to_string(),
             endpoint: disk.clone().map(|s| s.to_string()).unwrap_or_default(),
             state: state.to_string(),
         });
     }
 
-    Ok(res)
+    if let Some(detail) = heal_bucket_fence_detail(&fenced_pool_idxs) {
+        res.detail = detail;
+    }
+
+    match operation_error {
+        Some(err) => Err(err),
+        None => Ok(res),
+    }
 }
 
+#[allow(
+    dead_code,
+    reason = "reached only through heal_bucket_local, which only tests call (backlog#1823)"
+)]
 async fn clone_drives() -> Vec<Option<DiskStore>> {
     runtime_sources::local_disk_entries().await
 }
@@ -1300,6 +1752,7 @@ async fn clone_drives() -> Vec<Option<DiskStore>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::pools::{PoolDecommissionInfo, PoolMetaReplicaState, PoolStatus};
     use crate::disk::WalkDirOptions;
     use crate::disk::disk_store::LocalDiskWrapper;
     use crate::disk::endpoint::Endpoint;
@@ -1473,16 +1926,25 @@ mod tests {
         disks
     }
 
-    fn test_remote_peer(addr: &str) -> RemotePeerS3Client {
-        let node = Node {
-            url: url::Url::parse(addr).expect("test peer URL should parse"),
-            pools: vec![0],
-            is_local: false,
-            grid_host: addr.to_string(),
-        };
+    fn heal_bucket_pool_meta(suspended_pool: Option<usize>) -> PoolMeta {
+        PoolMeta {
+            pools: (0..2)
+                .map(|pool_idx| PoolStatus {
+                    id: pool_idx,
+                    cmd_line: format!("pool-{pool_idx}"),
+                    last_update: ::time::OffsetDateTime::UNIX_EPOCH,
+                    decommission: (suspended_pool == Some(pool_idx)).then(|| PoolDecommissionInfo {
+                        start_time: Some(::time::OffsetDateTime::UNIX_EPOCH),
+                        ..Default::default()
+                    }),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
 
+    fn test_remote_peer(addr: &str) -> RemotePeerS3Client {
         RemotePeerS3Client {
-            node: Some(node),
             pools: Some(vec![0]),
             addr: addr.to_string(),
             health: Arc::new(DiskHealthTracker::new()),
@@ -1756,7 +2218,7 @@ mod tests {
             .await
             .expect_err("second disk should start missing the bucket");
 
-        heal_bucket_local(
+        let result = heal_bucket_local(
             bucket,
             &HealOpts {
                 recreate: true,
@@ -1766,9 +2228,359 @@ mod tests {
         .await
         .expect("bucket heal should recreate missing volumes");
 
+        assert_eq!(result.before.drives.len(), 2);
+        assert_eq!(result.after.drives.len(), 2);
+        assert!(
+            result
+                .before
+                .drives
+                .iter()
+                .any(|drive| drive.state == DriveState::Missing.to_string()),
+            "one bucket volume must be reported missing before heal"
+        );
+        assert!(
+            result
+                .after
+                .drives
+                .iter()
+                .all(|drive| drive.state == DriveState::Ok.to_string()),
+            "all bucket volumes must be reported healthy after heal"
+        );
+
         for disk in disks {
             disk.stat_volume(bucket).await.expect("bucket should exist after heal");
         }
+
+        reset_local_disk_test_state().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn heal_bucket_rechecks_decommission_before_recreating_volume() {
+        reset_local_disk_test_state().await;
+
+        let temp_dir = TempDir::new().expect("create temp dir for bucket-heal fence regression");
+        let disks = init_test_local_disks_for_pools(&temp_dir, &[(0, 1), (1, 1)], "heal-bucket-mutation-fence").await;
+        let bucket = "fenced-recreate-bucket";
+        disks[0]
+            .make_volume(bucket)
+            .await
+            .expect("active pool should start with the bucket volume");
+
+        let pool_meta = Arc::new(RwLock::new(heal_bucket_pool_meta(None)));
+        let barrier = install_heal_bucket_pre_mutation_barrier();
+        let heal = tokio::spawn({
+            let disks = disks.clone();
+            let pool_meta = pool_meta.clone();
+            async move {
+                heal_bucket_local_on_disks_with_pool_meta(
+                    bucket,
+                    &HealOpts {
+                        recreate: true,
+                        ..Default::default()
+                    },
+                    disks.into_iter().map(Some).collect(),
+                    Some(pool_meta.as_ref()),
+                    &[],
+                )
+                .await
+            }
+        });
+
+        barrier.wait_until_paused().await;
+        pool_meta.write().await.pools[1].decommission = Some(PoolDecommissionInfo {
+            start_time: Some(::time::OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        });
+        barrier.release();
+
+        let result = heal
+            .await
+            .expect("bucket-heal task should join")
+            .expect("suspended pool should be reported as skipped");
+        assert!(result.detail.contains("skipped") && result.detail.contains('1'));
+        assert!(matches!(disks[1].stat_volume(bucket).await, Err(Error::VolumeNotFound)));
+
+        reset_local_disk_test_state().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn heal_bucket_dispatch_fence_blocks_stale_active_peer_state() {
+        reset_local_disk_test_state().await;
+
+        let temp_dir = TempDir::new().expect("create temp dir for stale bucket-heal peer regression");
+        let disks = init_test_local_disks_for_pools(&temp_dir, &[(0, 1), (1, 1)], "heal-bucket-dispatch-fence").await;
+        let bucket = "dispatch-fenced-bucket";
+        disks[0]
+            .make_volume(bucket)
+            .await
+            .expect("active pool should start with the bucket volume");
+        let stale_pool_meta = RwLock::new(heal_bucket_pool_meta(None));
+
+        let result = heal_bucket_local_on_disks_with_pool_meta(
+            bucket,
+            &HealOpts {
+                recreate: true,
+                ..Default::default()
+            },
+            disks.iter().cloned().map(Some).collect(),
+            Some(&stale_pool_meta),
+            &[1],
+        )
+        .await
+        .expect("dispatch fence should override stale active peer metadata");
+
+        assert!(result.detail.contains("skipped") && result.detail.contains('1'));
+        assert!(matches!(disks[1].stat_volume(bucket).await, Err(Error::VolumeNotFound)));
+
+        reset_local_disk_test_state().await;
+    }
+
+    #[tokio::test]
+    async fn local_bucket_heal_refuses_receiver_with_unsafe_pool_metadata() {
+        let gate = tokio::sync::Mutex::new(PoolMetaWriteState::default());
+        gate.lock().await.observe_replicas(PoolMetaReplicaState {
+            needs_repair: true,
+            repair_write_safe: false,
+        });
+
+        let err = acquire_bucket_heal_write_guard(Some(&gate))
+            .await
+            .expect_err("receiver-side bucket heal must honor the local pool metadata gate");
+
+        assert!(
+            err.to_string()
+                .contains("bucket heal cannot run while pool metadata requires recovery")
+        );
+    }
+
+    #[tokio::test]
+    async fn receiver_bucket_heal_fails_fast_behind_queued_movement_writer() {
+        let gate = Arc::new(tokio::sync::RwLock::new(()));
+        let coordinator_guard = gate.read().await;
+        let writer_gate = gate.clone();
+        let mut writer = tokio::spawn(async move {
+            let _writer_guard = writer_gate.write().await;
+        });
+        while gate.try_read().is_ok() {
+            tokio::task::yield_now().await;
+        }
+
+        let err = try_acquire_bucket_heal_movement_guard(Some(&gate), false)
+            .expect_err("receiver must not wait behind a queued movement writer");
+        assert_eq!(
+            err,
+            Error::TooManyOpenFiles,
+            "SlowDown collapses to TooManyOpenFiles at the disk boundary"
+        );
+        assert!(
+            try_acquire_bucket_heal_movement_guard(Some(&gate), true)
+                .expect("coordinator-owned movement guard should be reused")
+                .is_none()
+        );
+
+        drop(coordinator_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut writer)
+            .await
+            .expect("queued movement writer should proceed after the coordinator guard is released")
+            .expect("movement writer task should not panic");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn heal_bucket_keeps_suspended_pool_volume_on_remove() {
+        reset_local_disk_test_state().await;
+
+        let temp_dir = TempDir::new().expect("create temp dir for bucket-heal delete fence regression");
+        let disks = init_test_local_disks_for_pools(&temp_dir, &[(0, 1), (1, 1)], "heal-bucket-delete-fence").await;
+        let bucket = "fenced-remove-bucket";
+        for disk in &disks {
+            disk.make_volume(bucket)
+                .await
+                .expect("bucket volume should exist before heal");
+        }
+        let pool_meta = RwLock::new(heal_bucket_pool_meta(Some(1)));
+
+        let result = heal_bucket_local_on_disks_with_pool_meta(
+            bucket,
+            &HealOpts {
+                remove: true,
+                ..Default::default()
+            },
+            disks.iter().cloned().map(Some).collect(),
+            Some(&pool_meta),
+            &[],
+        )
+        .await
+        .expect("suspended pool should be skipped during bucket-volume removal");
+
+        assert!(result.detail.contains("skipped") && result.detail.contains('1'));
+        assert!(matches!(disks[0].stat_volume(bucket).await, Err(Error::VolumeNotFound)));
+        disks[1]
+            .stat_volume(bucket)
+            .await
+            .expect("suspended pool bucket volume must not be deleted");
+
+        reset_local_disk_test_state().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn heal_bucket_local_dry_run_reports_discovered_drive_states() {
+        reset_local_disk_test_state().await;
+
+        let temp_dir = TempDir::new().expect("create temp dir for bucket heal dry-run regression");
+        let disks = init_test_local_disks(&temp_dir, 2, "heal-bucket-local-dry-run-reports-state").await;
+        let bucket = "dry-run-healed-bucket";
+        disks[0]
+            .make_volume(bucket)
+            .await
+            .expect("bucket should exist on the first disk");
+
+        let result = heal_bucket_local_on_disks(
+            bucket,
+            &HealOpts {
+                dry_run: true,
+                ..Default::default()
+            },
+            vec![Some(disks[0].clone()), Some(disks[1].clone()), None],
+        )
+        .await
+        .expect("dry-run bucket heal should inspect disks");
+
+        assert_eq!(result.before.drives.len(), 3);
+        assert_eq!(result.after.drives.len(), 3);
+        assert_eq!(result.before.drives[0].state, DriveState::Ok.to_string());
+        assert_eq!(result.before.drives[1].state, DriveState::Missing.to_string());
+        assert_eq!(result.before.drives[2].state, DriveState::Offline.to_string());
+        for (before, after) in result.before.drives.iter().zip(&result.after.drives) {
+            assert_eq!(after.endpoint, before.endpoint);
+            assert_eq!(after.state, before.state);
+        }
+        assert!(matches!(disks[1].stat_volume(bucket).await, Err(Error::VolumeNotFound)));
+
+        reset_local_disk_test_state().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn heal_bucket_local_propagates_recreate_failure() {
+        reset_local_disk_test_state().await;
+
+        let temp_dir = TempDir::new().expect("create temp dir for bucket recreate failure regression");
+        let disks = init_test_local_disks(&temp_dir, 2, "heal-bucket-local-propagates-recreate-failure").await;
+        let bucket = "recreate-failure-bucket";
+        disks[0]
+            .make_volume(bucket)
+            .await
+            .expect("bucket should exist on the first disk");
+        let _failure = HealBucketOperationFailure::install(bucket, 1, HealBucketOperation::Make, Error::DiskAccessDenied);
+
+        let error = heal_bucket_local_on_disks(
+            bucket,
+            &HealOpts {
+                recreate: true,
+                ..Default::default()
+            },
+            disks.iter().cloned().map(Some).collect(),
+        )
+        .await
+        .expect_err("failed volume recreation must fail bucket heal");
+
+        assert_eq!(error, Error::DiskAccessDenied);
+        assert!(matches!(disks[1].stat_volume(bucket).await, Err(Error::VolumeNotFound)));
+
+        reset_local_disk_test_state().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn heal_bucket_local_propagates_delete_failure() {
+        reset_local_disk_test_state().await;
+
+        let temp_dir = TempDir::new().expect("create temp dir for bucket delete failure regression");
+        let disks = init_test_local_disks(&temp_dir, 2, "heal-bucket-local-propagates-delete-failure").await;
+        let bucket = "delete-failure-bucket";
+        disks[0]
+            .make_volume(bucket)
+            .await
+            .expect("bucket should exist on the first disk");
+        let _failure = HealBucketOperationFailure::install(bucket, 0, HealBucketOperation::Delete, Error::DiskAccessDenied);
+
+        let error = heal_bucket_local_on_disks(
+            bucket,
+            &HealOpts {
+                remove: true,
+                ..Default::default()
+            },
+            disks.iter().cloned().map(Some).collect(),
+        )
+        .await
+        .expect_err("failed volume deletion must fail bucket heal");
+
+        assert_eq!(error, Error::DiskAccessDenied);
+        disks[0]
+            .stat_volume(bucket)
+            .await
+            .expect("failed deletion must leave the bucket volume present");
+
+        reset_local_disk_test_state().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn heal_bucket_local_preserves_non_empty_bucket() {
+        reset_local_disk_test_state().await;
+
+        let temp_dir = TempDir::new().expect("create temp dir for non-empty bucket heal regression");
+        let disks = init_test_local_disks(&temp_dir, 1, "heal-bucket-local-preserves-non-empty").await;
+        let bucket = "non-empty-bucket";
+        disks[0]
+            .make_volume(bucket)
+            .await
+            .expect("bucket should exist on the first disk");
+        let _failure = HealBucketOperationFailure::install(bucket, 0, HealBucketOperation::Delete, Error::VolumeNotEmpty);
+
+        let result = heal_bucket_local_on_disks(
+            bucket,
+            &HealOpts {
+                remove: true,
+                ..Default::default()
+            },
+            disks.iter().cloned().map(Some).collect(),
+        )
+        .await
+        .expect("a non-empty bucket refusal is an expected safety result");
+
+        assert_eq!(result.after.drives.len(), 1);
+        assert_eq!(result.after.drives[0].state, DriveState::Ok.to_string());
+        disks[0]
+            .stat_volume(bucket)
+            .await
+            .expect("the non-empty bucket must remain present");
+
+        reset_local_disk_test_state().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn heal_bucket_local_propagates_preexisting_offline_disk() {
+        reset_local_disk_test_state().await;
+
+        let temp_dir = TempDir::new().expect("create temp dir for offline bucket heal regression");
+        let disks = init_test_local_disks(&temp_dir, 1, "heal-bucket-local-preexisting-offline").await;
+        let bucket = "offline-disk-bucket";
+        disks[0]
+            .make_volume(bucket)
+            .await
+            .expect("bucket should exist on the online disk");
+
+        let error = heal_bucket_local_on_disks(bucket, &HealOpts::default(), vec![Some(disks[0].clone()), None])
+            .await
+            .expect_err("a prepass offline disk must keep the bucket heal incomplete");
+
+        assert_eq!(error, Error::DiskNotFound);
 
         reset_local_disk_test_state().await;
     }
@@ -1824,6 +2636,36 @@ mod tests {
         resolve_heal_bucket_mode(&mut partial, &[None, Some(Error::VolumeNotFound)]).unwrap();
         assert!(!partial.remove);
         assert!(partial.recreate);
+    }
+
+    #[test]
+    fn heal_bucket_rpc_envelope_preserves_legacy_compatibility_fail_closed() {
+        let opts = HealOpts {
+            recreate: true,
+            pool: Some(2),
+            ..Default::default()
+        };
+        let encoded = encode_heal_bucket_rpc_options(opts, &[1, 2]).expect("encode bucket-heal RPC envelope");
+
+        assert!(
+            serde_json::from_str::<HealOpts>(&encoded).is_err(),
+            "an old peer must reject the nested request instead of ignoring its dispatch fence"
+        );
+        let (decoded, fenced_pools) =
+            decode_heal_bucket_rpc_options(&encoded).expect("new peer should decode bucket-heal RPC envelope");
+        assert!(decoded.recreate);
+        assert_eq!(decoded.pool, Some(2));
+        assert_eq!(fenced_pools, vec![1, 2]);
+
+        let legacy = encode_heal_bucket_rpc_options(opts, &[]).expect("encode legacy HealOpts for an unfenced heal");
+        let old_peer_opts = serde_json::from_str::<HealOpts>(&legacy).expect("old peer should decode an unfenced heal request");
+        assert!(old_peer_opts.recreate);
+        assert_eq!(old_peer_opts.pool, Some(2));
+
+        let (decoded, fenced_pools) = decode_heal_bucket_rpc_options(&legacy).expect("new peer should accept a legacy request");
+        assert!(decoded.recreate);
+        assert_eq!(decoded.pool, Some(2));
+        assert!(fenced_pools.is_empty());
     }
 
     #[tokio::test]
@@ -2029,5 +2871,38 @@ mod tests {
             .map(|call_count| call_count.load(Ordering::SeqCst))
             .collect::<Vec<_>>();
         assert_eq!(calls, vec![1, 1, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn peer_failure_without_details_names_operation_and_bucket() {
+        for op in ["heal_bucket", "make_bucket", "get_bucket_info", "delete_bucket"] {
+            let message = peer_failure_without_details(op, Some("ops-bucket")).to_string();
+            assert!(message.contains(op), "{op} message must name the operation: {message}");
+            assert!(message.contains("ops-bucket"), "{op} message must name the bucket: {message}");
+        }
+
+        let message = peer_failure_without_details("list_bucket", None).to_string();
+        assert!(message.contains("list_bucket"), "cluster-wide message must name the operation");
+        assert!(!message.trim().is_empty());
+    }
+
+    #[test]
+    fn peer_failure_without_details_keeps_one_reduce_errs_bucket_per_operation() {
+        // reduce_errs groups Io errors by kind plus rendered message: peers failing the
+        // same operation on the same bucket must still reach quorum as one dominant error.
+        let per_pool_errs = vec![
+            Some(peer_failure_without_details("delete_bucket", Some("shared"))),
+            Some(peer_failure_without_details("delete_bucket", Some("shared"))),
+            Some(peer_failure_without_details("delete_bucket", Some("shared"))),
+        ];
+        assert_eq!(
+            reduce_pool_write_quorum_errs(&per_pool_errs),
+            Some(peer_failure_without_details("delete_bucket", Some("shared")))
+        );
+
+        assert_ne!(
+            peer_failure_without_details("delete_bucket", Some("shared")),
+            peer_failure_without_details("get_bucket_info", Some("shared"))
+        );
     }
 }

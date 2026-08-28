@@ -129,6 +129,15 @@ impl NamespaceLockGuard {
         }
     }
 
+    /// Share the loss signal when a caller deliberately forwards a mutation
+    /// under an already-held distributed lock.
+    pub fn lock_lost_signal(&self) -> Option<Arc<crate::distributed_lock::LockLostSignal>> {
+        match self {
+            Self::Standard(guard) => Some(guard.lock_lost()),
+            Self::Fast(_) => None,
+        }
+    }
+
     /// Resolves when a distributed guard loses refresh quorum.
     ///
     /// Local fast locks cannot lose distributed quorum, so their future remains pending.
@@ -171,6 +180,11 @@ impl NamespaceLock {
         Self::Local(LocalLock::new(namespace, manager))
     }
 
+    /// Create a local namespace lock that shares an existing namespace allocation.
+    pub fn with_local_manager_shared(namespace: Arc<str>, manager: Arc<crate::GlobalLockManager>) -> Self {
+        Self::Local(LocalLock::new_shared(namespace, manager))
+    }
+
     /// Create namespace lock with clients
     /// Uses DistributedLock with appropriate quorum
     pub fn with_clients(namespace: String, clients: Vec<Arc<dyn LockClient>>) -> Self {
@@ -184,6 +198,15 @@ impl NamespaceLock {
     /// The write quorum will be clamped into [1, clients.len()].
     pub fn with_clients_and_quorum(namespace: String, clients: Vec<Arc<dyn LockClient>>, quorum: usize) -> Self {
         Self::Distributed(DistributedLock::new(namespace, clients, quorum))
+    }
+
+    /// Create a namespace lock that shares existing namespace and client allocations.
+    pub fn with_clients_and_quorum_shared(
+        namespace: Arc<str>,
+        clients: impl Into<Arc<[Arc<dyn LockClient>]>>,
+        quorum: usize,
+    ) -> Self {
+        Self::Distributed(DistributedLock::new_shared(namespace, clients.into(), quorum))
     }
 
     /// Get namespace identifier

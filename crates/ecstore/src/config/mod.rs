@@ -13,16 +13,15 @@
 // limitations under the License.
 
 // #730: configuration migration keeps legacy subsystem definitions available behind this module.
-#![allow(dead_code)]
 
 mod audit;
 pub mod com;
-#[allow(dead_code)]
 pub mod heal;
 mod notify;
 mod oidc;
 mod scanner;
 pub mod storageclass;
+mod target_defaults;
 
 use crate::error::Result;
 use crate::store::ECStore;

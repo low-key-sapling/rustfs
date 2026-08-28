@@ -12,23 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(dead_code)]
-
 //! Statistics collection functions for metrics.
 //!
 //! This module contains functions that collect statistics from various
 //! RustFS internal sources (storage layer, bucket monitor, system info)
 //! and convert them to the Stats structs used by collectors.
 
-use crate::metrics::collectors::scanner::{ScannerBucketDriveResultStats, ScannerSourceWorkStats};
+use crate::metrics::collectors::scanner::{ScannerActiveBucketDriveStats, ScannerBucketDriveResultStats, ScannerSourceWorkStats};
 use crate::metrics::collectors::{
     ApiRequestMetricSupport, ApiRequestStats, BucketReplicationBacklogStats, BucketReplicationBandwidthStats,
-    BucketReplicationRuntimeStats, BucketReplicationStats, BucketReplicationTargetBacklogStats, BucketReplicationTargetFlowStats,
-    BucketReplicationTargetStats, BucketStats, BucketUsageStats, ClusterConfigStats, ClusterHealthStats, ClusterStats,
-    ClusterUsageStats, CompressionClusterStats, CpuStats, DiskStats, DriveCountStats, DriveDetailedStats,
-    DriveRuntimeDetailedStats, ErasureSetStats, HostNetworkStats, IamStats, IlmActionTaskStats, IlmRuntimeStats, IlmStats,
-    MemoryStats, NetworkStats, ProcessStats, ProcessStatusType, ReplicationStats, ResourceStats, ScannerRuntimeStats,
-    ScannerStats,
+    BucketReplicationMetricsSnapshot, BucketReplicationRuntimeStats, BucketReplicationTargetBacklogStats,
+    BucketReplicationTargetFlowStats, BucketReplicationTargetStats, BucketStats, BucketUsageStats, ClusterConfigStats,
+    ClusterHealthStats, ClusterStats, ClusterUsageStats, CompressionClusterStats, CpuStats, DiskStats, DriveCountStats,
+    DriveDetailedStats, DriveRuntimeDetailedStats, ErasureSetStats, HostNetworkStats, IamStats, IlmActionTaskStats,
+    IlmBackpressureStats, IlmQueueTaskStats, IlmRuntimeStats, IlmStats, IlmTaskEventStats, MemoryStats, NetworkStats,
+    ProcessStats, ProcessStatusType, ReplicationMetricsSnapshot, ResourceStats, ScannerRuntimeStats, ScannerStats,
 };
 use crate::metrics::runtime_sources::{ObsIlmRuntimeSnapshot, bucket_monitor_handle, iam_metrics_snapshot, ilm_runtime_snapshot};
 use crate::metrics::{
@@ -38,13 +36,16 @@ use crate::metrics::{
     obs_replication_site_stats_snapshot, obs_resolve_object_store_handle,
 };
 use crate::node_identity::current_local_node_identity;
-use chrono::Utc;
-use rustfs_common::heal_channel::HealScanMode;
-use rustfs_common::metrics::{ScannerBucketDriveResultSnapshot, ScannerMetricsReport, ScannerSourceWorkSnapshot, global_metrics};
+use jiff::Timestamp;
+use rustfs_heal_contracts::heal_channel::HealScanMode;
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_io_metrics::{
     ProcessResourceSnapshot, ProcessSampler, ProcessStatusSnapshot, ProcessSystemSnapshot, s3_op_metrics_snapshot,
     snapshot_process_resource_and_system, snapshot_process_resource_and_system_with,
+};
+use rustfs_scanner_contracts::metrics::{
+    ScannerActiveBucketDriveSnapshot, ScannerBucketDriveResultSnapshot, ScannerMetricsReport, ScannerSourceWorkSnapshot,
+    global_metrics,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -65,6 +66,7 @@ type ObsBackendInfo = <ObsStore as StorageAdminApi>::BackendInfo;
 struct ObsDataUsageInfo {
     last_update: Option<SystemTime>,
     usage_snapshot_complete: bool,
+    usage_snapshot_converged: bool,
     buckets_count: u64,
     objects_total_count: u64,
     versions_total_count: u64,
@@ -102,6 +104,7 @@ async fn load_obs_data_usage_from_backend(store: Arc<ObsStore>) -> ObsEcstoreRes
     Ok(ObsDataUsageInfo {
         last_update: data_usage.last_update,
         usage_snapshot_complete,
+        usage_snapshot_converged: data_usage.usage_snapshot_converged == Some(true),
         buckets_count: data_usage.buckets_count,
         objects_total_count: data_usage.objects_total_count,
         versions_total_count: data_usage.versions_total_count,
@@ -263,7 +266,7 @@ fn bucket_replication_detail_from_snapshot(stats: ObsBucketReplicationStatsSnaps
 
     BucketReplicationRuntimeStats {
         target_flows,
-        stats: BucketReplicationStats {
+        stats: BucketReplicationMetricsSnapshot {
             bucket,
             total_failed_bytes: stats.total_failed_bytes,
             total_failed_count: stats.total_failed_count,
@@ -295,7 +298,7 @@ fn bucket_replication_detail_from_snapshot(stats: ObsBucketReplicationStatsSnaps
     }
 }
 
-async fn obs_site_replication_stats() -> ReplicationStats {
+async fn obs_site_replication_stats() -> ReplicationMetricsSnapshot {
     let current_data_transfer_rate = obs_bucket_replication_bandwidth_stats()
         .into_iter()
         .flatten()
@@ -303,7 +306,7 @@ async fn obs_site_replication_stats() -> ReplicationStats {
         .sum::<f64>();
     let stats = obs_replication_site_stats_snapshot(current_data_transfer_rate).await;
 
-    ReplicationStats {
+    ReplicationMetricsSnapshot {
         average_active_workers: stats.average_active_workers,
         average_queued_bytes: stats.average_queued_bytes,
         average_queued_count: stats.average_queued_count,
@@ -320,16 +323,21 @@ async fn obs_site_replication_stats() -> ReplicationStats {
     }
 }
 
-fn current_scanner_cycle_age_seconds(
-    current_cycle_active: bool,
-    current_started: chrono::DateTime<Utc>,
-    now: chrono::DateTime<Utc>,
-) -> u64 {
+fn current_scanner_cycle_age_seconds(current_cycle_active: bool, current_started: Timestamp, now: Timestamp) -> u64 {
     if !current_cycle_active {
         0
     } else {
-        now.signed_duration_since(current_started).num_seconds().max(0) as u64
+        timestamp_elapsed_seconds_since(now, current_started)
     }
+}
+
+fn timestamp_elapsed_seconds_since(now: Timestamp, earlier: Timestamp) -> u64 {
+    let duration = now.duration_since(earlier);
+    if duration.is_negative() {
+        return 0;
+    }
+
+    u64::try_from(duration.as_secs()).unwrap_or(u64::MAX)
 }
 
 fn scanner_scan_mode_code(scan_mode: &str) -> u64 {
@@ -640,7 +648,7 @@ pub fn collect_bucket_replication_bandwidth_stats() -> Vec<BucketReplicationBand
 }
 
 /// Collect bucket and target level replication stats from the global replication runtime.
-pub async fn collect_bucket_replication_detail_stats() -> Vec<BucketReplicationStats> {
+pub async fn collect_bucket_replication_detail_stats() -> Vec<BucketReplicationMetricsSnapshot> {
     obs_bucket_replication_stats_snapshot()
         .await
         .into_iter()
@@ -654,7 +662,7 @@ pub(crate) async fn collect_bucket_replication_stats_bundle()
 }
 
 /// Collect site-level replication stats from the global replication runtime.
-pub async fn collect_replication_stats() -> ReplicationStats {
+pub async fn collect_replication_stats() -> ReplicationMetricsSnapshot {
     obs_site_replication_stats().await
 }
 
@@ -830,6 +838,8 @@ pub(crate) async fn collect_disk_and_system_drive_runtime_stats()
                         drive_api_latency_micros(metrics.last_minute.values().map(|action| (action.count, action.acc_time)))
                     }),
                     health: if is_online { 1 } else { 0 },
+                    writes_total: disk.metrics.as_ref().map(|metrics| metrics.total_writes),
+                    deletes_total: disk.metrics.as_ref().map(|metrics| metrics.total_deletes),
                     reads_per_sec: None,
                     reads_kb_per_sec: None,
                     reads_await: None,
@@ -1199,6 +1209,7 @@ async fn collect_cluster_usage_metric_stats_from_data_usage(
             versions_count: data_usage.versions_total_count,
             delete_markers_count: data_usage.delete_markers_total_count,
             buckets_count: data_usage.buckets_count,
+            snapshot_converged: data_usage.usage_snapshot_converged,
             object_size_distribution: data_usage
                 .buckets_usage
                 .values()
@@ -1269,6 +1280,110 @@ fn ilm_action_task_stats(ilm: &ObsIlmRuntimeSnapshot) -> Vec<IlmActionTaskStats>
     ]
 }
 
+fn ilm_queue_task_stats(metrics: &ScannerMetricsReport) -> Vec<IlmQueueTaskStats> {
+    let expiry = &metrics.lifecycle_expiry;
+    let transition = &metrics.lifecycle_transition;
+    vec![
+        IlmQueueTaskStats {
+            action: "expiry".to_string(),
+            state: "pending".to_string(),
+            value: expiry.current_queued,
+        },
+        IlmQueueTaskStats {
+            action: "expiry".to_string(),
+            state: "active".to_string(),
+            value: expiry.current_active,
+        },
+        IlmQueueTaskStats {
+            action: "transition".to_string(),
+            state: "pending".to_string(),
+            value: transition.current_queued,
+        },
+        IlmQueueTaskStats {
+            action: "transition".to_string(),
+            state: "active".to_string(),
+            value: transition.current_active,
+        },
+        IlmQueueTaskStats {
+            action: "transition".to_string(),
+            state: "compensation_running".to_string(),
+            value: transition.compensation_running,
+        },
+    ]
+}
+
+fn ilm_task_event_stats(metrics: &ScannerMetricsReport) -> Vec<IlmTaskEventStats> {
+    let expiry = &metrics.lifecycle_expiry;
+    let transition = &metrics.lifecycle_transition;
+    vec![
+        IlmTaskEventStats {
+            action: "expiry".to_string(),
+            result: "queued".to_string(),
+            value: expiry.scanner_queued,
+        },
+        IlmTaskEventStats {
+            action: "expiry".to_string(),
+            result: "missed".to_string(),
+            value: expiry.scanner_missed,
+        },
+        IlmTaskEventStats {
+            action: "expiry".to_string(),
+            result: "blocked".to_string(),
+            value: expiry.scanner_blocked,
+        },
+        IlmTaskEventStats {
+            action: "expiry".to_string(),
+            result: "not_enqueued".to_string(),
+            value: expiry.scanner_not_enqueued,
+        },
+        IlmTaskEventStats {
+            action: "expiry".to_string(),
+            result: "failed".to_string(),
+            value: expiry.delete_failed,
+        },
+        IlmTaskEventStats {
+            action: "transition".to_string(),
+            result: "queued".to_string(),
+            value: transition.scanner_queued,
+        },
+        IlmTaskEventStats {
+            action: "transition".to_string(),
+            result: "missed".to_string(),
+            value: transition.scanner_missed,
+        },
+        IlmTaskEventStats {
+            action: "transition".to_string(),
+            result: "completed".to_string(),
+            value: transition.completed,
+        },
+        IlmTaskEventStats {
+            action: "transition".to_string(),
+            result: "failed".to_string(),
+            value: transition.failed,
+        },
+    ]
+}
+
+fn ilm_backpressure_stats(metrics: &ScannerMetricsReport) -> Vec<IlmBackpressureStats> {
+    vec![
+        IlmBackpressureStats {
+            action: "expiry".to_string(),
+            reason: "queue_missed".to_string(),
+            value: metrics.lifecycle_expiry.queue_missed,
+        },
+        IlmBackpressureStats {
+            action: "transition".to_string(),
+            reason: "queue_full".to_string(),
+            value: metrics.lifecycle_transition.queue_full,
+        },
+        IlmBackpressureStats {
+            action: "transition".to_string(),
+            reason: "send_timeout".to_string(),
+            value: metrics.lifecycle_transition.queue_send_timeout,
+        },
+    ]
+}
+
 /// Collect ILM metrics from the current lifecycle runtime state.
 pub async fn collect_ilm_metric_stats() -> Option<IlmStats> {
     collect_ilm_runtime_metric_stats().await.map(|stats| stats.stats)
@@ -1282,6 +1397,10 @@ pub(crate) async fn collect_ilm_runtime_metric_stats() -> Option<IlmRuntimeStats
     Some(IlmRuntimeStats {
         server: current_local_node_identity(),
         action_tasks: ilm_action_task_stats(&ilm),
+        queue_tasks: ilm_queue_task_stats(&metrics),
+        task_events: ilm_task_event_stats(&metrics),
+        backpressure: ilm_backpressure_stats(&metrics),
+        versions_scanned,
         stats: IlmStats {
             expiry_pending_tasks: ilm.expiry_pending_tasks,
             transition_active_tasks: ilm.transition_active_tasks,
@@ -1371,13 +1490,34 @@ fn scanner_bucket_drive_result_stats(results: &[ScannerBucketDriveResultSnapshot
     stats
 }
 
+fn scanner_active_bucket_drive_stats(results: &[ScannerActiveBucketDriveSnapshot]) -> Vec<ScannerActiveBucketDriveStats> {
+    let mut stats = results
+        .iter()
+        .filter(|result| !result.source.is_empty() && !result.bucket.is_empty() && !result.drive.is_empty() && result.count > 0)
+        .map(|result| ScannerActiveBucketDriveStats {
+            source: result.source.clone(),
+            bucket: result.bucket.clone(),
+            drive: result.drive.clone(),
+            count: result.count,
+            age_seconds: result.age_seconds,
+        })
+        .collect::<Vec<_>>();
+    stats.sort_by(|left, right| {
+        left.source
+            .cmp(&right.source)
+            .then_with(|| left.bucket.cmp(&right.bucket))
+            .then_with(|| left.drive.cmp(&right.drive))
+    });
+    stats
+}
+
 pub async fn collect_scanner_metric_stats() -> Option<ScannerStats> {
     collect_scanner_runtime_metric_stats().await.map(|stats| stats.stats)
 }
 
 pub(crate) async fn collect_scanner_runtime_metric_stats() -> Option<ScannerRuntimeStats> {
     let (metrics, runtime_details) = global_metrics().report_with_runtime_details().await;
-    let now = Utc::now();
+    let now = Timestamp::now();
     let bucket_scans_finished = metrics.life_time_ops.get("scan_bucket_drive").copied().unwrap_or_default();
     let bucket_scans_started = scanner_bucket_scans_started(&metrics.life_time_ops, bucket_scans_finished);
     let bucket_scans_failed = metrics
@@ -1395,7 +1535,7 @@ pub(crate) async fn collect_scanner_runtime_metric_stats() -> Option<ScannerRunt
     // rules report zero here while objects_scanned keeps climbing.
     let versions_scanned = metrics.versions_scanned;
     let reference_time = metrics.cycles_completed_at.last().copied().unwrap_or(metrics.current_started);
-    let last_activity_seconds = now.signed_duration_since(reference_time).num_seconds().max(0) as u64;
+    let last_activity_seconds = timestamp_elapsed_seconds_since(now, reference_time);
     let active_paths = metrics.active_scan_paths as u64;
     let current_cycle_age_seconds = current_scanner_cycle_age_seconds(metrics.current_cycle_active, metrics.current_started, now);
     let current_scan_mode = scanner_scan_mode_code(&metrics.current_scan_mode);
@@ -1412,6 +1552,7 @@ pub(crate) async fn collect_scanner_runtime_metric_stats() -> Option<ScannerRunt
             &runtime_details.current_cycle_bucket_drive_results,
         ),
         last_cycle_bucket_drive_results: scanner_bucket_drive_result_stats(&runtime_details.last_cycle_bucket_drive_results),
+        active_bucket_drive_scans: scanner_active_bucket_drive_stats(&runtime_details.active_bucket_drive_scans),
         stats: ScannerStats {
             bucket_scans_finished,
             bucket_scans_started,
@@ -1526,7 +1667,7 @@ pub async fn collect_compression_cluster_stats() -> Option<CompressionClusterSta
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustfs_common::metrics::ScannerSourceWorkSnapshot;
+    use rustfs_scanner_contracts::metrics::ScannerSourceWorkSnapshot;
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
     use std::thread;
@@ -1574,6 +1715,7 @@ mod tests {
         let (cluster, buckets) = collect_cluster_usage_metric_stats_from_data_usage(
             ObsDataUsageInfo {
                 usage_snapshot_complete: true,
+                usage_snapshot_converged: true,
                 ..Default::default()
             },
             &HashSet::new(),
@@ -1584,7 +1726,24 @@ mod tests {
         assert_eq!(cluster.buckets_count, 0);
         assert_eq!(cluster.objects_count, 0);
         assert_eq!(cluster.total_bytes, 0);
+        assert!(cluster.snapshot_converged);
         assert!(buckets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cluster_usage_metrics_publish_unknown_convergence_as_unconverged() {
+        let (cluster, _) = collect_cluster_usage_metric_stats_from_data_usage(
+            ObsDataUsageInfo {
+                usage_snapshot_complete: true,
+                usage_snapshot_converged: false,
+                ..Default::default()
+            },
+            &HashSet::new(),
+        )
+        .await
+        .expect("complete usage with unknown convergence should remain publishable");
+
+        assert!(!cluster.snapshot_converged);
     }
 
     #[tokio::test]
@@ -1858,23 +2017,29 @@ mod tests {
 
     #[test]
     fn current_scanner_cycle_age_seconds_returns_zero_when_idle() {
-        let now = Utc::now();
+        let now = Timestamp::constant(1_700_000_000, 0);
 
-        assert_eq!(current_scanner_cycle_age_seconds(false, now - chrono::Duration::seconds(30), now), 0);
+        assert_eq!(
+            current_scanner_cycle_age_seconds(false, now - jiff::SignedDuration::from_secs(30), now),
+            0
+        );
     }
 
     #[test]
     fn current_scanner_cycle_age_seconds_clamps_future_start() {
-        let now = Utc::now();
+        let now = Timestamp::constant(1_700_000_000, 0);
 
-        assert_eq!(current_scanner_cycle_age_seconds(true, now + chrono::Duration::seconds(30), now), 0);
+        assert_eq!(current_scanner_cycle_age_seconds(true, now + jiff::SignedDuration::from_secs(30), now), 0);
     }
 
     #[test]
     fn current_scanner_cycle_age_seconds_reports_active_first_cycle_elapsed_time() {
-        let now = Utc::now();
+        let now = Timestamp::constant(1_700_000_000, 0);
 
-        assert_eq!(current_scanner_cycle_age_seconds(true, now - chrono::Duration::seconds(45), now), 45);
+        assert_eq!(
+            current_scanner_cycle_age_seconds(true, now - jiff::SignedDuration::from_secs(45), now),
+            45
+        );
     }
 
     #[test]
@@ -1952,6 +2117,72 @@ mod tests {
         };
 
         assert_eq!(scanner_lifecycle_checked_versions(&report), 37);
+    }
+
+    #[test]
+    fn ilm_detail_stats_keep_expiry_and_transition_results_separate() {
+        let report = ScannerMetricsReport {
+            lifecycle_expiry: rustfs_scanner_contracts::metrics::ScannerLifecycleExpirySnapshot {
+                current_queued: 2,
+                current_active: 1,
+                scanner_queued: 10,
+                scanner_missed: 3,
+                delete_failed: 4,
+                ..Default::default()
+            },
+            lifecycle_transition: rustfs_scanner_contracts::metrics::ScannerLifecycleTransitionSnapshot {
+                current_queued: 5,
+                current_active: 6,
+                queue_full: 7,
+                queue_send_timeout: 8,
+                scanner_queued: 11,
+                completed: 12,
+                failed: 13,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let queues = ilm_queue_task_stats(&report);
+        assert!(
+            queues
+                .iter()
+                .any(|task| task.action == "expiry" && task.state == "pending" && task.value == 2)
+        );
+        assert!(
+            queues
+                .iter()
+                .any(|task| task.action == "transition" && task.state == "active" && task.value == 6)
+        );
+
+        let events = ilm_task_event_stats(&report);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.action == "expiry" && event.result == "failed" && event.value == 4)
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.action == "transition" && event.result == "completed" && event.value == 12)
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.action == "transition" && event.result == "failed" && event.value == 13)
+        );
+
+        let backpressure = ilm_backpressure_stats(&report);
+        assert!(
+            backpressure
+                .iter()
+                .any(|event| event.action == "transition" && event.reason == "queue_full" && event.value == 7)
+        );
+        assert!(
+            backpressure
+                .iter()
+                .any(|event| event.action == "transition" && event.reason == "send_timeout" && event.value == 8)
+        );
     }
 
     #[test]

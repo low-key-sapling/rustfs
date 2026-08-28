@@ -96,7 +96,6 @@ tokio-stream = { workspace = true }
 rustfs-madmin.workspace = true
 rustfs-filemeta.workspace = true
 bytes = { workspace = true, features = ["serde"] }
-serial_test = { workspace = true }
 aws-sdk-s3 = { workspace = true, default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 aws-sdk-sts = { workspace = true, default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-config = { workspace = true }
@@ -110,15 +109,22 @@ hyper = { workspace = true, features = ["http2", "http1", "server"] }
 hyper-util = { workspace = true, features = ["tokio", "server-auto", "server-graceful", "tracing"] }
 reqwest = { workspace = true, features = ["json", "multipart", "stream"] }
 rustfs-signer.workspace = true
+
+# The MFA e2e test computes RFC 6238 codes itself rather than calling the
+# server's implementation: a shared helper could agree with a bug on both sides.
+data-encoding = { workspace = true }
+hmac = { workspace = true }
+sha1 = { workspace = true }
+serde_urlencoded = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "time"] }
 uuid = { workspace = true, features = ["v4", "fast-rng", "macro-diagnostics"] }
 urlencoding.workspace = true
 walkdir.workspace = true
-base64 = { workspace = true }
+base64-simd = { workspace = true }
 rand = { workspace = true, features = ["serde"] }
 chrono = { workspace = true, features = ["serde"] }
-hex = { workspace = true }
+hex-simd = { workspace = true }
 md-5 = { workspace = true }
 opentelemetry-proto = { workspace = true }
 prost.workspace = true

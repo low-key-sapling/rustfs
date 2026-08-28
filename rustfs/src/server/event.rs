@@ -18,13 +18,10 @@ use super::{
 };
 use crate::init::reconcile_persisted_bucket_notification_configurations;
 use crate::storage_api::server::event::{
-    EventArgs as EcstoreEventArgs, StorageObjectInfo, read_existing_server_config_no_lock, register_event_dispatch_hook,
+    EventArgs as EcstoreEventArgs, read_existing_server_config_no_lock, register_event_dispatch_hook,
     with_server_config_read_lock,
 };
-use chrono::{DateTime, Utc};
-use rustfs_notify::{
-    EventArgs as NotifyEventArgs, NotificationError, NotificationRuntimeState, NotificationSystem, NotifyObjectInfo,
-};
+use rustfs_notify::{EventArgs as NotifyEventArgs, NotificationError, NotificationRuntimeState, NotificationSystem};
 use rustfs_s3_types::EventName;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -37,7 +34,6 @@ use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, instrument, warn};
 
-static NOTIFY_MODULE_ENABLED: AtomicBool = AtomicBool::new(rustfs_config::DEFAULT_NOTIFY_ENABLE);
 static NOTIFY_RUNTIME_RECONCILED: AtomicBool = AtomicBool::new(false);
 static NOTIFY_BUCKET_RULES_RECONCILED: AtomicBool = AtomicBool::new(false);
 static ECSTORE_EVENT_DISPATCH_HOOK: OnceLock<()> = OnceLock::new();
@@ -73,37 +69,13 @@ fn should_reconcile_bucket_notification_rules(runtime_changed: bool, notify_enab
 
 pub fn refresh_notify_module_enabled() -> bool {
     let enabled = resolve_notify_module_state().enabled;
-    NOTIFY_MODULE_ENABLED.store(enabled, Ordering::Relaxed);
+    crate::module_switches::set_notify_module_enabled(enabled);
     enabled
 }
 
-pub fn is_notify_module_enabled() -> bool {
-    NOTIFY_MODULE_ENABLED.load(Ordering::Relaxed)
-}
+pub use crate::module_switches::is_notify_module_enabled;
 
-pub(crate) fn convert_ecstore_object_info(object: StorageObjectInfo) -> NotifyObjectInfo {
-    NotifyObjectInfo {
-        bucket: object.bucket,
-        name: object.name,
-        size: object.size,
-        etag: object.etag,
-        content_type: object.content_type,
-        user_defined: object
-            .user_defined
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect(),
-        version_id: object.version_id.map(|version_id| version_id.to_string()),
-        mod_time: object
-            .mod_time
-            .and_then(|value| DateTime::<Utc>::from_timestamp(value.unix_timestamp(), value.nanosecond())),
-        restore_expires: object
-            .restore_expires
-            .and_then(|value| DateTime::<Utc>::from_timestamp(value.unix_timestamp(), value.nanosecond())),
-        storage_class: object.storage_class,
-        transitioned_tier: (!object.transitioned_object.tier.is_empty()).then_some(object.transitioned_object.tier),
-    }
-}
+pub(crate) use crate::shared_types::convert_ecstore_object_info;
 
 fn convert_ecstore_event_args(args: EcstoreEventArgs) -> Option<NotifyEventArgs> {
     let version_id = args.object.version_id.map(|v| v.to_string()).unwrap_or_default();
@@ -196,7 +168,7 @@ pub(crate) async fn reconcile_event_notifier_from_store(
         let transition_system = system.clone();
         let transition_store = store.clone();
         let transition = with_refreshed_notify_module_state_from(store.clone(), move |resolution| async move {
-            NOTIFY_MODULE_ENABLED.store(resolution.enabled, Ordering::Relaxed);
+            crate::module_switches::set_notify_module_enabled(resolution.enabled);
             let read_store = transition_store.clone();
             let config_system = transition_system.clone();
             with_server_config_read_lock(transition_store, move || async move {
@@ -440,7 +412,7 @@ mod tests {
     use crate::server::is_event_notifier_reconciled;
     use crate::storage_api::server::event::StorageObjectInfo;
     use crate::storage_api::server::event::contract::lifecycle::TransitionedObject;
-    use chrono::{DateTime, Utc};
+    use jiff::Timestamp;
     use rustfs_notify::NotificationError;
     use rustfs_notify::NotificationRuntimeState;
     use serial_test::serial;
@@ -557,8 +529,8 @@ mod tests {
         assert_eq!(converted.etag.as_deref(), Some("etag"));
         assert_eq!(converted.content_type.as_deref(), Some("text/plain"));
         assert_eq!(converted.user_defined.get("x-amz-meta-key").map(String::as_str), Some("value"));
-        assert_eq!(converted.mod_time, DateTime::<Utc>::from_timestamp(42, 0));
-        assert_eq!(converted.restore_expires, DateTime::<Utc>::from_timestamp(1_700_000_000, 0));
+        assert_eq!(converted.mod_time, Timestamp::new(42, 0).ok());
+        assert_eq!(converted.restore_expires, Timestamp::new(1_700_000_000, 0).ok());
         assert_eq!(converted.storage_class.as_deref(), Some("GLACIER"));
         assert_eq!(converted.transitioned_tier.as_deref(), Some("DEEP_ARCHIVE"));
     }

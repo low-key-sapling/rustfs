@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod account;
+pub(crate) mod account_audit;
 pub mod account_info;
 pub mod audit;
 mod audit_runtime_config;
@@ -39,7 +41,9 @@ pub mod kms_key_lifecycle;
 pub mod kms_key_metadata;
 pub mod kms_keys;
 pub mod kms_management;
+pub mod kms_rekey;
 pub mod metrics;
+pub mod mfa;
 pub mod module_switch;
 mod notify_runtime_access;
 pub mod object_data_cache;
@@ -64,10 +68,32 @@ mod target_descriptor;
 pub mod tier;
 pub mod tls_debug;
 pub mod trace;
+pub mod usage_prefix;
 pub mod user;
 pub mod user_iam;
 pub mod user_lifecycle;
 pub mod user_policy_binding;
+
+/// Serialize `payload` as the body of an admin JSON response.
+///
+/// Routes reached through the `/minio/admin` compat prefix carry an encrypted
+/// body; `encode_compatible_admin_payload` decides that from the path, so every
+/// handler must go through here rather than serializing directly, or a
+/// MinIO client gets plaintext where it expects ciphertext.
+pub(crate) fn admin_json_response<T: serde::Serialize>(
+    path: &str,
+    secret_key: &str,
+    status: http::StatusCode,
+    payload: &T,
+) -> s3s::S3Result<s3s::S3Response<(http::StatusCode, s3s::Body)>> {
+    let body = serde_json::to_vec(payload)
+        .map_err(|e| s3s::S3Error::with_message(s3s::S3ErrorCode::InternalError, format!("serialize error: {e}")))?;
+    let (body, content_type) = crate::admin::utils::encode_compatible_admin_payload(path, secret_key, body)?;
+
+    let mut header = hyper::HeaderMap::new();
+    header.insert(s3s::header::CONTENT_TYPE, content_type.parse().expect("valid header value"));
+    Ok(s3s::S3Response::with_headers((status, s3s::Body::from(body)), header))
+}
 
 pub(crate) async fn supervise_admin_mutation<T>(
     operation: &'static str,
@@ -119,11 +145,13 @@ mod tests {
         let _tls_status_handler = tls_debug::TlsStatusHandler {};
         let _heal_handler = heal::HealHandler {};
         let _bg_heal_handler = heal::BackgroundHealStatusHandler {};
+        let _replacement_recovery_status_handler = heal::ReplacementRecoveryStatusHandler {};
         let _replication_metrics_handler = replication::GetReplicationMetricsHandler {};
         let _set_remote_target_handler = replication::SetRemoteTargetHandler {};
         let _list_remote_target_handler = replication::ListRemoteTargetHandler {};
         let _remove_remote_target_handler = replication::RemoveRemoteTargetHandler {};
         let _scanner_status_handler = scanner::ScannerStatusHandler {};
+        let _scanner_cycle_state_reset_handler = scanner::ScannerCycleStateResetHandler {};
         let _ilm_expiry_status_handler = scanner::IlmExpiryStatusHandler {};
         let _manual_transition_handler = ilm_transition::ManualTransitionRunHandler {};
         let _manual_transition_status_handler = ilm_transition::ManualTransitionJobStatusHandler {};

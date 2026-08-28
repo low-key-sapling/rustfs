@@ -1,9 +1,9 @@
 %global _enable_debug_packages 0
 %global _empty_manifest_terminate_build 0
-%global prerelease beta.12
+%global prerelease rc.4
 Name:           rustfs
 Version:        1.0.0
-Release:        beta.12
+Release:        rc.4
 Summary:       ZfFS S3-compatible distributed object storage
 
 License:        Apache-2.0
@@ -60,6 +60,18 @@ ln -s zffs %buildroot/usr/bin/rustfs
 %_bindir/rustfs
 
 %changelog
+* Thu Aug 27 2026 overtrue <anzhengchao@gmail.com>
+- Update RPM package to RustFS 1.0.0-rc.4
+
+* Thu Aug 20 2026 overtrue <anzhengchao@gmail.com>
+- Update RPM package to RustFS 1.0.0-rc.3
+
+* Fri Aug 14 2026 overtrue <anzhengchao@gmail.com>
+- Update RPM package to RustFS 1.0.0-rc.2
+
+* Sat Aug 08 2026 overtrue <anzhengchao@gmail.com>
+- Update RPM package to RustFS 1.0.0-rc.1
+
 * Thu Jul 30 2026 overtrue <anzhengchao@gmail.com>
 - Update RPM package to RustFS 1.0.0-beta.12
 

@@ -14,6 +14,7 @@
 
 use super::runtime_sources;
 use crate::admin::console::is_console_path;
+use crate::app::object_traffic_health::ObjectTrafficHealth;
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
 use crate::server::cors;
@@ -25,6 +26,7 @@ use crate::server::{
     build_health_response_parts, collect_probe_readiness, has_path_prefix, is_admin_path, is_table_catalog_path,
     kms_probe_staleness_limit, kms_ready_from_probe,
 };
+use crate::shared_types::ReadinessDegradedReason;
 use crate::storage_api::server::layer::apply_cors_headers;
 use crate::storage_api::server::layer::request_context::{RequestContext, extract_request_id_from_headers, spawn_traced};
 use bytes::{Bytes, BytesMut};
@@ -35,6 +37,8 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use pin_project_lite::pin_project;
 use quick_xml::events::Event;
+use rustfs_common::GlobalReadiness;
+use rustfs_obs::HTTP_SERVER_LOG_TARGET;
 #[cfg(feature = "swift")]
 use rustfs_protocols::swift::SwiftRouter;
 use rustfs_trusted_proxies::ClientInfo;
@@ -44,13 +48,14 @@ use s3s::S3ErrorCode;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tower::{Layer, Service};
-use tracing::{debug, error, info, warn};
+use tracing::{Level, debug, error, info, warn};
 use url::form_urlencoded;
 
 const HTTP_REQUEST_COMPLETED_EVENT: &str = "http_request_completed";
@@ -329,9 +334,10 @@ struct RequestLogContext {
     request_id: String,
     trace_id: Option<String>,
     span_id: Option<String>,
-    peer_addr: String,
-    method: String,
-    uri: String,
+    client_ip: Option<IpAddr>,
+    peer_addr: Option<SocketAddr>,
+    method: Method,
+    uri: Uri,
     request_started_at: Option<RequestContext>,
     fallback_start: Instant,
 }
@@ -343,20 +349,14 @@ impl RequestLogContext {
             .as_ref()
             .map(|ctx| ctx.request_id.clone())
             .unwrap_or_else(|| extract_request_id_from_headers(req.headers()));
-        let peer_addr = req
-            .extensions()
-            .get::<ClientInfo>()
-            .map(|info| info.real_ip.to_string())
-            .or_else(|| req.extensions().get::<RemoteAddr>().map(|addr| addr.0.to_string()))
-            .unwrap_or_else(|| "unknown".to_string());
-
         Self {
             request_id,
             trace_id: request_context.as_ref().and_then(|ctx| ctx.trace_id.clone()),
             span_id: request_context.as_ref().and_then(|ctx| ctx.span_id.clone()),
-            peer_addr,
-            method: req.method().to_string(),
-            uri: redact_sensitive_uri_query(req.uri()),
+            client_ip: req.extensions().get::<ClientInfo>().map(|info| info.real_ip),
+            peer_addr: req.extensions().get::<RemoteAddr>().map(|addr| addr.0),
+            method: req.method().clone(),
+            uri: req.uri().clone(),
             request_started_at: request_context,
             fallback_start: Instant::now(),
         }
@@ -381,6 +381,40 @@ impl RequestLogContext {
         }
     }
 
+    fn peer_addr(&self) -> String {
+        self.client_ip
+            .map(|addr| addr.to_string())
+            .or_else(|| self.peer_addr.map(|addr| addr.to_string()))
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    fn redacted_uri(&self) -> String {
+        redact_sensitive_uri_query(&self.uri)
+    }
+
+    fn log_slow_inflight(&self) {
+        if !tracing::enabled!(target: HTTP_SERVER_LOG_TARGET, Level::WARN) {
+            return;
+        }
+        warn!(
+            target: HTTP_SERVER_LOG_TARGET,
+            event = HTTP_REQUEST_INFLIGHT_SLOW_EVENT,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_HTTP,
+            request_id = %self.request_id,
+            trace_id = %self.trace_id.as_deref().unwrap_or("unknown"),
+            span_id = %self.span_id.as_deref().unwrap_or("unknown"),
+            peer_addr = %self.peer_addr(),
+            method = %self.method.as_str(),
+            uri = %self.redacted_uri(),
+            duration_ms = self.duration_ms(),
+            active_requests = active_http_requests(),
+            threshold_ms = HTTP_REQUEST_INFLIGHT_WARN_THRESHOLD.as_millis() as u64,
+            state = "response_pending",
+            "HTTP request remains in flight"
+        );
+    }
+
     fn log_response<ResBody>(&self, response: &Response<ResBody>) {
         let duration_ms = self.duration_ms();
         let status = response.status();
@@ -390,32 +424,40 @@ impl RequestLogContext {
         let span_id = self.span_id.as_deref().unwrap_or("unknown");
 
         if status.is_server_error() {
+            if !tracing::enabled!(target: HTTP_SERVER_LOG_TARGET, Level::ERROR) {
+                return;
+            }
             error!(
+                target: HTTP_SERVER_LOG_TARGET,
                 event = HTTP_REQUEST_COMPLETED_EVENT,
                 component = LOG_COMPONENT_SERVER,
                 subsystem = LOG_SUBSYSTEM_HTTP,
                 request_id = %self.request_id,
                 trace_id = %trace_id,
                 span_id = %span_id,
-                peer_addr = %self.peer_addr,
-                method = %self.method,
-                uri = %self.uri,
+                peer_addr = %self.peer_addr(),
+                method = %self.method.as_str(),
+                uri = %self.redacted_uri(),
                 status_code,
                 duration_ms,
                 result,
                 "HTTP request completed"
             );
         } else {
+            if !tracing::enabled!(target: HTTP_SERVER_LOG_TARGET, Level::INFO) {
+                return;
+            }
             info!(
+                target: HTTP_SERVER_LOG_TARGET,
                 event = HTTP_REQUEST_COMPLETED_EVENT,
                 component = LOG_COMPONENT_SERVER,
                 subsystem = LOG_SUBSYSTEM_HTTP,
                 request_id = %self.request_id,
                 trace_id = %trace_id,
                 span_id = %span_id,
-                peer_addr = %self.peer_addr,
-                method = %self.method,
-                uri = %self.uri,
+                peer_addr = %self.peer_addr(),
+                method = %self.method.as_str(),
+                uri = %self.redacted_uri(),
                 status_code,
                 duration_ms,
                 result,
@@ -429,15 +471,16 @@ impl RequestLogContext {
         E: std::fmt::Display,
     {
         error!(
+            target: HTTP_SERVER_LOG_TARGET,
             event = HTTP_REQUEST_FAILED_EVENT,
             component = LOG_COMPONENT_SERVER,
             subsystem = LOG_SUBSYSTEM_HTTP,
             request_id = %self.request_id,
             trace_id = %self.trace_id.as_deref().unwrap_or("unknown"),
             span_id = %self.span_id.as_deref().unwrap_or("unknown"),
-            peer_addr = %self.peer_addr,
-            method = %self.method,
-            uri = %self.uri,
+            peer_addr = %self.peer_addr(),
+            method = %self.method.as_str(),
+            uri = %self.redacted_uri(),
             duration_ms = self.duration_ms(),
             result = "service_error",
             error = %error,
@@ -464,39 +507,27 @@ where
     fn call(&mut self, req: HttpRequest<B>) -> Self::Future {
         let context = RequestLogContext::from_request(&req);
         let mut inner = self.inner.clone();
-        let watchdog = CancellationToken::new();
-        let watchdog_context = context.clone();
-
-        spawn_traced({
-            let watchdog = watchdog.clone();
-            async move {
-                tokio::select! {
-                    _ = watchdog.cancelled() => {}
-                    _ = tokio::time::sleep(HTTP_REQUEST_INFLIGHT_WARN_THRESHOLD) => {
-                        warn!(
-                            event = HTTP_REQUEST_INFLIGHT_SLOW_EVENT,
-                            component = LOG_COMPONENT_SERVER,
-                            subsystem = LOG_SUBSYSTEM_HTTP,
-                            request_id = %watchdog_context.request_id,
-                            trace_id = %watchdog_context.trace_id.as_deref().unwrap_or("unknown"),
-                            span_id = %watchdog_context.span_id.as_deref().unwrap_or("unknown"),
-                            peer_addr = %watchdog_context.peer_addr,
-                            method = %watchdog_context.method,
-                            uri = %watchdog_context.uri,
-                            duration_ms = watchdog_context.duration_ms(),
-                            active_requests = active_http_requests(),
-                            threshold_ms = HTTP_REQUEST_INFLIGHT_WARN_THRESHOLD.as_millis() as u64,
-                            state = "response_pending",
-                            "HTTP request remains in flight"
-                        );
+        let watchdog = tracing::enabled!(target: HTTP_SERVER_LOG_TARGET, Level::WARN).then(CancellationToken::new);
+        if let Some(watchdog) = watchdog.as_ref() {
+            spawn_traced({
+                let watchdog = watchdog.clone();
+                let watchdog_context = context.clone();
+                async move {
+                    tokio::select! {
+                        _ = watchdog.cancelled() => {}
+                        _ = tokio::time::sleep(HTTP_REQUEST_INFLIGHT_WARN_THRESHOLD) => {
+                            watchdog_context.log_slow_inflight();
+                        }
                     }
                 }
-            }
-        });
+            });
+        }
 
         Box::pin(async move {
             let result = inner.call(req).await;
-            watchdog.cancel();
+            if let Some(watchdog) = watchdog {
+                watchdog.cancel();
+            }
             match &result {
                 Ok(response) => context.log_response(response),
                 Err(error) => context.log_failure(error),
@@ -718,11 +749,12 @@ pub struct S3ErrorMessageCompatService<S> {
     inner: S,
 }
 
-impl<S, RestBody, GrpcBody> Service<HttpRequest<Incoming>> for S3ErrorMessageCompatService<S>
+impl<S, ReqBody, RestBody, GrpcBody> Service<HttpRequest<ReqBody>> for S3ErrorMessageCompatService<S>
 where
-    S: Service<HttpRequest<Incoming>, Response = Response<HybridBody<RestBody, GrpcBody>>> + Clone + Send + 'static,
+    S: Service<HttpRequest<ReqBody>, Response = Response<HybridBody<RestBody, GrpcBody>>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Send + 'static,
+    ReqBody: Send + 'static,
     RestBody: Body<Data = Bytes> + From<Bytes> + Send + 'static,
     RestBody::Error: Into<S::Error> + Send + 'static,
     GrpcBody: Send + 'static,
@@ -735,28 +767,27 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: HttpRequest<Incoming>) -> Self::Future {
+    fn call(&mut self, req: HttpRequest<ReqBody>) -> Self::Future {
         let is_sts_query =
             req.method() == Method::POST && req.uri().path() == "/" && req.extensions().get::<StsQueryRequest>().is_some();
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
             let response = inner.call(req).await?;
+            if is_sts_query || response.status() != StatusCode::FORBIDDEN || !is_xml_response(response.headers()) {
+                return Ok(response);
+            }
+
             let (parts, body) = response.into_parts();
-            let should_fix = !is_sts_query && parts.status == StatusCode::FORBIDDEN && is_xml_response(&parts.headers);
 
             let response = match body {
                 HybridBody::Rest { rest_body } => {
-                    if !should_fix {
-                        Response::from_parts(parts, HybridBody::Rest { rest_body })
-                    } else {
-                        let (rest_body, changed) = fix_s3_error_message_in_xml(rest_body).await.map_err(Into::into)?;
-                        let mut parts = parts;
-                        if changed {
-                            parts.headers.remove(http::header::CONTENT_LENGTH);
-                        }
-                        Response::from_parts(parts, HybridBody::Rest { rest_body })
+                    let (rest_body, changed) = fix_s3_error_message_in_xml(rest_body).await.map_err(Into::into)?;
+                    let mut parts = parts;
+                    if changed {
+                        parts.headers.remove(http::header::CONTENT_LENGTH);
                     }
+                    Response::from_parts(parts, HybridBody::Rest { rest_body })
                 }
                 HybridBody::Grpc { grpc_body } => Response::from_parts(parts, HybridBody::Grpc { grpc_body }),
             };
@@ -857,11 +888,12 @@ pub struct IcebergRestErrorCompatService<S> {
     inner: S,
 }
 
-impl<S, RestBody, GrpcBody> Service<HttpRequest<Incoming>> for IcebergRestErrorCompatService<S>
+impl<S, ReqBody, RestBody, GrpcBody> Service<HttpRequest<ReqBody>> for IcebergRestErrorCompatService<S>
 where
-    S: Service<HttpRequest<Incoming>, Response = Response<HybridBody<RestBody, GrpcBody>>> + Clone + Send + 'static,
+    S: Service<HttpRequest<ReqBody>, Response = Response<HybridBody<RestBody, GrpcBody>>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Send + 'static,
+    ReqBody: Send + 'static,
     RestBody: Body<Data = Bytes> + From<Bytes> + Send + 'static,
     RestBody::Error: Into<S::Error> + Send + 'static,
     GrpcBody: Send + 'static,
@@ -874,18 +906,21 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: HttpRequest<Incoming>) -> Self::Future {
+    fn call(&mut self, req: HttpRequest<ReqBody>) -> Self::Future {
         let catalog_path =
             (req.method() != Method::HEAD && is_table_catalog_path(req.uri().path())).then(|| req.uri().path().to_string());
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
             let response = inner.call(req).await?;
+            if catalog_path.is_none() || response.status().is_success() || !is_xml_response(response.headers()) {
+                return Ok(response);
+            }
+
             let (parts, body) = response.into_parts();
-            let should_convert = catalog_path.is_some() && !parts.status.is_success() && is_xml_response(&parts.headers);
 
             let response = match body {
-                HybridBody::Rest { rest_body } if should_convert => {
+                HybridBody::Rest { rest_body } => {
                     let (rest_body, converted_status) = convert_iceberg_error_in_xml(
                         rest_body,
                         parts.status,
@@ -903,7 +938,6 @@ where
                     }
                     Response::from_parts(parts, HybridBody::Rest { rest_body })
                 }
-                HybridBody::Rest { rest_body } => Response::from_parts(parts, HybridBody::Rest { rest_body }),
                 HybridBody::Grpc { grpc_body } => Response::from_parts(parts, HybridBody::Grpc { grpc_body }),
             };
 
@@ -1016,11 +1050,12 @@ pub struct ObjectAttributesEtagFixService<S> {
     inner: S,
 }
 
-impl<S, RestBody, GrpcBody> Service<HttpRequest<Incoming>> for ObjectAttributesEtagFixService<S>
+impl<S, ReqBody, RestBody, GrpcBody> Service<HttpRequest<ReqBody>> for ObjectAttributesEtagFixService<S>
 where
-    S: Service<HttpRequest<Incoming>, Response = Response<HybridBody<RestBody, GrpcBody>>> + Clone + Send + 'static,
+    S: Service<HttpRequest<ReqBody>, Response = Response<HybridBody<RestBody, GrpcBody>>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Send + 'static,
+    ReqBody: Send + 'static,
     RestBody: Body<Data = Bytes> + From<Bytes> + Send + 'static,
     RestBody::Error: Into<S::Error> + Send + 'static,
     GrpcBody: Send + 'static,
@@ -1033,27 +1068,26 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: HttpRequest<Incoming>) -> Self::Future {
+    fn call(&mut self, req: HttpRequest<ReqBody>) -> Self::Future {
         let is_target = is_object_attributes_request(&req);
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
             let response = inner.call(req).await?;
+            if !is_target || !response.status().is_success() || !is_xml_response(response.headers()) {
+                return Ok(response);
+            }
+
             let (parts, body) = response.into_parts();
-            let should_fix = is_target && parts.status.is_success() && is_xml_response(&parts.headers);
 
             let response = match body {
                 HybridBody::Rest { rest_body } => {
-                    if !should_fix {
-                        Response::from_parts(parts, HybridBody::Rest { rest_body })
-                    } else {
-                        let rest_body = fix_object_attributes_etag_in_xml(rest_body).await.map_err(Into::into)?;
+                    let rest_body = fix_object_attributes_etag_in_xml(rest_body).await.map_err(Into::into)?;
 
-                        let mut parts = parts;
-                        parts.headers.remove(http::header::CONTENT_LENGTH);
+                    let mut parts = parts;
+                    parts.headers.remove(http::header::CONTENT_LENGTH);
 
-                        Response::from_parts(parts, HybridBody::Rest { rest_body })
-                    }
+                    Response::from_parts(parts, HybridBody::Rest { rest_body })
                 }
                 HybridBody::Grpc { grpc_body } => Response::from_parts(parts, HybridBody::Grpc { grpc_body }),
             };
@@ -1115,12 +1149,11 @@ where
 
         Box::pin(async move {
             let response = inner.call(req).await?;
-            let (mut parts, body) = response.into_parts();
-
-            if !is_bodyless_status(parts.status) {
-                return Ok(Response::from_parts(parts, body));
+            if !is_bodyless_status(response.status()) {
+                return Ok(response);
             }
 
+            let (mut parts, body) = response.into_parts();
             let response = match body {
                 HybridBody::Rest { .. } => {
                     parts.headers.remove(http::header::CONTENT_LENGTH);
@@ -1210,19 +1243,34 @@ where
 }
 
 #[derive(Clone)]
-pub struct PublicHealthEndpointLayer;
+pub struct PublicHealthEndpointLayer {
+    server_ctx: Arc<crate::runtime_sources::ServerContextSlot>,
+    readiness: Arc<GlobalReadiness>,
+}
+
+impl PublicHealthEndpointLayer {
+    pub fn new(server_ctx: Arc<crate::runtime_sources::ServerContextSlot>, readiness: Arc<GlobalReadiness>) -> Self {
+        Self { server_ctx, readiness }
+    }
+}
 
 impl<S> Layer<S> for PublicHealthEndpointLayer {
     type Service = PublicHealthEndpointService<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        PublicHealthEndpointService { inner }
+        PublicHealthEndpointService {
+            inner,
+            server_ctx: Arc::clone(&self.server_ctx),
+            readiness: Arc::clone(&self.readiness),
+        }
     }
 }
 
 #[derive(Clone)]
 pub struct PublicHealthEndpointService<S> {
     inner: S,
+    server_ctx: Arc<crate::runtime_sources::ServerContextSlot>,
+    readiness: Arc<GlobalReadiness>,
 }
 
 fn health_endpoint_enabled() -> bool {
@@ -1290,6 +1338,8 @@ async fn health_kms_ready() -> bool {
 async fn build_public_health_http_response<RestBody, GrpcBody>(
     method: Method,
     path: String,
+    object_traffic_health: Option<Arc<ObjectTrafficHealth>>,
+    readiness: &GlobalReadiness,
 ) -> Response<HybridBody<RestBody, GrpcBody>>
 where
     RestBody: From<Bytes>,
@@ -1314,7 +1364,15 @@ where
             .expect("failed to build health busy response");
     }
 
-    let readiness_report = collect_probe_readiness(probe).await;
+    let mut readiness_report = collect_probe_readiness(probe, object_traffic_health.as_deref()).await;
+    if probe == HealthProbe::Readiness
+        && !readiness.is_ready()
+        && let Some(report) = readiness_report.as_mut()
+    {
+        report
+            .degraded_reasons
+            .push(ReadinessDegradedReason::StartupFinalizationPending);
+    }
     let kms_ready = if probe == HealthProbe::Readiness && health_compat_kms_ready_check_enabled() {
         Some(health_kms_ready().await)
     } else {
@@ -1360,7 +1418,14 @@ where
         if is_public_health_endpoint_request(method, path) {
             let method = method.clone();
             let path = path.to_owned();
-            return Box::pin(async move { Ok(build_public_health_http_response(method, path).await) });
+            let object_traffic_health = self
+                .server_ctx
+                .installed_app_context()
+                .map(|context| context.object_traffic_health());
+            let readiness = Arc::clone(&self.readiness);
+            return Box::pin(async move {
+                Ok(build_public_health_http_response(method, path, object_traffic_health, readiness.as_ref()).await)
+            });
         }
 
         let mut inner = self.inner.clone();
@@ -1605,13 +1670,8 @@ fn add_sts_response_metadata(xml: &str, request_id: &str) -> Option<Bytes> {
                     if !is_sts_success_response_tag(element.local_name().as_ref()) {
                         return None;
                     }
-                    root_prefix = element
-                        .name()
-                        .prefix()
-                        .map(|prefix| std::str::from_utf8(prefix.as_ref()).map(str::to_owned))
-                        .transpose()
-                        .ok()?;
-                } else if depth == 1 && element.local_name().as_ref() == STS_RESPONSE_METADATA_TAG.as_bytes() {
+                    root_prefix = element.name().prefix().map(|prefix| prefix.as_ref().to_owned());
+                } else if depth == 1 && element.local_name().as_ref() == STS_RESPONSE_METADATA_TAG {
                     return None;
                 }
                 depth += 1;
@@ -1620,7 +1680,7 @@ fn add_sts_response_metadata(xml: &str, request_id: &str) -> Option<Bytes> {
                 if depth == 0 {
                     return None;
                 }
-                if depth == 1 && element.local_name().as_ref() == STS_RESPONSE_METADATA_TAG.as_bytes() {
+                if depth == 1 && element.local_name().as_ref() == STS_RESPONSE_METADATA_TAG {
                     return None;
                 }
             }
@@ -1654,8 +1714,8 @@ fn add_sts_response_metadata(xml: &str, request_id: &str) -> Option<Bytes> {
     }
 }
 
-fn is_sts_success_response_tag(tag: &[u8]) -> bool {
-    STS_SUCCESS_RESPONSE_TAGS.iter().any(|candidate| candidate.as_bytes() == tag)
+fn is_sts_success_response_tag(tag: &str) -> bool {
+    STS_SUCCESS_RESPONSE_TAGS.contains(&tag)
 }
 
 fn wrap_sts_error_response(xml: &str, status: StatusCode, request_id: &str) -> String {
@@ -1756,7 +1816,7 @@ fn strip_quotes_from_first_etag(xml: String) -> String {
     fixed
 }
 
-fn is_object_attributes_request(req: &HttpRequest<Incoming>) -> bool {
+fn is_object_attributes_request<B>(req: &HttpRequest<B>) -> bool {
     if req.method() != Method::GET {
         return false;
     }
@@ -1921,11 +1981,12 @@ fn apply_bucket_cors_result(response_headers: &mut HeaderMap, bucket_cors_header
     }
 }
 
-impl<S, ResBody> Service<HttpRequest<Incoming>> for ConditionalCorsService<S>
+impl<S, ReqBody, ResBody> Service<HttpRequest<ReqBody>> for ConditionalCorsService<S>
 where
-    S: Service<HttpRequest<Incoming>, Response = Response<ResBody>> + Clone + Send + 'static,
+    S: Service<HttpRequest<ReqBody>, Response = Response<ResBody>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send + 'static,
+    ReqBody: Send + 'static,
     ResBody: Default + Send + 'static,
 {
     type Response = Response<ResBody>;
@@ -1936,7 +1997,14 @@ where
         self.inner.poll_ready(cx).map_err(Into::into)
     }
 
-    fn call(&mut self, req: HttpRequest<Incoming>) -> Self::Future {
+    fn call(&mut self, req: HttpRequest<ReqBody>) -> Self::Future {
+        let is_options = req.method() == Method::OPTIONS;
+        let has_origin = req.headers().contains_key(cors::standard::ORIGIN);
+        if !is_options && !has_origin {
+            let mut inner = self.inner.clone();
+            return Box::pin(async move { inner.call(req).await.map_err(Into::into) });
+        }
+
         let path = req.uri().path().to_string();
         let method = req.method().clone();
         let request_headers = req.headers().clone();
@@ -1944,7 +2012,7 @@ where
         let is_s3 = ConditionalCorsLayer::is_s3_path(&path);
         let is_root = path == "/";
 
-        if method == Method::OPTIONS {
+        if is_options {
             let has_acrm = request_headers.contains_key(cors::request::ACCESS_CONTROL_REQUEST_METHOD);
 
             if is_root {
@@ -2146,6 +2214,7 @@ mod tests {
     use futures::future::{Ready, ready};
     use http::Request;
     use http_body_util::BodyExt;
+    use http_body_util::Empty;
     use http_body_util::Full;
     use opentelemetry::global;
     use opentelemetry_sdk::propagation::TraceContextPropagator;
@@ -2156,6 +2225,28 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use temp_env::{async_with_vars, with_var};
     use tracing_subscriber::{Registry, fmt::MakeWriter, layer::SubscriberExt};
+
+    fn public_health_layer() -> PublicHealthEndpointLayer {
+        let readiness = Arc::new(GlobalReadiness::new());
+        readiness.mark_stage(rustfs_common::SystemStage::FullReady);
+        PublicHealthEndpointLayer::new(crate::runtime_sources::ServerContextSlot::new(), readiness)
+    }
+
+    async fn public_health_layer_with_tracker(object_traffic_health: Arc<ObjectTrafficHealth>) -> PublicHealthEndpointLayer {
+        let readiness = Arc::new(GlobalReadiness::new());
+        readiness.mark_stage(rustfs_common::SystemStage::FullReady);
+        public_health_layer_with_tracker_and_readiness(object_traffic_health, readiness).await
+    }
+
+    async fn public_health_layer_with_tracker_and_readiness(
+        object_traffic_health: Arc<ObjectTrafficHealth>,
+        readiness: Arc<GlobalReadiness>,
+    ) -> PublicHealthEndpointLayer {
+        let app_context = crate::app::gating_test_env::app_context_with_object_traffic_health(object_traffic_health).await;
+        let server_ctx = crate::runtime_sources::ServerContextSlot::new();
+        assert!(server_ctx.install(app_context));
+        PublicHealthEndpointLayer::new(server_ctx, readiness)
+    }
 
     #[derive(Clone, Debug)]
     struct CaptureService;
@@ -2620,41 +2711,47 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn public_health_endpoint_layer_handles_health_before_inner_service() {
-        async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true"))], async {
-            let inner = CountingHybridService::default();
-            let calls = inner.calls();
-            let mut service = PublicHealthEndpointLayer.layer(inner);
+        async_with_vars(
+            [
+                (rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true")),
+                (rustfs_config::ENV_HEALTH_MINIMAL_RESPONSE_ENABLE, Some("false")),
+            ],
+            async {
+                let inner = CountingHybridService::default();
+                let calls = inner.calls();
+                let mut service = public_health_layer().layer(inner);
 
-            let response = service
-                .call(
-                    Request::builder()
-                        .method(Method::GET)
-                        .uri(HEALTH_PREFIX)
-                        .header(http::header::HOST, "localhost:9000")
-                        .body(Full::<Bytes>::from(Bytes::new()))
-                        .expect("request"),
-                )
-                .await
-                .expect("health response");
+                let response = service
+                    .call(
+                        Request::builder()
+                            .method(Method::GET)
+                            .uri(HEALTH_PREFIX)
+                            .header(http::header::HOST, "localhost:9000")
+                            .body(Full::<Bytes>::from(Bytes::new()))
+                            .expect("request"),
+                    )
+                    .await
+                    .expect("health response");
 
-            assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(calls.load(Ordering::SeqCst), 0);
-            assert_eq!(
-                response
-                    .headers()
-                    .get(http::header::CONTENT_TYPE)
-                    .and_then(|value| value.to_str().ok()),
-                Some("application/json")
-            );
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(http::header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("application/json")
+                );
 
-            let body = BodyExt::collect(response.into_body()).await.expect("body").to_bytes();
-            let payload: serde_json::Value =
-                serde_json::from_slice(&body).expect("public liveness health response should be valid JSON");
-            assert_eq!(payload["status"], "ok");
-            assert_eq!(payload["ready"], true);
-            assert!(payload.get("details").is_none());
-            assert!(payload.get("degradedReasons").is_none());
-        })
+                let body = BodyExt::collect(response.into_body()).await.expect("body").to_bytes();
+                let payload: serde_json::Value =
+                    serde_json::from_slice(&body).expect("public liveness health response should be valid JSON");
+                assert_eq!(payload["status"], "ok");
+                assert!(payload.get("ready").is_none());
+                assert!(payload.get("details").is_none());
+                assert!(payload.get("degradedReasons").is_none());
+            },
+        )
         .await;
     }
 
@@ -2818,7 +2915,7 @@ mod tests {
         async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true"))], async {
             let inner = CountingHybridService::default();
             let calls = inner.calls();
-            let mut service = PublicHealthEndpointLayer.layer(inner);
+            let mut service = public_health_layer().layer(inner);
 
             let response = service
                 .call(
@@ -2846,7 +2943,7 @@ mod tests {
         async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true"))], async {
             let inner = CountingHybridService::default();
             let calls = inner.calls();
-            let mut service = PublicHealthEndpointLayer.layer(inner);
+            let mut service = public_health_layer().layer(inner);
 
             let response = service
                 .call(
@@ -2871,7 +2968,7 @@ mod tests {
         async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true"))], async {
             let inner = CountingHybridService::default();
             let calls = inner.calls();
-            let mut service = PublicHealthEndpointLayer.layer(inner);
+            let mut service = public_health_layer().layer(inner);
 
             let response = service
                 .call(
@@ -2896,7 +2993,7 @@ mod tests {
         async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true"))], async {
             let inner = CountingHybridService::default();
             let calls = inner.calls();
-            let mut service = PublicHealthEndpointLayer.layer(inner);
+            let mut service = public_health_layer().layer(inner);
 
             let response = service
                 .call(
@@ -2920,11 +3017,189 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn public_readiness_waits_for_s3_admission_publication() {
+        async_with_vars(
+            [
+                (rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true")),
+                (rustfs_config::ENV_HEALTH_MINIMAL_RESPONSE_ENABLE, Some("false")),
+            ],
+            async {
+                let object_traffic_health = Arc::new(ObjectTrafficHealth::enabled_for_test(Duration::ZERO));
+                let readiness = Arc::new(GlobalReadiness::new());
+                let inner = CountingHybridService::default();
+                let calls = inner.calls();
+                let mut service = public_health_layer_with_tracker_and_readiness(object_traffic_health, Arc::clone(&readiness))
+                    .await
+                    .layer(inner);
+
+                let response = service
+                    .call(
+                        Request::builder()
+                            .method(Method::GET)
+                            .uri(HEALTH_READY_PATH)
+                            .body(Full::<Bytes>::from(Bytes::new()))
+                            .expect("readiness request before admission publication"),
+                    )
+                    .await
+                    .expect("readiness response before admission publication");
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                let body = BodyExt::collect(response.into_body())
+                    .await
+                    .expect("readiness body before admission publication")
+                    .to_bytes();
+                let payload: serde_json::Value = serde_json::from_slice(&body).expect("readiness JSON");
+                assert_eq!(payload["ready"], false);
+                assert_eq!(payload["details"]["storage"]["ready"], true);
+                assert_eq!(payload["details"]["iam"]["ready"], true);
+                assert_eq!(payload["details"]["lock"]["ready"], true);
+                assert_eq!(payload["degradedReasons"], serde_json::json!(["startup_finalization_pending"]));
+
+                let response = service
+                    .call(
+                        Request::builder()
+                            .method(Method::GET)
+                            .uri(HEALTH_COMPAT_LIVE_PATH)
+                            .body(Full::<Bytes>::from(Bytes::new()))
+                            .expect("liveness request before admission publication"),
+                    )
+                    .await
+                    .expect("liveness response before admission publication");
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = BodyExt::collect(response.into_body())
+                    .await
+                    .expect("liveness body before admission publication")
+                    .to_bytes();
+                let payload: serde_json::Value = serde_json::from_slice(&body).expect("liveness JSON");
+                assert_eq!(payload["status"], "ok");
+                assert!(payload.get("ready").is_none());
+
+                readiness.mark_stage(rustfs_common::SystemStage::FullReady);
+                let response = service
+                    .call(
+                        Request::builder()
+                            .method(Method::HEAD)
+                            .uri(MINIO_HEALTH_READY_PATH)
+                            .body(Full::<Bytes>::from(Bytes::new()))
+                            .expect("readiness request after admission publication"),
+                    )
+                    .await
+                    .expect("readiness response after admission publication");
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn public_readiness_aliases_use_the_installed_object_progress() {
+        async_with_vars(
+            [
+                (rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true")),
+                (rustfs_config::ENV_HEALTH_MINIMAL_RESPONSE_ENABLE, Some("false")),
+            ],
+            async {
+                let object_traffic_health = Arc::new(ObjectTrafficHealth::enabled_for_test(Duration::ZERO));
+                let stalled = object_traffic_health
+                    .track_read_storage()
+                    .expect("read tracking must be enabled");
+                let inner = CountingHybridService::default();
+                let calls = inner.calls();
+                let mut service = public_health_layer_with_tracker(Arc::clone(&object_traffic_health))
+                    .await
+                    .layer(inner);
+
+                let response = service
+                    .call(
+                        Request::builder()
+                            .method(Method::GET)
+                            .uri(HEALTH_READY_PATH)
+                            .body(Full::<Bytes>::from(Bytes::new()))
+                            .expect("canonical readiness request"),
+                    )
+                    .await
+                    .expect("canonical readiness response");
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                let body = BodyExt::collect(response.into_body())
+                    .await
+                    .expect("readiness body")
+                    .to_bytes();
+                let payload: serde_json::Value = serde_json::from_slice(&body).expect("readiness JSON");
+                assert_eq!(payload["ready"], false);
+                assert_eq!(payload["degradedReasons"], serde_json::json!(["object_read_stalled"]));
+
+                let response = service
+                    .call(
+                        Request::builder()
+                            .method(Method::HEAD)
+                            .uri(MINIO_HEALTH_READY_PATH)
+                            .body(Full::<Bytes>::from(Bytes::new()))
+                            .expect("MinIO readiness request"),
+                    )
+                    .await
+                    .expect("MinIO readiness response");
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                assert!(
+                    BodyExt::collect(response.into_body())
+                        .await
+                        .expect("HEAD body")
+                        .to_bytes()
+                        .is_empty()
+                );
+
+                let response = service
+                    .call(
+                        Request::builder()
+                            .method(Method::GET)
+                            .uri(HEALTH_COMPAT_LIVE_PATH)
+                            .body(Full::<Bytes>::from(Bytes::new()))
+                            .expect("liveness request"),
+                    )
+                    .await
+                    .expect("liveness response");
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = BodyExt::collect(response.into_body())
+                    .await
+                    .expect("liveness body")
+                    .to_bytes();
+                let payload: serde_json::Value = serde_json::from_slice(&body).expect("liveness JSON");
+                assert_eq!(payload["status"], "ok");
+                assert!(payload.get("ready").is_none());
+                assert!(payload.get("degradedReasons").is_none());
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+                drop(stalled);
+                let response = service
+                    .call(
+                        Request::builder()
+                            .method(Method::HEAD)
+                            .uri(HEALTH_READY_PATH)
+                            .body(Full::<Bytes>::from(Bytes::new()))
+                            .expect("recovered readiness request"),
+                    )
+                    .await
+                    .expect("recovered readiness response");
+                assert_eq!(response.status(), StatusCode::OK);
+                assert!(
+                    BodyExt::collect(response.into_body())
+                        .await
+                        .expect("HEAD body")
+                        .to_bytes()
+                        .is_empty()
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn public_health_endpoint_layer_handles_minio_health_cluster_before_inner_service() {
         async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true"))], async {
             let inner = CountingHybridService::default();
             let calls = inner.calls();
-            let mut service = PublicHealthEndpointLayer.layer(inner);
+            let mut service = public_health_layer().layer(inner);
 
             let response = service
                 .call(
@@ -2949,7 +3224,7 @@ mod tests {
         async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true"))], async {
             let inner = CountingHybridService::default();
             let calls = inner.calls();
-            let mut service = PublicHealthEndpointLayer.layer(inner);
+            let mut service = public_health_layer().layer(inner);
 
             let response = service
                 .call(
@@ -2974,7 +3249,7 @@ mod tests {
         async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("false"))], async {
             let inner = CountingHybridService::default();
             let calls = inner.calls();
-            let mut service = PublicHealthEndpointLayer.layer(inner);
+            let mut service = public_health_layer().layer(inner);
 
             let response = service
                 .call(
@@ -2999,7 +3274,7 @@ mod tests {
         async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("false"))], async {
             let inner = CountingHybridService::default();
             let calls = inner.calls();
-            let mut service = PublicHealthEndpointLayer.layer(inner);
+            let mut service = public_health_layer().layer(inner);
 
             let response = service
                 .call(
@@ -3041,7 +3316,7 @@ mod tests {
         async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("false"))], async {
             let inner = CountingHybridService::default();
             let calls = inner.calls();
-            let mut service = PublicHealthEndpointLayer.layer(inner);
+            let mut service = public_health_layer().layer(inner);
 
             let response = service
                 .call(
@@ -3064,7 +3339,7 @@ mod tests {
     async fn public_health_endpoint_layer_forwards_non_health_requests() {
         let inner = CountingHybridService::default();
         let calls = inner.calls();
-        let mut service = PublicHealthEndpointLayer.layer(inner);
+        let mut service = public_health_layer().layer(inner);
 
         let response = service
             .call(
@@ -3633,6 +3908,188 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct FixedHybridResponse {
+        status: StatusCode,
+        body: Bytes,
+        content_type: &'static str,
+    }
+
+    impl<B: Send + 'static> Service<Request<B>> for FixedHybridResponse {
+        type Response = Response<HybridBody<Full<Bytes>, Empty<Bytes>>>;
+        type Error = Infallible;
+        type Future = Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: Request<B>) -> Self::Future {
+            let body = self.body.clone();
+            ready(Ok(Response::builder()
+                .status(self.status)
+                .header(http::header::CONTENT_TYPE, self.content_type)
+                .header(http::header::CONTENT_LENGTH, body.len().to_string())
+                .body(HybridBody::Rest {
+                    rest_body: Full::from(body),
+                })
+                .expect("fixed hybrid response")))
+        }
+    }
+
+    async fn collect_hybrid_response(
+        response: Response<HybridBody<Full<Bytes>, Empty<Bytes>>>,
+    ) -> (StatusCode, HeaderMap, String) {
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = BodyExt::collect(response.into_body())
+            .await
+            .expect("collect hybrid body")
+            .to_bytes();
+        (
+            status,
+            headers,
+            String::from_utf8(body.to_vec()).expect("hybrid response body should be UTF-8"),
+        )
+    }
+
+    #[tokio::test]
+    async fn s3_error_message_compat_fixes_regular_forbidden_xml() {
+        let body = Bytes::from_static(b"<Error><Code>SignatureDoesNotMatch</Code></Error>");
+        let mut service = S3ErrorMessageCompatLayer.layer(FixedHybridResponse {
+            status: StatusCode::FORBIDDEN,
+            body,
+            content_type: "application/xml",
+        });
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/bucket/object")
+            .body(())
+            .expect("request");
+
+        let response = service.call(request).await.expect("service response");
+        let (status, headers, body) = collect_hybrid_response(response).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(headers.get(http::header::CONTENT_LENGTH).is_none());
+        assert!(body.contains("<Message>"));
+    }
+
+    #[tokio::test]
+    async fn s3_error_message_compat_leaves_sts_query_response_unchanged() {
+        let input = Bytes::from_static(b"<Error><Code>SignatureDoesNotMatch</Code></Error>");
+        let mut service = S3ErrorMessageCompatLayer.layer(FixedHybridResponse {
+            status: StatusCode::FORBIDDEN,
+            body: input.clone(),
+            content_type: "application/xml",
+        });
+        let mut request = Request::builder().method(Method::POST).uri("/").body(()).expect("request");
+        request.extensions_mut().insert(StsQueryRequest);
+
+        let response = service.call(request).await.expect("service response");
+        let (_status, headers, body) = collect_hybrid_response(response).await;
+
+        let expected_len = input.len().to_string();
+        assert_eq!(
+            headers
+                .get(http::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()),
+            Some(expected_len.as_str())
+        );
+        assert_eq!(body.as_bytes(), input.as_ref());
+    }
+
+    #[tokio::test]
+    async fn iceberg_rest_error_compat_converts_catalog_xml_errors() {
+        let mut service = IcebergRestErrorCompatLayer.layer(FixedHybridResponse {
+            status: StatusCode::NOT_FOUND,
+            body: Bytes::from_static(b"<Error><Code>NoSuchTableException</Code><Message>missing</Message></Error>"),
+            content_type: "application/xml",
+        });
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/iceberg/v1/warehouse/namespaces/ns/tables/events")
+            .body(())
+            .expect("request");
+
+        let response = service.call(request).await.expect("service response");
+        let (status, headers, body) = collect_hybrid_response(response).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(headers.get(http::header::CONTENT_TYPE).unwrap(), "application/json");
+        assert!(headers.get(http::header::CONTENT_LENGTH).is_none());
+        assert!(body.contains("\"type\":\"NoSuchTableException\""));
+    }
+
+    #[tokio::test]
+    async fn iceberg_rest_error_compat_leaves_non_catalog_errors_unchanged() {
+        let input = Bytes::from_static(b"<Error><Code>NoSuchKey</Code><Message>missing</Message></Error>");
+        let mut service = IcebergRestErrorCompatLayer.layer(FixedHybridResponse {
+            status: StatusCode::NOT_FOUND,
+            body: input.clone(),
+            content_type: "application/xml",
+        });
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/bucket/object")
+            .body(())
+            .expect("request");
+
+        let response = service.call(request).await.expect("service response");
+        let (status, headers, body) = collect_hybrid_response(response).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(headers.get(http::header::CONTENT_TYPE).unwrap(), "application/xml");
+        assert_eq!(body.as_bytes(), input.as_ref());
+    }
+
+    #[tokio::test]
+    async fn object_attributes_etag_fix_rewrites_target_response() {
+        let mut service = ObjectAttributesEtagFixLayer.layer(FixedHybridResponse {
+            status: StatusCode::OK,
+            body: Bytes::from_static(b"<GetObjectAttributesOutput><ETag>\"abc\"</ETag></GetObjectAttributesOutput>"),
+            content_type: "application/xml",
+        });
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/bucket/object?attributes")
+            .body(())
+            .expect("request");
+
+        let response = service.call(request).await.expect("service response");
+        let (_status, headers, body) = collect_hybrid_response(response).await;
+
+        assert!(headers.get(http::header::CONTENT_LENGTH).is_none());
+        assert!(body.contains("<ETag>abc</ETag>"));
+    }
+
+    #[tokio::test]
+    async fn object_attributes_etag_fix_leaves_regular_get_unchanged() {
+        let input = Bytes::from_static(b"<GetObjectAttributesOutput><ETag>\"abc\"</ETag></GetObjectAttributesOutput>");
+        let mut service = ObjectAttributesEtagFixLayer.layer(FixedHybridResponse {
+            status: StatusCode::OK,
+            body: input.clone(),
+            content_type: "application/xml",
+        });
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/bucket/object")
+            .body(())
+            .expect("request");
+
+        let response = service.call(request).await.expect("service response");
+        let (_status, headers, body) = collect_hybrid_response(response).await;
+
+        let expected_len = input.len().to_string();
+        assert_eq!(
+            headers
+                .get(http::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()),
+            Some(expected_len.as_str())
+        );
+        assert_eq!(body.as_bytes(), input.as_ref());
+    }
+
+    #[derive(Clone)]
     struct FixedStsResponse {
         status: StatusCode,
         body: Bytes,
@@ -4119,6 +4576,63 @@ mod tests {
         });
     }
 
+    #[derive(Clone)]
+    struct CorsOkService;
+
+    impl<B> Service<Request<B>> for CorsOkService {
+        type Response = Response<Empty<Bytes>>;
+        type Error = Infallible;
+        type Future = Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: Request<B>) -> Self::Future {
+            ready(Ok(Response::builder()
+                .status(StatusCode::OK)
+                .body(Empty::new())
+                .expect("response")))
+        }
+    }
+
+    #[tokio::test]
+    async fn conditional_cors_passthrough_without_origin() {
+        let layer = ConditionalCorsLayer {
+            cors_origins: Some("*".to_string()),
+        };
+        let mut service = layer.layer(CorsOkService);
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/bucket/object")
+            .body(())
+            .expect("request");
+
+        let response = service.call(request).await.expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+    }
+
+    #[tokio::test]
+    async fn conditional_cors_applies_origin_headers() {
+        let layer = ConditionalCorsLayer {
+            cors_origins: Some("*".to_string()),
+        };
+        let mut service = layer.layer(CorsOkService);
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/bucket/object")
+            .header(cors::standard::ORIGIN, "https://example.com")
+            .body(())
+            .expect("request");
+
+        let response = service.call(request).await.expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(), "*");
+    }
+
     #[test]
     fn request_context_layer_populates_context_without_mutating_signed_headers() {
         let mut service = RequestContextLayer.layer(CaptureService);
@@ -4579,9 +5093,9 @@ mod tests {
         assert_eq!(context.request_id, "req-ctx");
         assert_eq!(context.trace_id.as_deref(), Some("trace-123"));
         assert_eq!(context.span_id.as_deref(), Some("span-456"));
-        assert_eq!(context.peer_addr, "127.0.0.1:9000");
-        assert_eq!(context.method, "PUT");
-        assert_eq!(context.uri, "/bucket/object.txt");
+        assert_eq!(context.peer_addr(), "127.0.0.1:9000");
+        assert_eq!(context.method.as_str(), "PUT");
+        assert_eq!(context.redacted_uri(), "/bucket/object.txt");
     }
 
     #[test]
@@ -4594,8 +5108,9 @@ mod tests {
 
         let context = RequestLogContext::from_request(&request);
 
-        assert_eq!(context.uri, "/rustfs/admin/v3/object-zip-downloads/download-id.zip?token=redacted&part=1");
-        assert!(!context.uri.contains("secret-token"));
+        let uri = context.redacted_uri();
+        assert_eq!(uri, "/rustfs/admin/v3/object-zip-downloads/download-id.zip?token=redacted&part=1");
+        assert!(!uri.contains("secret-token"));
     }
 
     #[test]
@@ -4608,8 +5123,9 @@ mod tests {
 
         let context = RequestLogContext::from_request(&request);
 
-        assert_eq!(context.uri, "/minio/admin/v3/object-zip-downloads/download-id.zip?token=redacted&part=1");
-        assert!(!context.uri.contains("secret-token"));
+        let uri = context.redacted_uri();
+        assert_eq!(uri, "/minio/admin/v3/object-zip-downloads/download-id.zip?token=redacted&part=1");
+        assert!(!uri.contains("secret-token"));
     }
 
     #[test]

@@ -12,18 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::HashMap, time::Duration};
-
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::heal_commands::HealResultItem;
-
+/// Bitflag helper for service trace categories.
+///
+/// Each variant occupies a single bit so that a `TraceType` value can represent
+/// an arbitrary combination of categories via bitwise OR.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 pub struct TraceType(u64);
 
 impl TraceType {
-    // Define some constants
     pub const OS: TraceType = TraceType(1 << 0);
     pub const STORAGE: TraceType = TraceType(1 << 1);
     pub const S3: TraceType = TraceType(1 << 2);
@@ -40,15 +38,13 @@ impl TraceType {
     pub const FTP: TraceType = TraceType(1 << 13);
     pub const ILM: TraceType = TraceType(1 << 14);
 
-    // MetricsAll must be last.
+    /// All trace categories combined. Must be updated when adding new variants.
     pub const ALL: TraceType = TraceType((1 << 15) - 1);
 
     pub fn new(t: u64) -> Self {
         Self(t)
     }
-}
 
-impl TraceType {
     pub fn contains(&self, x: &TraceType) -> bool {
         (self.0 & x.0) == x.0
     }
@@ -76,105 +72,38 @@ impl TraceType {
     }
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct TraceInfo {
-    #[serde(rename = "type")]
-    trace_type: u64,
-    #[serde(rename = "nodename")]
-    node_name: String,
-    #[serde(rename = "funcname")]
-    func_name: String,
-    #[serde(rename = "time")]
-    time: DateTime<Utc>,
-    #[serde(rename = "path")]
-    path: String,
-    #[serde(rename = "dur")]
-    duration: Duration,
-    #[serde(rename = "bytes", skip_serializing_if = "Option::is_none")]
-    bytes: Option<i64>,
-    #[serde(rename = "msg", skip_serializing_if = "Option::is_none")]
-    message: Option<String>,
-    #[serde(rename = "error", skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-    #[serde(rename = "custom", skip_serializing_if = "Option::is_none")]
-    custom: Option<HashMap<String, String>>,
-    #[serde(rename = "http", skip_serializing_if = "Option::is_none")]
-    http: Option<TraceHTTPStats>,
-    #[serde(rename = "healResult", skip_serializing_if = "Option::is_none")]
-    heal_result: Option<HealResultItem>,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl TraceInfo {
-    pub fn mask(&self) -> u64 {
-        TraceType::new(self.trace_type).mask()
+    #[test]
+    fn trace_type_contains_and_overlaps() {
+        let mut combined = TraceType::default();
+        combined.merge(&TraceType::S3);
+        combined.merge(&TraceType::HEALING);
+
+        assert!(combined.contains(&TraceType::S3));
+        assert!(combined.contains(&TraceType::HEALING));
+        assert!(!combined.contains(&TraceType::SCANNER));
+        assert!(combined.overlaps(&TraceType::S3));
+        assert!(combined.overlaps(&TraceType::HEALING));
+        assert!(!combined.overlaps(&TraceType::SCANNER));
     }
-}
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct TraceInfoLegacy {
-    trace_info: TraceInfo,
-    #[serde(rename = "request")]
-    req_info: Option<TraceRequestInfo>,
-    #[serde(rename = "response")]
-    resp_info: Option<TraceResponseInfo>,
-    #[serde(rename = "stats")]
-    call_stats: Option<TraceCallStats>,
-    #[serde(rename = "storageStats")]
-    storage_stats: Option<StorageStats>,
-    #[serde(rename = "osStats")]
-    os_stats: Option<OSStats>,
-}
+    #[test]
+    fn trace_type_set_if() {
+        let mut tt = TraceType::default();
+        tt.set_if(true, &TraceType::OS);
+        tt.set_if(false, &TraceType::S3);
+        assert!(tt.contains(&TraceType::OS));
+        assert!(!tt.contains(&TraceType::S3));
+    }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct StorageStats {
-    path: String,
-    duration: Duration,
-}
-
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct OSStats {
-    path: String,
-    duration: Duration,
-}
-
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct TraceHTTPStats {
-    req_info: TraceRequestInfo,
-    resp_info: TraceResponseInfo,
-    call_stats: TraceCallStats,
-}
-
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct TraceCallStats {
-    input_bytes: i32,
-    output_bytes: i32,
-    latency: Duration,
-    time_to_first_byte: Duration,
-}
-
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct TraceRequestInfo {
-    time: DateTime<Utc>,
-    proto: String,
-    method: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    raw_query: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    headers: Option<HashMap<String, String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    body: Option<Vec<u8>>,
-    client: String,
-}
-
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct TraceResponseInfo {
-    time: DateTime<Utc>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    headers: Option<HashMap<String, String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    body: Option<Vec<u8>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    status_code: Option<i32>,
+    #[test]
+    fn trace_type_single_type() {
+        assert!(TraceType::S3.single_type());
+        let mut combined = TraceType::S3;
+        combined.merge(&TraceType::HEALING);
+        assert!(!combined.single_type());
+    }
 }

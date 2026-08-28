@@ -14,7 +14,7 @@
 
 use crate::error::{Error, Result};
 use manager::IamCache;
-use oidc::OidcSys;
+use oidc::{OidcExtraRootCaProvider, OidcSys};
 use std::sync::{Arc, OnceLock};
 use store::object::ObjectStore;
 use sys::IamSys;
@@ -31,6 +31,7 @@ pub mod error;
 pub mod federation;
 pub mod keyring;
 pub mod manager;
+pub mod mfa;
 pub mod oidc;
 pub mod oidc_state;
 mod root_credentials;
@@ -102,7 +103,49 @@ pub(crate) async fn notify_iam_delete_user(access_key: &str) -> Vec<IamNotificat
     }
 }
 
+#[cfg(test)]
+pub(crate) struct LoadUserNotificationProbe {
+    pub(crate) observed: std::sync::Mutex<Option<(String, bool)>>,
+    pub(crate) remaining_failures: std::sync::atomic::AtomicUsize,
+    pub(crate) attempts: std::sync::atomic::AtomicUsize,
+    pub(crate) panic: bool,
+    pub(crate) started: tokio::sync::Notify,
+    pub(crate) release: Option<tokio::sync::Notify>,
+    pub(crate) completed: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static LOAD_USER_NOTIFICATION_PROBE: std::sync::Arc<LoadUserNotificationProbe>;
+}
+
 pub(crate) async fn notify_iam_load_user(access_key: &str, temp: bool) -> Vec<IamNotificationPeerErr> {
+    #[cfg(test)]
+    if let Ok(probe) = LOAD_USER_NOTIFICATION_PROBE.try_with(std::sync::Arc::clone) {
+        probe.attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *probe.observed.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((access_key.to_string(), temp));
+        probe.started.notify_one();
+        if let Some(release) = &probe.release {
+            release.notified().await;
+        }
+        assert!(!probe.panic, "notification probe panic");
+        let should_fail = probe
+            .remaining_failures
+            .fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok();
+        let result = if should_fail {
+            vec![IamNotificationPeerErr {
+                err: Some(IamEcstoreError::other("peer notification failed")),
+            }]
+        } else {
+            Vec::new()
+        };
+        probe.completed.notify_one();
+        return result;
+    }
+
     match runtime_sources::notification_sys() {
         Some(notification_sys) => notification_sys
             .load_user(access_key, temp)
@@ -166,6 +209,15 @@ pub async fn build_iam_sys(ecstore: Arc<IamStore>) -> Result<Arc<IamSys<ObjectSt
 
     // 3. Construct the system interface
     Ok(Arc::new(IamSys::new(cache_manager)))
+}
+
+/// Build an IAM system for an application context and publish the first one
+/// as the ambient compatibility default.
+#[instrument(skip(ecstore))]
+pub async fn init_iam_sys_for_context(ecstore: Arc<IamStore>) -> Result<Arc<IamSys<ObjectStore>>> {
+    let iam_instance = build_iam_sys(ecstore).await?;
+    let _ = IAM_SYS.set(iam_instance.clone());
+    Ok(iam_instance)
 }
 
 #[instrument(skip(ecstore))]
@@ -233,6 +285,23 @@ pub fn get_global_iam_sys() -> Option<Arc<IamSys<ObjectStore>>> {
 
 /// Initialize the global OIDC system. Non-fatal if no OIDC providers are configured.
 pub async fn init_oidc_sys() -> Result<()> {
+    init_oidc_sys_with_extra_root_ca(None).await
+}
+
+/// Initialize the global OIDC system with an additional outbound root CA bundle.
+pub async fn init_oidc_sys_with_extra_root_ca(root_ca_pem: Option<&[u8]>) -> Result<()> {
+    init_oidc_sys_with_extra_root_ca_provider_inner(None, root_ca_pem).await
+}
+
+/// Initialize the global OIDC system with a reload-aware outbound root CA provider.
+pub async fn init_oidc_sys_with_extra_root_ca_provider(extra_root_ca_provider: OidcExtraRootCaProvider) -> Result<()> {
+    init_oidc_sys_with_extra_root_ca_provider_inner(Some(extra_root_ca_provider), None).await
+}
+
+async fn init_oidc_sys_with_extra_root_ca_provider_inner(
+    extra_root_ca_provider: Option<OidcExtraRootCaProvider>,
+    root_ca_pem: Option<&[u8]>,
+) -> Result<()> {
     if OIDC_SYS.get().is_some() {
         debug!(
             event = EVENT_OIDC_STATE,
@@ -252,7 +321,11 @@ pub async fn init_oidc_sys() -> Result<()> {
         "OIDC runtime starting"
     );
 
-    let oidc_sys = match OidcSys::new().await {
+    let oidc_sys_result = match extra_root_ca_provider {
+        Some(provider) => OidcSys::new_with_extra_root_ca_provider(provider).await,
+        None => OidcSys::new_with_extra_root_ca(root_ca_pem).await,
+    };
+    let oidc_sys = match oidc_sys_result {
         Ok(sys) => {
             if sys.has_providers() {
                 debug!(

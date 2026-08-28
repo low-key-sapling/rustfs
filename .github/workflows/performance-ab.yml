@@ -17,27 +17,20 @@
 # Two entry points, honestly scoped:
 #   * schedule (nightly, on main): post-merge detection — catches a regression
 #     within 24h of landing, not before merge.
-#   * pull_request labeled `perf-ab`: opt-in pre-merge gate for a specific PR.
-# The `perf-deliberate-tradeoff` label runs the gate with --allow-regression so
-# a deliberate correctness cost (e.g. the #4221 fsync durability fix) is
-# recorded but does not block (rustfs/backlog#935 correction 1).
+#   * workflow_dispatch: an explicitly selected trusted ref.
+# The dispatch input can run the gate with --allow-regression so a deliberate
+# correctness cost (e.g. the #4221 fsync durability fix) is recorded, not
+# blocked (rustfs/backlog#935 correction 1).
 
-# DISABLED. This workflow is switched off in the repository's Actions settings
-# (state: disabled_manually) and does not run on any trigger, including its cron
-# and workflow_dispatch. That state lives in GitHub's UI and is invisible when
-# reading this file, which has already misled at least one audit — hence this
-# banner. Re-enabling is a UI action; anyone doing so should first check that the
-# workflow still matches the current CI layout. See rustfs/backlog#1603.
-#
 name: Performance A/B
 
 on:
   schedule:
-    - cron: "0 6 * * *" # 06:00 UTC nightly, against main
+    - cron: "31 6 * * *" # 06:31 UTC nightly, against main
   workflow_dispatch:
     inputs:
       duration:
-        description: "warp duration per round (short by default to fit the double-build budget)"
+        description: "warp duration per round"
         required: false
         default: "12s"
         type: string
@@ -46,116 +39,28 @@ on:
         required: false
         default: false
         type: boolean
-  pull_request:
-    types: [labeled, synchronize, reopened]
-  push:
-    # Every main commit pre-builds and caches its release binary (perf-3) so the
-    # nightly A/B restores a ready baseline instead of paying the double build.
-    branches: [main]
-
 permissions:
+  actions: read
   contents: read
-  pull-requests: write
-
-# Per-PR: a new push cancels the previous (up to 90-minute) A/B run instead of
-# stacking them. Nightly schedule and manual dispatch get a unique group and
-# always run to completion.
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
-  # perf-3: on every push to main, build the release binary once and cache it
-  # keyed by commit SHA (rustfs-baseline-<sha>). The nightly A/B (and, later, the
-  # perf-7 PR gate) restore this instead of paying the ~32min-per-side source
-  # build. That double build is what pushed the expanded 24-cell nightly past its
-  # ceiling — 2026-07-11..07-14 all cancelled on the 120min timeout. Incremental
-  # builds off the shared cargo cache keep each push cheap, and building on the
-  # same sm-standard-2 runner the A/B measures on guarantees the cached binary is
-  # ABI-identical. Do NOT source this from build.yml's per-merge artifact: those
-  # are cancelled ~7/8 of the time and are not a reliable baseline.
-  build-baseline-cache:
-    name: Build + cache baseline binary
-    if: github.event_name == 'push'
-    runs-on: sm-standard-2
-    # Latest-wins: consumers only ever restore the binary for the *current*
-    # origin/main tip, so when pushes land faster than the ~65min build, a
-    # superseded build's output is dead weight — cancel it instead of stacking
-    # hour-long jobs on the shared runner pool. A skipped intermediate SHA at
-    # most costs one same-commit self-heal in the A/B job.
-    concurrency:
-      group: perf-baseline-build-main
-      cancel-in-progress: true
-    # #4806 put thin LTO + codegen-units=1 on [profile.release], pushing a
-    # single release build past 60min on this runner — every cache build on
-    # 2026-07-15 died on the old 60min ceiling ("exceeded the maximum execution
-    # time of 1h0m0s") and the cache never populated. The measured binary must
-    # keep the production profile, so the budget absorbs the build instead.
-    timeout-minutes: 100
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          persist-credentials: false
-
-      - name: Setup Rust environment
-        uses: ./.github/actions/setup
-        with:
-          rust-version: stable
-          cache-shared-key: warp-ab-${{ hashFiles('**/Cargo.lock') }}
-          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: Build release server
-        run: cargo build --release -p rustfs --bins
-
-      - name: Stage binary for cache
-        run: |
-          set -euo pipefail
-          mkdir -p baseline-bin
-          if [[ -x target/release/zffs ]]; then
-            cp target/release/zffs baseline-bin/rustfs
-          else
-            cp target/release/rustfs baseline-bin/rustfs
-          fi
-
-      - name: Cache baseline binary by SHA
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: baseline-bin/rustfs
-          key: rustfs-baseline-${{ github.sha }}
-
   warp-ab:
     name: Warp A/B budget gate
-    # Always run on schedule / manual dispatch. Opt-in on PRs: only when the
-    # `perf-ab` label is present, and for `labeled` events only when the label
-    # being added is `perf-ab` itself (adding an unrelated label to an opted-in
-    # PR must not re-run the gate). Never on push — that event only feeds
-    # build-baseline-cache above.
-    if: >-
-      github.event_name == 'schedule' ||
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' &&
-       contains(github.event.pull_request.labels.*.name, 'perf-ab') &&
-       (github.event.action != 'labeled' || github.event.label.name == 'perf-ab'))
     runs-on: sm-standard-2
-    # With perf-3's cached baseline binary the common (cache-hit) nightly is
-    # measurement-only and finishes well under 50min. This ceiling stays
-    # generous only to absorb the same-commit cache-miss self-heal (~65min
-    # single build with the post-#4806 LTO profile + measurement). A timeout
-    # surfaces via the alert-on-failure job (it fires on cancelled/timed-out,
-    # not just failure). perf-6 recalibrates the budget once the noise study
-    # lands.
-    timeout-minutes: 120
+    # A normal nightly restores the last successful binary and builds only the
+    # candidate; daily access keeps that cache warm. A cache miss may build both
+    # and needs room for the A/B run plus artifact and cache publication.
+    timeout-minutes: 180
     steps:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
-          fetch-depth: 0 # baseline is built from origin/main
+          fetch-depth: 0 # baseline may be an earlier successful scheduled head
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -178,33 +83,60 @@ jobs:
           INPUT_ALLOW_REGRESSION: ${{ github.event.inputs.allow_regression }}
         run: |
           allow="false"
-          if [[ "${{ github.event_name }}" == "pull_request" ]] \
-            && ${{ contains(github.event.pull_request.labels.*.name, 'perf-deliberate-tradeoff') }}; then
-            allow="true"
-          fi
           if [[ "$INPUT_ALLOW_REGRESSION" == "true" ]]; then
             allow="true"
           fi
           echo "allow_regression=$allow" >> "$GITHUB_OUTPUT"
 
-      # perf-3: resolve the commits so the cache can be keyed by SHA. The
-      # baseline is origin/main; the candidate is the checked-out ref. On the
-      # nightly (checkout == main) they are the same commit, so one cached binary
-      # serves both phases and the run does zero source builds.
+      # A failed regression run must keep comparing against the last known-good
+      # scheduled head. Otherwise the next nightly would absorb the regression
+      # into its baseline and turn green without a fix.
+      - name: Find last successful scheduled baseline
+        id: scheduled_baseline
+        if: github.event_name == 'schedule'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          result-encoding: string
+          script: |
+            const { data } = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: "performance-ab.yml",
+              event: "schedule",
+              status: "success",
+              per_page: 1,
+            });
+            return data.workflow_runs[0]?.head_sha ?? "";
+
+      # Manual runs compare a selected ref with current main. Scheduled runs
+      # compare current main with the last successful scheduled head. With no
+      # history, the first run measures the candidate against itself and seeds
+      # that head only if the complete rig succeeds.
       - name: Resolve baseline / candidate commits
         id: commits
+        env:
+          SCHEDULED_BASELINE_SHA: ${{ steps.scheduled_baseline.outputs.result }}
         run: |
           set -euo pipefail
-          baseline_sha="$(git rev-parse origin/main)"
           candidate_sha="$(git rev-parse HEAD)"
+          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+            baseline_sha="${SCHEDULED_BASELINE_SHA:-$candidate_sha}"
+          else
+            baseline_sha="$(git rev-parse origin/main)"
+          fi
+          git cat-file -e "${baseline_sha}^{commit}"
+          if ! git merge-base --is-ancestor "$baseline_sha" "$candidate_sha"; then
+            echo "::error::baseline $baseline_sha is not an ancestor of candidate $candidate_sha; update the selected ref before comparing" >&2
+            exit 1
+          fi
           echo "baseline_sha=$baseline_sha" >> "$GITHUB_OUTPUT"
           echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
           echo "baseline commit: $baseline_sha"
           echo "candidate commit: $candidate_sha"
 
-      # Exact-key restore of the baseline binary built by build-baseline-cache
-      # when origin/main last landed. A miss (binary evicted or not built yet)
-      # leaves cache-hit unset and the rig falls back to a source build.
+      # Exact-key restore of the candidate binary saved by its successful
+      # scheduled run. A miss leaves cache-hit unset and falls back to a source
+      # build of that known-good head.
       - name: Restore cached baseline binary
         id: baseline_cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
@@ -306,11 +238,11 @@ jobs:
             elif [[ "$selfheal_built" == "true" ]]; then
               base_src="source build (cache self-heal, saved as rustfs-baseline-$baseline_sha)"
             else
-              base_src="isolated origin/main source build (saved as rustfs-baseline-$baseline_sha)"
+              base_src="isolated baseline source build (saved as rustfs-baseline-$baseline_sha)"
             fi
             if [[ "$candidate_sha" == "$baseline_sha" ]]; then
-              # Nightly on main: the candidate is the same commit as the baseline,
-              # so reuse the one binary for both phases and skip all builds.
+              # No commits landed since the last successful baseline, so reuse
+              # the one binary for both phases and measure only rig drift.
               args+=(--candidate-bin "$base_bin")
               cand_src="same binary as baseline (same commit)"
             elif [[ "$candidate_built" == "true" ]]; then
@@ -330,10 +262,10 @@ jobs:
           echo "candidate binary: $cand_src"
 
           if [[ "${{ steps.exempt.outputs.allow_regression }}" == "true" ]]; then
-            args+=(--allow-regression --exemption-reason "labeled perf-deliberate-tradeoff / dispatch override")
+            args+=(--allow-regression --exemption-reason "workflow dispatch override")
           fi
           # Do not let a gate FAIL abort the job here; capture status and surface
-          # it after the PR comment is posted.
+          # it after the step summary is written.
           set +e
           bash scripts/run_hotpath_warp_abba.sh "${args[@]}"
           echo "status=$?" >> "$GITHUB_OUTPUT"
@@ -398,12 +330,22 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Comment gate result on PR
-        if: always() && github.event_name == 'pull_request' && steps.ab.outputs.gate_md != ''
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Stage successful candidate baseline
+        if: >-
+          steps.ab.outputs.status == '0' &&
+          steps.commits.outputs.baseline_sha != steps.commits.outputs.candidate_sha
         run: |
-          gh pr comment "${{ github.event.pull_request.number }}" --body-file "${{ steps.ab.outputs.gate_md }}"
+          set -euo pipefail
+          cp candidate-bin/rustfs baseline-bin/rustfs
+
+      - name: Cache successful candidate baseline
+        if: >-
+          steps.ab.outputs.status == '0' &&
+          steps.commits.outputs.baseline_sha != steps.commits.outputs.candidate_sha
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: baseline-bin/rustfs
+          key: rustfs-baseline-${{ steps.commits.outputs.candidate_sha }}
 
       # Scheduled failure alerting is handled by the alert-on-failure job below
       # (perf-2 consuming ci-8's schedule-failure-issue composite action).
@@ -412,8 +354,12 @@ jobs:
         if: always()
         run: |
           status="${{ steps.ab.outputs.status }}"
+          if [[ -z "$status" ]]; then
+            echo "::error::warp A/B setup failed before the rig ran. Check the first failed workflow step." >&2
+            exit 1
+          fi
           if [[ "$status" != "0" ]]; then
-            echo "::error::warp A/B budget gate failed (exit $status). See the step summary / PR comment / gate.md artifact." >&2
+            echo "::error::warp A/B budget gate failed (exit $status). See the step summary / gate.md artifact." >&2
             exit "$status"
           fi
           echo "warp A/B budget gate passed."
@@ -423,14 +369,12 @@ jobs:
     needs: [warp-ab]
     # `always()` is required: without it this job is skipped when a needed
     # job fails. Alerts only for scheduled (nightly) runs (backlog#1149
-    # ci-8); PR and manual dispatch failures are already watched by a human.
+    # ci-8); manual dispatch failures are already watched by a human.
     # `cancelled` is included alongside `failure` on purpose: a job that hits
     # timeout-minutes ends as `cancelled`, and the 2026-07-11..07-14 nightly
     # timeouts went silent precisely because the guard was failure-only. The
     # composite action already reports cancelled/timed-out jobs in the issue
-    # body. (Scheduled runs get a unique concurrency group with
-    # cancel-in-progress off, so a cancellation here means a timeout/manual
-    # abort, never a superseding run.)
+    # body.
     if: >-
       always() && github.event_name == 'schedule' &&
       (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))

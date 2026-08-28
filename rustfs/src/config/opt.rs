@@ -18,7 +18,7 @@
 //! and methods for parsing command line arguments.
 
 use super::Config;
-use super::cli::{Cli, CommandResult, Commands, ServerOpts, default_server_opts, preprocess_args_for_legacy};
+use super::cli::{Cli, CommandResult, Commands, ConnectCommands, ServerOpts, default_server_opts, preprocess_args_for_legacy};
 use super::config_file::{UnifiedConfig, load_config_file_from_args};
 use CommandResult::Server;
 use clap::{CommandFactory, FromArgMatches};
@@ -181,6 +181,10 @@ impl Opt {
             Some(Commands::Info(opts)) => Ok(CommandResult::Info(opts)),
             Some(Commands::Tls(opts)) => Ok(CommandResult::Tls(opts)),
             Some(Commands::Diagnose(opts)) => Ok(CommandResult::Diagnose(opts)),
+            Some(Commands::Inspect(opts)) => Ok(CommandResult::Inspect(opts)),
+            Some(Commands::Connect(opts)) => match opts.command {
+                ConnectCommands::Register(opts) => Ok(CommandResult::ConnectRegister(opts)),
+            },
             Some(Commands::Server(opts)) => Self::server_command_result(Self::from_server_opts(*opts)),
             None => Self::server_command_result(Self::from_server_opts(default_server_opts())),
         }
@@ -197,9 +201,11 @@ impl Opt {
         let cli = Self::parse_cli_prepared(args, config, &report).unwrap_or_else(|error| error.exit());
         match cli.command {
             Some(Commands::Server(opts)) => Self::from_server_opts(*opts),
-            Some(Commands::Info(_)) | Some(Commands::Tls(_)) | Some(Commands::Diagnose(_)) => {
-                Self::from_server_opts(default_server_opts())
-            }
+            Some(Commands::Info(_))
+            | Some(Commands::Tls(_))
+            | Some(Commands::Diagnose(_))
+            | Some(Commands::Inspect(_))
+            | Some(Commands::Connect(_)) => Self::from_server_opts(default_server_opts()),
             None => {
                 // Default to server with empty volumes (will be filled from env)
                 Self::from_server_opts(default_server_opts())
@@ -247,9 +253,11 @@ impl Opt {
         let cli = Self::parse_cli_prepared(args, config, &report)?;
         match cli.command {
             Some(Commands::Server(opts)) => Ok(Self::from_server_opts(*opts)),
-            Some(Commands::Info(_)) | Some(Commands::Tls(_)) | Some(Commands::Diagnose(_)) => {
-                Err(clap::Error::new(clap::error::ErrorKind::DisplayHelp))
-            }
+            Some(Commands::Info(_))
+            | Some(Commands::Tls(_))
+            | Some(Commands::Diagnose(_))
+            | Some(Commands::Inspect(_))
+            | Some(Commands::Connect(_)) => Err(clap::Error::new(clap::error::ErrorKind::DisplayHelp)),
             None => {
                 // Default to server with empty volumes
                 Ok(Self::from_server_opts(default_server_opts()))

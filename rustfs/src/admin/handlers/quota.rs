@@ -18,11 +18,13 @@ use crate::admin::auth::{validate_admin_request, validate_admin_request_with_buc
 use crate::admin::handlers::site_replication::site_replication_bucket_meta_hook;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{current_bucket_metadata_handle, current_object_store_handle};
-use crate::admin::storage_api::bucket::metadata_sys::BucketMetadataSys;
+use crate::admin::storage_api::bucket::metadata_sys::{self, BucketMetadataSys};
 use crate::admin::storage_api::bucket::quota::checker::QuotaChecker;
 use crate::admin::storage_api::bucket::quota::{BucketQuota, QuotaError, QuotaOperation};
 use crate::auth::{check_key_valid, get_session_token};
+use crate::error::ApiError;
 use crate::server::ADMIN_PREFIX;
+use crate::server::RemoteAddr;
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
@@ -263,13 +265,14 @@ impl Operation for SetBucketQuotaHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
 
+        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
         validate_admin_request(
             &req.headers,
             &cred,
             owner,
             false,
             vec![Action::AdminAction(AdminAction::SetBucketQuotaAdminAction)],
-            None,
+            remote_addr,
         )
         .await?;
 
@@ -277,6 +280,9 @@ impl Operation for SetBucketQuotaHandler {
         if bucket.is_empty() {
             return Err(s3_error!(InvalidRequest, "bucket name is required"));
         }
+        let expected_incarnation_id = metadata_sys::capture_bucket_metadata_incarnation(&bucket)
+            .await
+            .map_err(|e| s3_error!(InternalError, "failed to capture bucket incarnation: {}", e))?;
 
         let body = req
             .input
@@ -290,16 +296,36 @@ impl Operation for SetBucketQuotaHandler {
             return Err(s3_error!(InvalidArgument, "{}", rustfs_config::QUOTA_INVALID_TYPE_ERROR_MSG));
         }
 
+        let fleet_proof = if request.quota.is_some() {
+            Some(crate::admin::storage_api::acquire_cross_pool_fence_fleet_proof().ok_or_else(|| {
+                S3Error::with_message(
+                    s3s::S3ErrorCode::ServiceUnavailable,
+                    "durable quota capability is not confirmed across the cluster".to_string(),
+                )
+            })?)
+        } else {
+            None
+        };
+
         let quota = BucketQuota::new(request.quota);
 
         let metadata_sys_lock = bucket_metadata_from_context()
             .ok_or_else(|| s3_error!(InternalError, "{}", rustfs_config::QUOTA_METADATA_SYSTEM_ERROR_MSG))?;
         let mut quota_checker = QuotaChecker::new(metadata_sys_lock.clone());
 
-        let updated_at = quota_checker
-            .set_quota_config(&bucket, quota.clone())
-            .await
-            .map_err(|e| s3_error!(InternalError, "failed to set quota: {}", e))?;
+        let updated_at = match fleet_proof.as_ref() {
+            Some(fleet_proof) => {
+                quota_checker
+                    .set_durable_quota_config_if_incarnation(&bucket, quota.clone(), expected_incarnation_id, fleet_proof)
+                    .await
+            }
+            None => {
+                quota_checker
+                    .set_quota_config_if_incarnation(&bucket, quota.clone(), expected_incarnation_id)
+                    .await
+            }
+        }
+        .map_err(ApiError::from)?;
 
         if let Err(err) = site_replication_bucket_meta_hook(SRBucketMeta {
             bucket: bucket.clone(),
@@ -369,14 +395,14 @@ impl Operation for GetBucketQuotaHandler {
         if bucket.is_empty() {
             return Err(s3_error!(InvalidRequest, "bucket name is required"));
         }
-
+        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
         validate_admin_request_with_bucket(
             &req.headers,
             &cred,
             owner,
             false,
             vec![Action::S3Action(S3Action::GetBucketQuotaAction)],
-            None,
+            remote_addr,
             &bucket,
         )
         .await?;
@@ -438,13 +464,14 @@ impl Operation for ClearBucketQuotaHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
 
+        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
         validate_admin_request(
             &req.headers,
             &cred,
             owner,
             false,
             vec![Action::AdminAction(AdminAction::SetBucketQuotaAdminAction)],
-            None,
+            remote_addr,
         )
         .await?;
 
@@ -452,6 +479,9 @@ impl Operation for ClearBucketQuotaHandler {
         if bucket.is_empty() {
             return Err(s3_error!(InvalidRequest, "bucket name is required"));
         }
+        let expected_incarnation_id = metadata_sys::capture_bucket_metadata_incarnation(&bucket)
+            .await
+            .map_err(|e| s3_error!(InternalError, "failed to capture bucket incarnation: {}", e))?;
 
         info!(
             event = EVENT_ADMIN_QUOTA_STATE,
@@ -471,7 +501,7 @@ impl Operation for ClearBucketQuotaHandler {
         // Clear quota (set to None)
         let quota = BucketQuota::new(None);
         let updated_at = quota_checker
-            .set_quota_config(&bucket, quota.clone())
+            .set_quota_config_if_incarnation(&bucket, quota.clone(), expected_incarnation_id)
             .await
             .map_err(|e| s3_error!(InternalError, "failed to clear quota: {}", e))?;
 
@@ -551,13 +581,14 @@ impl Operation for GetBucketQuotaStatsHandler {
             return Err(s3_error!(InvalidRequest, "bucket name is required"));
         }
 
+        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
         validate_admin_request_with_bucket(
             &req.headers,
             &cred,
             owner,
             false,
             vec![Action::S3Action(S3Action::GetBucketQuotaAction)],
-            None,
+            remote_addr,
             &bucket,
         )
         .await?;
@@ -623,13 +654,14 @@ impl Operation for CheckBucketQuotaHandler {
             return Err(s3_error!(InvalidRequest, "bucket name is required"));
         }
 
+        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
         validate_admin_request_with_bucket(
             &req.headers,
             &cred,
             owner,
             false,
             vec![Action::S3Action(S3Action::GetBucketQuotaAction)],
-            None,
+            remote_addr,
             &bucket,
         )
         .await?;

@@ -19,13 +19,17 @@ use crate::api_types::{
 };
 use crate::cache::KmsCacheStats;
 use crate::encryption::ciphers::{create_cipher, generate_iv};
+use crate::encryption::context_aad;
 use crate::error::{KmsError, Result};
 use crate::manager::KmsManager;
 use crate::types::*;
-use base64::Engine;
 use jiff::Zoned;
 use md5::{Digest as Md5Digest, Md5};
 use rand::random;
+use rustfs_utils::http::object_encryption_keys::{
+    INTERNAL_ENCRYPTION_ALGORITHM_HEADER, INTERNAL_ENCRYPTION_CONTEXT_HEADER, INTERNAL_ENCRYPTION_IV_HEADER,
+    INTERNAL_ENCRYPTION_KEY_HEADER, INTERNAL_ENCRYPTION_KEY_ID_HEADER, INTERNAL_ENCRYPTION_TAG_HEADER,
+};
 use std::collections::HashMap;
 use std::io::Cursor;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -35,7 +39,7 @@ use zeroize::Zeroize;
 fn md5_hex(input: impl AsRef<[u8]>) -> String {
     let mut hasher = Md5::new();
     hasher.update(input.as_ref());
-    hex::encode(hasher.finalize())
+    hex_simd::encode_to_string(hasher.finalize(), hex_simd::AsciiCase::Lower)
 }
 
 /// Data key for object encryption
@@ -79,8 +83,6 @@ fn request_encryption_context(context: &ObjectEncryptionContext) -> HashMap<Stri
         .or_insert_with(|| canonical_bucket_path(&context.bucket, &context.object_key));
     enc_context
 }
-
-const INTERNAL_ENCRYPTION_KEY_ID_HEADER: &str = "x-rustfs-encryption-key-id";
 
 /// Result of object encryption
 #[derive(Debug, Clone)]
@@ -302,6 +304,41 @@ impl ObjectEncryptionService {
         self.kms_manager.backend_capabilities()
     }
 
+    /// Re-wrap an object's encrypted data key onto its master key's current
+    /// version, without the plaintext data key ever reaching the caller.
+    ///
+    /// Pure passthrough: the backend owns the format and the no-op decision
+    /// ([`RewrapDataKeyResponse::rewrapped`] false means nothing to persist).
+    /// The context must be the object's own — the backend refuses an envelope
+    /// whose recorded context the caller cannot reproduce.
+    pub async fn rewrap_data_key(
+        &self,
+        encrypted_key: &[u8],
+        context: &ObjectEncryptionContext,
+    ) -> Result<crate::types::RewrapDataKeyResponse> {
+        self.kms_manager
+            .rewrap_data_key(crate::types::RewrapDataKeyRequest {
+                ciphertext: encrypted_key.to_vec(),
+                encryption_context: request_encryption_context(context),
+            })
+            .await
+    }
+
+    /// Report which master key version wraps an object's encrypted data key,
+    /// and whether a rewrap would change anything.
+    pub async fn describe_data_key_wrapping(
+        &self,
+        encrypted_key: &[u8],
+        context: &ObjectEncryptionContext,
+    ) -> Result<crate::types::DescribeDataKeyWrappingResponse> {
+        self.kms_manager
+            .describe_data_key_wrapping(crate::types::DescribeDataKeyWrappingRequest {
+                ciphertext: encrypted_key.to_vec(),
+                encryption_context: request_encryption_context(context),
+            })
+            .await
+    }
+
     /// Create a data encryption key for object encryption
     ///
     /// # Arguments
@@ -484,7 +521,7 @@ impl ObjectEncryptionService {
         let iv = generate_iv(algorithm);
 
         // Build AAD from encryption context
-        let aad = serde_json::to_vec(&context)?;
+        let aad = context_aad(&context)?;
 
         // Encrypt the data
         let (ciphertext, tag) = cipher.encrypt(&data, &iv, &aad)?;
@@ -498,6 +535,9 @@ impl ObjectEncryptionService {
             tag: Some(tag),
             encryption_context: context,
             encrypted_at: Zoned::now(),
+            // Pinned to the bytes actually fed to the AEAD, so the projection
+            // below can store them verbatim instead of re-deriving them.
+            context_aad: Some(aad),
             original_size,
             encrypted_data_key: data_key.ciphertext_blob,
         };
@@ -558,7 +598,13 @@ impl ObjectEncryptionService {
         let cipher = create_cipher(&algorithm, &decrypt_response.plaintext)?;
 
         // Build AAD from encryption context
-        let aad = serde_json::to_vec(&metadata.encryption_context)?;
+        // Prefer the bytes the object was sealed under. Deriving them from the
+        // parsed map would re-order a pre-canonicalization context and fail the
+        // AEAD on an object that is otherwise perfectly readable.
+        let aad = match metadata.context_aad.as_ref() {
+            Some(stored) => stored.clone(),
+            None => context_aad(&metadata.encryption_context)?,
+        };
 
         // Get tag from metadata
         let tag = metadata
@@ -634,7 +680,7 @@ impl ObjectEncryptionService {
             ("sse_type".to_string(), "customer".to_string()),
         ]);
 
-        let aad = serde_json::to_vec(&context)?;
+        let aad = context_aad(&context)?;
 
         // Encrypt the data
         let (ciphertext, tag) = cipher.encrypt(&data, &iv, &aad)?;
@@ -648,6 +694,9 @@ impl ObjectEncryptionService {
             tag: Some(tag),
             encryption_context: context,
             encrypted_at: Zoned::now(),
+            // Pinned to the bytes actually fed to the AEAD, so the projection
+            // below can store them verbatim instead of re-deriving them.
+            context_aad: Some(aad),
             original_size,
             encrypted_data_key: Vec::new(), // Empty for SSE-C
         };
@@ -702,7 +751,13 @@ impl ObjectEncryptionService {
         let cipher = create_cipher(&algorithm, customer_key)?;
 
         // Build AAD from encryption context
-        let aad = serde_json::to_vec(&metadata.encryption_context)?;
+        // Prefer the bytes the object was sealed under. Deriving them from the
+        // parsed map would re-order a pre-canonicalization context and fail the
+        // AEAD on an object that is otherwise perfectly readable.
+        let aad = match metadata.context_aad.as_ref() {
+            Some(stored) => stored.clone(),
+            None => context_aad(&metadata.encryption_context)?,
+        };
 
         // Get tag from metadata
         let tag = metadata
@@ -774,27 +829,34 @@ impl ObjectEncryptionService {
             headers.insert(INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), metadata.key_id.clone());
         }
 
+        // Record the cipher separately from the SSE mode advertised above.
+        headers.insert(INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(), metadata.algorithm.clone());
+
         // Internal headers for decryption
         headers.insert(
-            "x-rustfs-encryption-iv".to_string(),
-            base64::engine::general_purpose::STANDARD.encode(&metadata.iv),
+            INTERNAL_ENCRYPTION_IV_HEADER.to_string(),
+            base64_simd::STANDARD.encode_to_string(&metadata.iv),
         );
 
         if let Some(ref tag) = metadata.tag {
-            headers.insert(
-                "x-rustfs-encryption-tag".to_string(),
-                base64::engine::general_purpose::STANDARD.encode(tag),
-            );
+            headers.insert(INTERNAL_ENCRYPTION_TAG_HEADER.to_string(), base64_simd::STANDARD.encode_to_string(tag));
         }
 
         headers.insert(
-            "x-rustfs-encryption-key".to_string(),
-            base64::engine::general_purpose::STANDARD.encode(&metadata.encrypted_data_key),
+            INTERNAL_ENCRYPTION_KEY_HEADER.to_string(),
+            base64_simd::STANDARD.encode_to_string(&metadata.encrypted_data_key),
         );
 
+        // Whatever the object was sealed under is what gets stored: for a
+        // pre-canonicalization object that is its original ordering, which must
+        // survive a re-projection rather than being rewritten into sorted form.
+        let context_bytes = match metadata.context_aad.as_ref() {
+            Some(stored) => stored.clone(),
+            None => context_aad(&metadata.encryption_context).unwrap_or_default(),
+        };
         headers.insert(
-            "x-rustfs-encryption-context".to_string(),
-            serde_json::to_string(&metadata.encryption_context).unwrap_or_default(),
+            INTERNAL_ENCRYPTION_CONTEXT_HEADER.to_string(),
+            String::from_utf8_lossy(&context_bytes).into_owned(),
         );
 
         headers
@@ -809,18 +871,27 @@ impl ObjectEncryptionService {
     /// EncryptionMetadata parsed from headers
     ///
     pub fn headers_to_metadata(&self, headers: &HashMap<String, String>) -> Result<EncryptionMetadata> {
-        let algorithm = headers
+        let sse_mode = headers
             .get("x-amz-server-side-encryption")
             .ok_or_else(|| KmsError::validation_error("Missing encryption algorithm header"))?
             .clone();
 
-        let key_id = if algorithm == "AES256" && headers.contains_key("x-amz-server-side-encryption-customer-algorithm") {
+        // Prefer the recorded cipher; fall back to the SSE mode for objects
+        // written before that header existed, where `AES256`/`aws:kms` was the
+        // only thing stored and AES-256-GCM was the only cipher in use.
+        let algorithm = match headers.get(INTERNAL_ENCRYPTION_ALGORITHM_HEADER) {
+            Some(algorithm) => algorithm.clone(),
+            None if sse_mode == "aws:kms" => EncryptionAlgorithm::Aes256.as_str().to_string(),
+            None => sse_mode.clone(),
+        };
+
+        let key_id = if sse_mode == "AES256" && headers.contains_key("x-amz-server-side-encryption-customer-algorithm") {
             "sse-c".to_string()
         } else if let Some(key_id) = headers.get(INTERNAL_ENCRYPTION_KEY_ID_HEADER) {
             key_id.clone()
         } else if let Some(kms_key_id) = headers.get("x-amz-server-side-encryption-aws-kms-key-id") {
             kms_key_id.clone()
-        } else if algorithm == "AES256" {
+        } else if sse_mode == "AES256" {
             self.get_default_key_id()
                 .cloned()
                 .ok_or_else(|| KmsError::validation_error("Missing key ID"))?
@@ -829,35 +900,41 @@ impl ObjectEncryptionService {
         };
 
         let iv = headers
-            .get("x-rustfs-encryption-iv")
+            .get(INTERNAL_ENCRYPTION_IV_HEADER)
             .ok_or_else(|| KmsError::validation_error("Missing IV header"))?;
-        let iv = base64::engine::general_purpose::STANDARD
-            .decode(iv)
+        let iv = base64_simd::STANDARD
+            .decode_to_vec(iv)
             .map_err(|e| KmsError::validation_error(format!("Invalid IV: {e}")))?;
 
-        let tag = if let Some(tag_str) = headers.get("x-rustfs-encryption-tag") {
+        let tag = if let Some(tag_str) = headers.get(INTERNAL_ENCRYPTION_TAG_HEADER) {
             Some(
-                base64::engine::general_purpose::STANDARD
-                    .decode(tag_str)
+                base64_simd::STANDARD
+                    .decode_to_vec(tag_str)
                     .map_err(|e| KmsError::validation_error(format!("Invalid tag: {e}")))?,
             )
         } else {
             None
         };
 
-        let encrypted_data_key = if let Some(key_str) = headers.get("x-rustfs-encryption-key") {
-            base64::engine::general_purpose::STANDARD
-                .decode(key_str)
+        let encrypted_data_key = if let Some(key_str) = headers.get(INTERNAL_ENCRYPTION_KEY_HEADER) {
+            base64_simd::STANDARD
+                .decode_to_vec(key_str)
                 .map_err(|e| KmsError::validation_error(format!("Invalid encrypted key: {e}")))?
         } else {
             Vec::new() // Empty for SSE-C
         };
 
-        let encryption_context = if let Some(context_str) = headers.get("x-rustfs-encryption-context") {
-            serde_json::from_str(context_str)
-                .map_err(|e| KmsError::validation_error(format!("Invalid encryption context: {e}")))?
-        } else {
-            HashMap::new()
+        // The stored string is the AAD verbatim. It is parsed into a map for
+        // callers that inspect the context, but the bytes are carried through
+        // untouched: re-serializing the parsed map is exactly how the original
+        // ordering — and with it the ability to open the object — was lost.
+        let (encryption_context, context_aad) = match headers.get(INTERNAL_ENCRYPTION_CONTEXT_HEADER) {
+            Some(context_str) => (
+                serde_json::from_str(context_str)
+                    .map_err(|e| KmsError::validation_error(format!("Invalid encryption context: {e}")))?,
+                Some(context_str.as_bytes().to_vec()),
+            ),
+            None => (HashMap::new(), None),
         };
 
         Ok(EncryptionMetadata {
@@ -870,6 +947,7 @@ impl ObjectEncryptionService {
             encrypted_at: Zoned::now(),
             original_size: 0, // Not available from headers
             encrypted_data_key,
+            context_aad,
         })
     }
 }
@@ -986,6 +1064,8 @@ mod tests {
             encrypted_at: Zoned::now(),
             original_size: 100,
             encrypted_data_key: vec![1, 2, 3, 4],
+            // A hand-built record with no sealed bytes to defer to.
+            context_aad: None,
         };
 
         // Convert to headers

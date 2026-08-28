@@ -167,9 +167,9 @@ CLIENT_MATRIX: list[dict[str, str]] = [
     },
     {
         "client": "DuckDB Iceberg",
-        "status": "manual-live-read-probe",
-        "coverage": "generated httpfs/iceberg SQL using an operator-supplied current metadata location; write/commit is not claimed",
-        "entrypoint": "scripts/table-catalog/engine_compatibility.py --print-live-conformance",
+        "status": "automated-smoke",
+        "coverage": "metadata-location read plus generic REST catalog single-table DDL, DML, schema evolution, snapshots, canonical and compatibility signing, negative boundaries, endpoint-disabled multi-table mode, concurrent writers, and PyIceberg cross-read",
+        "entrypoint": "scripts/table-catalog/duckdb_smoke.py",
     },
     {
         "client": "Databend",
@@ -1207,6 +1207,7 @@ def smoke_view_request(args: argparse.Namespace, view_name: str, version_id: int
             "schema-id": 0,
             "timestamp-ms": int(time.time() * 1000),
             "summary": {"operation": "replace"},
+            "default-namespace": [args.namespace],
             "representations": [
                 {
                     "type": "sql",

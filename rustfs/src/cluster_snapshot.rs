@@ -13,9 +13,8 @@
 // limitations under the License.
 
 use crate::runtime_capabilities::runtime_observability_snapshot;
-use crate::server::{
-    DependencyReadiness, DependencyReadinessReport, ReadinessDegradedReason, snapshot_dependency_readiness_report,
-};
+use crate::server::snapshot_dependency_readiness_report;
+use crate::shared_types::{DependencyReadiness, DependencyReadinessReport, ReadinessDegradedReason};
 use crate::storage_api::cluster::EndpointServerPools;
 use crate::storage_api::cluster::contract::observability::ObservabilitySnapshot;
 use crate::storage_api::cluster::contract::topology::TopologySnapshot;
@@ -24,9 +23,9 @@ use crate::storage_api::cluster::control_plane::{
     ClusterPeerHealthSnapshot, ClusterPoolStateSnapshot, ClusterRpcBoundarySnapshot,
 };
 use crate::workload_admission::workload_admission_registry_snapshot;
-use rustfs_common::metrics::{ScannerMetricsReport, global_metrics};
 use rustfs_concurrency::{AdmissionState, WorkloadAdmissionRegistrySnapshot};
 use rustfs_io_metrics::internode_metrics::{InternodeMetricsSnapshot, global_internode_metrics};
+use rustfs_scanner_contracts::metrics::{ScannerMetricsReport, global_metrics};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterReadOnlySnapshot {
@@ -67,6 +66,14 @@ pub struct ClusterUsageFreshnessSnapshot {
     pub last_usage_save_unix_secs: u64,
     pub last_usage_save_result: String,
     pub last_usage_save_result_code: u64,
+    pub last_durable_success_unix_secs: u64,
+    pub last_publication_unix_secs: u64,
+    pub last_publication_state: String,
+    pub last_publication_reason: String,
+    pub deferred_pending: bool,
+    pub deferred_total: u64,
+    pub last_deferred_unix_secs: u64,
+    pub last_deferred_reason: String,
 }
 
 impl From<&ScannerMetricsReport> for ClusterUsageFreshnessSnapshot {
@@ -80,6 +87,14 @@ impl From<&ScannerMetricsReport> for ClusterUsageFreshnessSnapshot {
             last_usage_save_unix_secs: report.usage_freshness.last_usage_save_unix_secs,
             last_usage_save_result: report.usage_freshness.last_usage_save_result.clone(),
             last_usage_save_result_code: report.usage_freshness.last_usage_save_result_code,
+            last_durable_success_unix_secs: report.usage_freshness.last_durable_success_unix_secs,
+            last_publication_unix_secs: report.usage_freshness.last_publication_unix_secs,
+            last_publication_state: report.usage_freshness.last_publication_state.clone(),
+            last_publication_reason: report.usage_freshness.last_publication_reason.clone(),
+            deferred_pending: report.usage_freshness.deferred_pending,
+            deferred_total: report.usage_freshness.deferred_total,
+            last_deferred_unix_secs: report.usage_freshness.last_deferred_unix_secs,
+            last_deferred_reason: report.usage_freshness.last_deferred_reason.clone(),
         }
     }
 }

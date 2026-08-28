@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Concurrency manager for coordinating concurrent GetObject requests.
+//! Concurrency manager for coordinating concurrent GetObject and PutObject requests.
 
 use super::io_schedule::{
     IoLoadLevel, IoLoadMetrics, IoPriority, IoPriorityQueue, IoPriorityQueueConfig, IoQueueStatus, IoSchedulerConfig, IoStrategy,
@@ -34,6 +34,8 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 use tracing::debug;
 
+const DERIVED_LARGE_PUT_ADMISSION_LIMIT_MAX: usize = 32;
+
 /// Global concurrency manager instance
 pub(crate) static CONCURRENCY_MANAGER: LazyLock<ConcurrencyManager> = LazyLock::new(ConcurrencyManager::new);
 
@@ -50,7 +52,7 @@ pub struct ConcurrencyManager {
     /// I/O load metrics for adaptive strategy calculation
     io_metrics: Arc<Mutex<IoLoadMetrics>>,
     /// I/O priority queue for request scheduling
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "written but never read back (backlog#1823)")]
     priority_queue: Arc<IoPriorityQueue<()>>,
     /// Bytes pool for buffer allocation and reuse
     bytes_pool: Arc<BytesPool>,
@@ -65,6 +67,8 @@ pub struct ConcurrencyManager {
     bandwidth_monitor: Arc<Mutex<BandwidthMonitor>>,
     /// Metrics collector for I/O latency tracking (P50, P95, P99)
     metrics_collector: Arc<MetricsCollector>,
+    /// Foreground write admission policy, resolved once at startup.
+    foreground_write_admission_policy: ForegroundWriteAdmissionPolicy,
 }
 
 impl std::fmt::Debug for ConcurrencyManager {
@@ -114,7 +118,242 @@ pub enum DiskReadAdmission {
     Rejected,
 }
 
-#[allow(dead_code)]
+/// Outcome of foreground write request admission.
+#[derive(Debug)]
+pub enum ForegroundWriteAdmission {
+    /// Foreground write admission is disabled; proceed on the legacy path.
+    Disabled,
+    /// Request is admitted and must hold the permit until the store write
+    /// returns or the request fails before mutation.
+    Admitted(tokio::sync::OwnedSemaphorePermit),
+    /// The selected foreground write admission gate stayed full until the configured wait timeout.
+    Rejected,
+}
+
+#[derive(Clone)]
+struct ForegroundWriteAdmissionGate {
+    semaphore: Arc<Semaphore>,
+    limit: usize,
+    wait_timeout: Duration,
+}
+
+impl ForegroundWriteAdmissionGate {
+    fn new(limit: usize, wait_timeout: Duration) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(limit)),
+            limit,
+            wait_timeout,
+        }
+    }
+
+    fn active(&self) -> usize {
+        self.limit.saturating_sub(self.semaphore.available_permits())
+    }
+
+    async fn admit(&self) -> Result<ForegroundWriteAdmission, tokio::sync::AcquireError> {
+        if self.wait_timeout.is_zero() {
+            return Ok(match self.semaphore.clone().try_acquire_owned() {
+                Ok(permit) => ForegroundWriteAdmission::Admitted(permit),
+                Err(tokio::sync::TryAcquireError::NoPermits) => ForegroundWriteAdmission::Rejected,
+                Err(tokio::sync::TryAcquireError::Closed) => ForegroundWriteAdmission::Rejected,
+            });
+        }
+
+        match tokio::time::timeout(self.wait_timeout, self.semaphore.clone().acquire_owned()).await {
+            Ok(permit) => Ok(ForegroundWriteAdmission::Admitted(permit?)),
+            Err(_) => Ok(ForegroundWriteAdmission::Rejected),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum ForegroundWriteAdmissionPolicy {
+    /// Strict admission was explicitly enabled with limit `0`.
+    Disabled,
+    /// No hard PUT gate is configured; foreground write snapshots use the
+    /// existing active request counter as a soft pressure signal.
+    LegacyCounterOnly,
+    /// Explicit all foreground write admission gate.
+    Strict(ForegroundWriteAdmissionGate),
+    /// Default foreground write admission gate for pressure-heavy writes.
+    Large {
+        gate: ForegroundWriteAdmissionGate,
+        put_object_min_size_bytes: usize,
+        multipart_part_min_size_bytes: usize,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum ForegroundWriteAdmissionKind {
+    PutObject,
+    MultipartPart,
+}
+
+impl ForegroundWriteAdmissionPolicy {
+    fn from_env(max_disk_reads: usize) -> Self {
+        let strict_enabled = rustfs_utils::get_env_bool(
+            rustfs_config::ENV_PUT_FOREGROUND_ADMISSION_ENABLE,
+            rustfs_config::DEFAULT_PUT_FOREGROUND_ADMISSION_ENABLE,
+        );
+        if strict_enabled {
+            let strict_limit = rustfs_utils::get_env_usize(
+                rustfs_config::ENV_PUT_FOREGROUND_ADMISSION_LIMIT,
+                rustfs_config::DEFAULT_PUT_FOREGROUND_ADMISSION_LIMIT,
+            );
+            let strict_wait_timeout = Duration::from_millis(rustfs_utils::get_env_u64(
+                rustfs_config::ENV_PUT_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS,
+                rustfs_config::DEFAULT_PUT_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS,
+            ));
+            return if strict_limit == 0 {
+                Self::Disabled
+            } else {
+                Self::Strict(ForegroundWriteAdmissionGate::new(strict_limit, strict_wait_timeout))
+            };
+        }
+
+        let large_enabled = rustfs_utils::get_env_bool(
+            rustfs_config::ENV_PUT_LARGE_FOREGROUND_ADMISSION_ENABLE,
+            rustfs_config::DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_ENABLE,
+        );
+        if !large_enabled {
+            return Self::LegacyCounterOnly;
+        }
+
+        let large_limit = derive_large_put_admission_limit(
+            rustfs_utils::get_env_usize(
+                rustfs_config::ENV_PUT_LARGE_FOREGROUND_ADMISSION_LIMIT,
+                rustfs_config::DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_LIMIT,
+            ),
+            max_disk_reads,
+        );
+        let put_object_min_size_bytes = rustfs_utils::get_env_usize(
+            rustfs_config::ENV_PUT_LARGE_FOREGROUND_ADMISSION_MIN_SIZE_BYTES,
+            rustfs_config::DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_MIN_SIZE_BYTES,
+        );
+        let multipart_part_min_size_bytes = rustfs_utils::get_env_usize(
+            rustfs_config::ENV_PUT_MULTIPART_FOREGROUND_ADMISSION_MIN_SIZE_BYTES,
+            rustfs_config::DEFAULT_PUT_MULTIPART_FOREGROUND_ADMISSION_MIN_SIZE_BYTES,
+        );
+        let wait_timeout = Duration::from_millis(rustfs_utils::get_env_u64(
+            rustfs_config::ENV_PUT_LARGE_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS,
+            rustfs_config::DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS,
+        ));
+
+        Self::Large {
+            gate: ForegroundWriteAdmissionGate::new(large_limit, wait_timeout),
+            put_object_min_size_bytes,
+            multipart_part_min_size_bytes,
+        }
+    }
+
+    #[cfg(test)]
+    fn strict_for_test(enabled: bool, limit: usize, wait_timeout: Duration) -> Self {
+        if enabled {
+            if limit == 0 {
+                Self::Disabled
+            } else {
+                Self::Strict(ForegroundWriteAdmissionGate::new(limit, wait_timeout))
+            }
+        } else {
+            Self::LegacyCounterOnly
+        }
+    }
+
+    #[cfg(test)]
+    fn large_for_test(enabled: bool, limit: usize, min_size_bytes: usize, wait_timeout: Duration) -> Self {
+        if enabled && limit > 0 {
+            Self::Large {
+                gate: ForegroundWriteAdmissionGate::new(limit, wait_timeout),
+                put_object_min_size_bytes: min_size_bytes,
+                multipart_part_min_size_bytes: 0,
+            }
+        } else {
+            Self::LegacyCounterOnly
+        }
+    }
+
+    async fn admit(
+        &self,
+        kind: ForegroundWriteAdmissionKind,
+        size: i64,
+    ) -> Result<ForegroundWriteAdmission, tokio::sync::AcquireError> {
+        match self {
+            Self::Disabled | Self::LegacyCounterOnly => Ok(ForegroundWriteAdmission::Disabled),
+            Self::Strict(gate) => gate.admit().await,
+            Self::Large {
+                gate,
+                put_object_min_size_bytes,
+                multipart_part_min_size_bytes,
+            } => {
+                let min_size_bytes = match kind {
+                    ForegroundWriteAdmissionKind::PutObject => *put_object_min_size_bytes,
+                    ForegroundWriteAdmissionKind::MultipartPart => *multipart_part_min_size_bytes,
+                };
+                if should_gate_foreground_write(size, min_size_bytes) {
+                    gate.admit().await
+                } else {
+                    Ok(ForegroundWriteAdmission::Disabled)
+                }
+            }
+        }
+    }
+
+    fn snapshot(&self, legacy_limit: usize) -> WorkloadAdmissionSnapshot {
+        match self {
+            Self::Disabled => put_admission_snapshot(0, 0, None),
+            Self::LegacyCounterOnly => put_admission_snapshot(PutObjectGuard::concurrent_count(), legacy_limit, None),
+            Self::Strict(gate) => {
+                put_admission_snapshot(gate.active(), gate.limit, Some("foreground write admission permits exhausted"))
+            }
+            Self::Large { gate, .. } => {
+                put_admission_snapshot(gate.active(), gate.limit, Some("large foreground write admission permits exhausted"))
+            }
+        }
+    }
+}
+
+fn put_admission_snapshot(active: usize, limit: usize, hard_gate_reason: Option<&'static str>) -> WorkloadAdmissionSnapshot {
+    let state = if limit == 0 {
+        AdmissionState::Disabled
+    } else if active >= limit {
+        AdmissionState::Saturated
+    } else {
+        AdmissionState::Open
+    };
+
+    let admission =
+        WorkloadAdmissionSnapshot::new(WorkloadClass::ForegroundWrite, state).with_counts(Some(active), None, Some(limit));
+
+    match state {
+        AdmissionState::Disabled => admission.with_reason("foreground write admission disabled"),
+        AdmissionState::Saturated => {
+            admission.with_reason(hard_gate_reason.unwrap_or("foreground write concurrency reached local pressure limit"))
+        }
+        _ => admission,
+    }
+}
+
+fn derive_large_put_admission_limit(configured_limit: usize, max_disk_reads: usize) -> usize {
+    if configured_limit > 0 {
+        return configured_limit;
+    }
+
+    let scheduler_base = if max_disk_reads == 0 {
+        rustfs_config::DEFAULT_OBJECT_MAX_CONCURRENT_DISK_READS
+    } else {
+        max_disk_reads
+    };
+    scheduler_base.div_ceil(2).clamp(1, DERIVED_LARGE_PUT_ADMISSION_LIMIT_MAX)
+}
+
+fn should_gate_foreground_write(size: i64, min_size_bytes: usize) -> bool {
+    if min_size_bytes == 0 || size < 0 {
+        return true;
+    }
+
+    usize::try_from(size).is_ok_and(|size| size >= min_size_bytes)
+}
+
 impl ConcurrencyManager {
     /// Create a new concurrency manager with default settings
     ///
@@ -161,6 +400,7 @@ impl ConcurrencyManager {
         // Initialize metrics collector for I/O latency tracking
         // Keep 1000 samples for P95/P99 calculation
         let metrics_collector = Arc::new(MetricsCollector::new(performance_metrics, 1000));
+        let foreground_write_admission_policy = ForegroundWriteAdmissionPolicy::from_env(max_disk_reads);
 
         // Build queue config directly from scheduler config.
         let queue_config = IoPriorityQueueConfig::from_scheduler_config(&scheduler_config);
@@ -176,6 +416,7 @@ impl ConcurrencyManager {
             pattern_detector,
             bandwidth_monitor,
             metrics_collector,
+            foreground_write_admission_policy,
         }
     }
 
@@ -197,6 +438,26 @@ impl ConcurrencyManager {
     pub(crate) fn close_disk_read_admission_for_test(&self) {
         self.disk_read_semaphore.close();
         self.degraded_read_semaphore.close();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_put_admission_for_test(enabled: bool, limit: usize, wait_timeout: Duration) -> Self {
+        let mut manager = Self::new();
+        manager.foreground_write_admission_policy = ForegroundWriteAdmissionPolicy::strict_for_test(enabled, limit, wait_timeout);
+        manager
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_large_put_admission_for_test(
+        enabled: bool,
+        limit: usize,
+        min_size_bytes: usize,
+        wait_timeout: Duration,
+    ) -> Self {
+        let mut manager = Self::new();
+        manager.foreground_write_admission_policy =
+            ForegroundWriteAdmissionPolicy::large_for_test(enabled, limit, min_size_bytes, wait_timeout);
+        manager
     }
 
     /// Track a GetObject request
@@ -282,6 +543,28 @@ impl ConcurrencyManager {
                 }
             }
         }
+    }
+
+    /// Admit a foreground PutObject request under the configured write gate.
+    ///
+    /// The strict experimental gate applies to every PUT only when explicitly
+    /// enabled. Otherwise the default-on large-object gate protects sustained
+    /// erasure/RPC pressure while keeping small PUTs on the legacy path.
+    pub async fn admit_put_object(&self, size: i64) -> Result<ForegroundWriteAdmission, tokio::sync::AcquireError> {
+        self.foreground_write_admission_policy
+            .admit(ForegroundWriteAdmissionKind::PutObject, size)
+            .await
+    }
+
+    /// Admit a multipart UploadPart request under the configured write gate.
+    ///
+    /// Multipart workloads can saturate memory and internode write streams with
+    /// many moderate-sized parts, so they use an operation-specific threshold
+    /// while sharing the same foreground write permit pool.
+    pub async fn admit_multipart_part(&self, size: i64) -> Result<ForegroundWriteAdmission, tokio::sync::AcquireError> {
+        self.foreground_write_admission_policy
+            .admit(ForegroundWriteAdmissionKind::MultipartPart, size)
+            .await
     }
 
     // ============================================
@@ -692,24 +975,8 @@ impl ConcurrencyManager {
 
     /// Get a read-only workload admission snapshot for foreground writes.
     pub fn put_object_admission_snapshot(&self) -> WorkloadAdmissionSnapshot {
-        let active = PutObjectGuard::concurrent_count();
-        let limit = self.scheduler_config.max_concurrent_reads;
-        let state = if limit == 0 {
-            AdmissionState::Disabled
-        } else if active >= limit {
-            AdmissionState::Saturated
-        } else {
-            AdmissionState::Open
-        };
-
-        let admission =
-            WorkloadAdmissionSnapshot::new(WorkloadClass::ForegroundWrite, state).with_counts(Some(active), None, Some(limit));
-
-        match state {
-            AdmissionState::Disabled => admission.with_reason("foreground write pressure tracking disabled"),
-            AdmissionState::Saturated => admission.with_reason("foreground write concurrency reached local pressure limit"),
-            _ => admission,
-        }
+        self.foreground_write_admission_policy
+            .snapshot(self.scheduler_config.max_concurrent_reads)
     }
 
     /// Get a read-only workload admission registry snapshot for local storage concurrency.
@@ -783,7 +1050,7 @@ impl Default for ConcurrencyManager {
 mod integration_tests {
     use super::super::io_schedule::{IoLoadLevel, IoPriority};
     use super::super::request_guard::GetObjectGuard;
-    use super::ConcurrencyManager;
+    use super::{ConcurrencyManager, ForegroundWriteAdmission, derive_large_put_admission_limit};
     use crate::storage::storage_api::concurrency_consumer::PutObjectGuard;
     use rustfs_concurrency::{AdmissionState, WorkloadAdmissionSnapshotProvider, WorkloadClass};
     use rustfs_io_core::io_profile::{AccessPattern, StorageMedia};
@@ -862,7 +1129,7 @@ mod integration_tests {
     #[serial]
     async fn test_concurrency_manager_workload_admission_snapshot_tracks_put_requests() {
         crate::storage::concurrency::reset_active_put_requests();
-        let manager = ConcurrencyManager::new();
+        let manager = ConcurrencyManager::with_put_admission_for_test(false, 0, Duration::ZERO);
         let initial = manager.put_object_admission_snapshot();
 
         assert_eq!(initial.class, WorkloadClass::ForegroundWrite);
@@ -878,6 +1145,197 @@ mod integration_tests {
         assert_eq!(snapshot.limit, Some(manager.scheduler_config().max_concurrent_reads));
         drop(guard);
         crate::storage::concurrency::reset_active_put_requests();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_put_admission_disabled_does_not_touch_gate() {
+        let manager = ConcurrencyManager::with_put_admission_for_test(false, 1, Duration::ZERO);
+
+        let admission = manager
+            .admit_put_object(1024)
+            .await
+            .expect("disabled put admission must not close");
+
+        assert!(matches!(admission, ForegroundWriteAdmission::Disabled));
+        assert_eq!(manager.put_object_admission_snapshot().state, AdmissionState::Open);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_strict_put_admission_zero_limit_disables_large_gate() {
+        let manager = ConcurrencyManager::with_put_admission_for_test(true, 0, Duration::ZERO);
+
+        let admission = manager
+            .admit_put_object(32 * 1024 * 1024)
+            .await
+            .expect("strict zero-limit put admission must not close");
+
+        assert!(matches!(admission, ForegroundWriteAdmission::Disabled));
+        assert_eq!(manager.put_object_admission_snapshot().state, AdmissionState::Disabled);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_put_admission_rejects_when_limit_full() {
+        let manager = ConcurrencyManager::with_put_admission_for_test(true, 1, Duration::ZERO);
+
+        let first = manager
+            .admit_put_object(1024)
+            .await
+            .expect("first put admission should acquire");
+        assert!(matches!(first, ForegroundWriteAdmission::Admitted(_)));
+        assert_eq!(manager.put_object_admission_snapshot().state, AdmissionState::Saturated);
+
+        let second = manager
+            .admit_put_object(1024)
+            .await
+            .expect("full put admission gate should reject, not close");
+        assert!(matches!(second, ForegroundWriteAdmission::Rejected));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_put_admission_reuses_released_permit() {
+        let manager = ConcurrencyManager::with_put_admission_for_test(true, 1, Duration::ZERO);
+
+        let first = manager
+            .admit_put_object(1024)
+            .await
+            .expect("first put admission should acquire");
+        drop(first);
+
+        let second = manager
+            .admit_put_object(1024)
+            .await
+            .expect("released put admission permit should be reusable");
+        assert!(matches!(second, ForegroundWriteAdmission::Admitted(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn test_concurrency_manager_put_admission_wait_timeout_rejects() {
+        let manager = ConcurrencyManager::with_put_admission_for_test(true, 1, Duration::from_secs(5));
+        let held = manager
+            .admit_put_object(1024)
+            .await
+            .expect("first put admission should acquire");
+        let waiter_manager = manager.clone();
+
+        let waiter = tokio::spawn(async move { waiter_manager.admit_put_object(1024).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+
+        let admission = waiter
+            .await
+            .expect("put admission waiter task must not panic")
+            .expect("put admission gate must stay open");
+        assert!(matches!(admission, ForegroundWriteAdmission::Rejected));
+        drop(held);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_large_put_admission_bypasses_small_puts() {
+        let min_size = rustfs_config::DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_MIN_SIZE_BYTES;
+        let manager = ConcurrencyManager::with_large_put_admission_for_test(true, 1, min_size, Duration::ZERO);
+
+        let held = manager
+            .admit_put_object(min_size as i64)
+            .await
+            .expect("large put admission should acquire");
+        assert!(matches!(held, ForegroundWriteAdmission::Admitted(_)));
+
+        let small = manager
+            .admit_put_object((min_size - 1) as i64)
+            .await
+            .expect("small put should bypass large admission");
+        assert!(matches!(small, ForegroundWriteAdmission::Disabled));
+
+        let large = manager
+            .admit_put_object(min_size as i64)
+            .await
+            .expect("second large put should reject when the gate is full");
+        assert!(matches!(large, ForegroundWriteAdmission::Rejected));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_large_put_admission_gates_unknown_size() {
+        let manager = ConcurrencyManager::with_large_put_admission_for_test(true, 1, 32 * 1024 * 1024, Duration::ZERO);
+
+        let held = manager
+            .admit_put_object(-1)
+            .await
+            .expect("unknown-size put admission should acquire");
+        assert!(matches!(held, ForegroundWriteAdmission::Admitted(_)));
+
+        let second = manager
+            .admit_put_object(-1)
+            .await
+            .expect("unknown-size put admission should reject when the gate is full");
+        assert!(matches!(second, ForegroundWriteAdmission::Rejected));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_large_put_admission_gates_multipart_parts_by_default() {
+        let min_size = rustfs_config::DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_MIN_SIZE_BYTES;
+        let manager = ConcurrencyManager::with_large_put_admission_for_test(true, 1, min_size, Duration::ZERO);
+
+        let held = manager
+            .admit_multipart_part(1024)
+            .await
+            .expect("first multipart part admission should acquire");
+        assert!(matches!(held, ForegroundWriteAdmission::Admitted(_)));
+
+        let direct_small_put = manager
+            .admit_put_object((min_size - 1) as i64)
+            .await
+            .expect("small direct put should bypass the large put threshold");
+        assert!(matches!(direct_small_put, ForegroundWriteAdmission::Disabled));
+
+        let second_part = manager
+            .admit_multipart_part(1024)
+            .await
+            .expect("full multipart admission gate should reject, not close");
+        assert!(matches!(second_part, ForegroundWriteAdmission::Rejected));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_large_put_snapshot_tracks_gate() {
+        let manager = ConcurrencyManager::with_large_put_admission_for_test(true, 2, 32 * 1024 * 1024, Duration::ZERO);
+        let first = manager
+            .admit_put_object(32 * 1024 * 1024)
+            .await
+            .expect("first large put admission should acquire");
+        let initial = manager.put_object_admission_snapshot();
+
+        assert_eq!(initial.class, WorkloadClass::ForegroundWrite);
+        assert_eq!(initial.state, AdmissionState::Open);
+        assert_eq!(initial.active, Some(1));
+        assert_eq!(initial.limit, Some(2));
+
+        let second = manager
+            .admit_put_object(32 * 1024 * 1024)
+            .await
+            .expect("second large put admission should acquire");
+        let saturated = manager.put_object_admission_snapshot();
+
+        assert_eq!(saturated.state, AdmissionState::Saturated);
+        assert_eq!(saturated.active, Some(2));
+        assert_eq!(saturated.limit, Some(2));
+        drop((first, second));
+    }
+
+    #[test]
+    fn test_concurrency_manager_derives_large_put_admission_limit_from_scheduler_cap() {
+        assert_eq!(derive_large_put_admission_limit(7, 64), 7);
+        assert_eq!(derive_large_put_admission_limit(0, 64), 32);
+        assert_eq!(derive_large_put_admission_limit(0, 8), 4);
+        assert_eq!(derive_large_put_admission_limit(0, 1), 1);
+        assert_eq!(derive_large_put_admission_limit(0, 0), 32);
     }
 
     #[tokio::test]

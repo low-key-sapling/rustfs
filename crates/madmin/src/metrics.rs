@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::health::MemInfo;
@@ -78,7 +78,7 @@ pub struct DiskIOStats {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DiskMetric {
     #[serde(rename = "collected")]
-    pub collected_at: DateTime<Utc>,
+    pub collected_at: Timestamp,
     #[serde(rename = "n_disks")]
     pub n_disks: usize,
     #[serde(rename = "offline")]
@@ -302,10 +302,28 @@ pub struct ScannerUsageFreshnessSnapshot {
     pub last_usage_save_result: String,
     #[serde(rename = "last_usage_save_result_code", default)]
     pub last_usage_save_result_code: u64,
+    #[serde(rename = "last_durable_success_unix_secs", default)]
+    pub last_durable_success_unix_secs: u64,
+    #[serde(rename = "last_publication_unix_secs", default)]
+    pub last_publication_unix_secs: u64,
+    #[serde(rename = "last_publication_state", default)]
+    pub last_publication_state: String,
+    #[serde(rename = "last_publication_reason", default)]
+    pub last_publication_reason: String,
+    #[serde(rename = "deferred_pending", default)]
+    pub deferred_pending: bool,
+    #[serde(rename = "deferred_total", default)]
+    pub deferred_total: u64,
+    #[serde(rename = "last_deferred_unix_secs", default)]
+    pub last_deferred_unix_secs: u64,
+    #[serde(rename = "last_deferred_reason", default)]
+    pub last_deferred_reason: String,
 }
 
 impl ScannerUsageFreshnessSnapshot {
     fn merge(&mut self, other: &Self) {
+        let self_deferred_state_at = self.last_deferred_unix_secs.max(self.last_durable_success_unix_secs);
+        let other_deferred_state_at = other.last_deferred_unix_secs.max(other.last_durable_success_unix_secs);
         self.dirty_pending_buckets = self.dirty_pending_buckets.saturating_add(other.dirty_pending_buckets);
         self.last_dirty_mark_unix_secs = self.last_dirty_mark_unix_secs.max(other.last_dirty_mark_unix_secs);
         self.last_dirty_clear_unix_secs = self.last_dirty_clear_unix_secs.max(other.last_dirty_clear_unix_secs);
@@ -317,6 +335,22 @@ impl ScannerUsageFreshnessSnapshot {
             self.last_usage_save_unix_secs = other.last_usage_save_unix_secs;
             self.last_usage_save_result = other.last_usage_save_result.clone();
             self.last_usage_save_result_code = other.last_usage_save_result_code;
+        }
+        self.last_durable_success_unix_secs = self.last_durable_success_unix_secs.max(other.last_durable_success_unix_secs);
+        if other.last_publication_unix_secs > self.last_publication_unix_secs {
+            self.last_publication_unix_secs = other.last_publication_unix_secs;
+            self.last_publication_state = other.last_publication_state.clone();
+            self.last_publication_reason = other.last_publication_reason.clone();
+        }
+        self.deferred_total = self.deferred_total.saturating_add(other.deferred_total);
+        if other_deferred_state_at > self_deferred_state_at {
+            self.deferred_pending = other.deferred_pending;
+        } else if other_deferred_state_at == self_deferred_state_at {
+            self.deferred_pending |= other.deferred_pending;
+        }
+        if other.last_deferred_unix_secs > self.last_deferred_unix_secs {
+            self.last_deferred_unix_secs = other.last_deferred_unix_secs;
+            self.last_deferred_reason = other.last_deferred_reason.clone();
         }
     }
 }
@@ -542,15 +576,15 @@ impl ScannerLifecycleTransitionSnapshot {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ScannerMetrics {
     #[serde(rename = "collected")]
-    pub collected_at: DateTime<Utc>,
+    pub collected_at: Timestamp,
     #[serde(rename = "current_cycle")]
     pub current_cycle: u64,
     #[serde(rename = "current_cycle_active", default, skip_serializing_if = "Option::is_none")]
     pub current_cycle_active: Option<bool>,
     #[serde(rename = "current_started")]
-    pub current_started: DateTime<Utc>,
+    pub current_started: Timestamp,
     #[serde(rename = "cycle_complete_times")]
-    pub cycles_completed_at: Vec<DateTime<Utc>>,
+    pub cycles_completed_at: Vec<Timestamp>,
     #[serde(rename = "ongoing_buckets")]
     pub ongoing_buckets: usize,
     #[serde(rename = "active_scan_paths", default)]
@@ -689,6 +723,14 @@ pub struct ScannerMetrics {
     pub cycle_max_objects: u64,
     #[serde(rename = "cycle_max_directories", default)]
     pub cycle_max_directories: u64,
+    #[serde(rename = "cycle_timeout_total", default)]
+    pub cycle_timeout_total: u64,
+    #[serde(rename = "cycle_recovery_required_total", default)]
+    pub cycle_recovery_required_total: u64,
+    #[serde(rename = "cycle_last_progress_age", default)]
+    pub cycle_last_progress_age: u64,
+    #[serde(rename = "leader_lease_without_progress", default)]
+    pub leader_lease_without_progress: bool,
     #[serde(rename = "bitrot_cycle_enabled", default)]
     pub bitrot_cycle_enabled: bool,
     #[serde(rename = "bitrot_cycle_seconds", default)]
@@ -764,6 +806,8 @@ impl ScannerMetrics {
             self.cycle_max_duration_seconds = other.cycle_max_duration_seconds;
             self.cycle_max_objects = other.cycle_max_objects;
             self.cycle_max_directories = other.cycle_max_directories;
+            self.cycle_last_progress_age = other.cycle_last_progress_age;
+            self.leader_lease_without_progress = other.leader_lease_without_progress;
             self.bitrot_cycle_enabled = other.bitrot_cycle_enabled;
             self.bitrot_cycle_seconds = other.bitrot_cycle_seconds;
         }
@@ -857,6 +901,12 @@ impl ScannerMetrics {
             .saturating_add(other.last_cycle_replication_checks);
         self.last_cycle_usage_saves = self.last_cycle_usage_saves.saturating_add(other.last_cycle_usage_saves);
         self.failed_cycles = self.failed_cycles.saturating_add(other.failed_cycles);
+        self.cycle_timeout_total = self.cycle_timeout_total.saturating_add(other.cycle_timeout_total);
+        self.cycle_recovery_required_total = self
+            .cycle_recovery_required_total
+            .saturating_add(other.cycle_recovery_required_total);
+        self.cycle_last_progress_age = self.cycle_last_progress_age.max(other.cycle_last_progress_age);
+        self.leader_lease_without_progress |= other.leader_lease_without_progress;
         self.superseded_cycles = self.superseded_cycles.saturating_add(other.superseded_cycles);
         self.partial_cycles_unknown = self.partial_cycles_unknown.saturating_add(other.partial_cycles_unknown);
         self.partial_cycles_runtime = self.partial_cycles_runtime.saturating_add(other.partial_cycles_runtime);
@@ -1011,7 +1061,7 @@ impl Metrics {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RPCMetrics {
     #[serde(rename = "collectedAt")]
-    pub collected_at: DateTime<Utc>,
+    pub collected_at: Timestamp,
 
     pub connected: i32,
 
@@ -1041,7 +1091,7 @@ pub struct RPCMetrics {
     pub out_queue: i32,
 
     #[serde(rename = "lastPongTime")]
-    pub last_pong_time: DateTime<Utc>,
+    pub last_pong_time: Timestamp,
 
     #[serde(rename = "lastPingMS")]
     pub last_ping_ms: f64,
@@ -1050,7 +1100,7 @@ pub struct RPCMetrics {
     pub max_ping_dur_ms: f64, // Maximum across all merged entries.
 
     #[serde(rename = "lastConnectTime")]
-    pub last_connect_time: DateTime<Utc>,
+    pub last_connect_time: Timestamp,
 
     #[serde(rename = "byDestination", skip_serializing_if = "Option::is_none")]
     pub by_destination: Option<HashMap<String, RPCMetrics>>,
@@ -1125,7 +1175,7 @@ pub struct CPUMetrics {}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct NetMetrics {
     #[serde(rename = "collected")]
-    pub collected_at: DateTime<Utc>,
+    pub collected_at: Timestamp,
     #[serde(rename = "interfaceName")]
     pub interface_name: String,
     #[serde(rename = "netstats")]
@@ -1214,7 +1264,7 @@ pub struct NetDevLine {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MemMetrics {
     #[serde(rename = "collected")]
-    pub collected_at: DateTime<Utc>,
+    pub collected_at: Timestamp,
     #[serde(rename = "memInfo")]
     pub info: MemInfo,
 }
@@ -1222,13 +1272,13 @@ pub struct MemMetrics {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SiteResyncMetrics {
     #[serde(rename = "collected")]
-    pub collected_at: DateTime<Utc>,
+    pub collected_at: Timestamp,
     #[serde(rename = "resyncStatus", skip_serializing_if = "Option::is_none")]
     pub resync_status: Option<String>,
     #[serde(rename = "startTime")]
-    pub start_time: DateTime<Utc>,
+    pub start_time: Timestamp,
     #[serde(rename = "lastUpdate")]
-    pub last_update: DateTime<Utc>,
+    pub last_update: Timestamp,
     #[serde(rename = "numBuckets")]
     pub num_buckets: i64,
     #[serde(rename = "resyncID")]
@@ -1262,7 +1312,7 @@ impl SiteResyncMetrics {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct BatchJobMetrics {
     #[serde(rename = "collected")]
-    pub collected_at: DateTime<Utc>,
+    pub collected_at: Timestamp,
     #[serde(rename = "Jobs")]
     pub jobs: HashMap<String, JobMetric>,
 }
@@ -1290,9 +1340,9 @@ pub struct JobMetric {
     #[serde(rename = "jobType")]
     pub job_type: String,
     #[serde(rename = "startTime")]
-    pub start_time: DateTime<Utc>,
+    pub start_time: Timestamp,
     #[serde(rename = "lastUpdate")]
-    pub last_update: DateTime<Utc>,
+    pub last_update: Timestamp,
     #[serde(rename = "retryAttempts")]
     pub retry_attempts: i32,
     pub complete: bool,
@@ -1385,7 +1435,7 @@ impl RealtimeMetrics {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct OsMetrics {
     #[serde(rename = "collected")]
-    pub collected_at: DateTime<Utc>,
+    pub collected_at: Timestamp,
     #[serde(rename = "life_time_ops")]
     pub life_time_ops: HashMap<String, u64>,
     #[serde(rename = "last_minute")]
@@ -1417,6 +1467,119 @@ pub struct Operations {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jiff::SignedDuration;
+
+    fn fixed_timestamp() -> Timestamp {
+        Timestamp::constant(1_700_000_000, 123_456_000)
+    }
+
+    #[test]
+    fn admin_metrics_timestamps_serialize_as_rfc3339_utc() {
+        let timestamp = fixed_timestamp();
+
+        let disk = serde_json::to_value(DiskMetric {
+            collected_at: timestamp,
+            ..Default::default()
+        })
+        .expect("disk metrics should serialize");
+        assert_eq!(disk["collected"], "2023-11-14T22:13:20.123456Z");
+        let disk: DiskMetric = serde_json::from_value(disk).expect("disk metrics should deserialize");
+        assert_eq!(disk.collected_at, timestamp);
+
+        let scanner = serde_json::to_value(ScannerMetrics {
+            collected_at: timestamp,
+            current_started: timestamp,
+            cycles_completed_at: vec![timestamp],
+            ..Default::default()
+        })
+        .expect("scanner metrics should serialize");
+        assert_eq!(scanner["collected"], "2023-11-14T22:13:20.123456Z");
+        assert_eq!(scanner["current_started"], "2023-11-14T22:13:20.123456Z");
+        assert_eq!(scanner["cycle_complete_times"][0], "2023-11-14T22:13:20.123456Z");
+        let scanner: ScannerMetrics = serde_json::from_value(scanner).expect("scanner metrics should deserialize");
+        assert_eq!(scanner.collected_at, timestamp);
+        assert_eq!(scanner.current_started, timestamp);
+        assert_eq!(scanner.cycles_completed_at, vec![timestamp]);
+
+        let rpc = serde_json::to_value(RPCMetrics {
+            collected_at: timestamp,
+            last_pong_time: timestamp,
+            last_connect_time: timestamp,
+            ..Default::default()
+        })
+        .expect("rpc metrics should serialize");
+        assert_eq!(rpc["collectedAt"], "2023-11-14T22:13:20.123456Z");
+        assert_eq!(rpc["lastPongTime"], "2023-11-14T22:13:20.123456Z");
+        assert_eq!(rpc["lastConnectTime"], "2023-11-14T22:13:20.123456Z");
+        let rpc: RPCMetrics = serde_json::from_value(rpc).expect("rpc metrics should deserialize");
+        assert_eq!(rpc.collected_at, timestamp);
+        assert_eq!(rpc.last_pong_time, timestamp);
+        assert_eq!(rpc.last_connect_time, timestamp);
+
+        let batch = serde_json::to_value(BatchJobMetrics {
+            collected_at: timestamp,
+            jobs: HashMap::from([(
+                "job-a".to_string(),
+                JobMetric {
+                    job_id: "job-a".to_string(),
+                    start_time: timestamp,
+                    last_update: timestamp,
+                    ..Default::default()
+                },
+            )]),
+        })
+        .expect("batch metrics should serialize");
+        assert_eq!(batch["collected"], "2023-11-14T22:13:20.123456Z");
+        assert_eq!(batch["Jobs"]["job-a"]["startTime"], "2023-11-14T22:13:20.123456Z");
+        assert_eq!(batch["Jobs"]["job-a"]["lastUpdate"], "2023-11-14T22:13:20.123456Z");
+        let batch: BatchJobMetrics = serde_json::from_value(batch).expect("batch metrics should deserialize");
+        assert_eq!(batch.collected_at, timestamp);
+        let job = batch.jobs.get("job-a").expect("job should deserialize");
+        assert_eq!(job.start_time, timestamp);
+        assert_eq!(job.last_update, timestamp);
+
+        let net = serde_json::to_value(NetMetrics {
+            collected_at: timestamp,
+            ..Default::default()
+        })
+        .expect("net metrics should serialize");
+        assert_eq!(net["collected"], "2023-11-14T22:13:20.123456Z");
+        let net: NetMetrics = serde_json::from_value(net).expect("net metrics should deserialize");
+        assert_eq!(net.collected_at, timestamp);
+
+        let mem = serde_json::to_value(MemMetrics {
+            collected_at: timestamp,
+            ..Default::default()
+        })
+        .expect("mem metrics should serialize");
+        assert_eq!(mem["collected"], "2023-11-14T22:13:20.123456Z");
+        let mem: MemMetrics = serde_json::from_value(mem).expect("mem metrics should deserialize");
+        assert_eq!(mem.collected_at, timestamp);
+
+        let site_resync = serde_json::to_value(SiteResyncMetrics {
+            collected_at: timestamp,
+            start_time: timestamp,
+            last_update: timestamp,
+            ..Default::default()
+        })
+        .expect("site resync metrics should serialize");
+        assert_eq!(site_resync["collected"], "2023-11-14T22:13:20.123456Z");
+        assert_eq!(site_resync["startTime"], "2023-11-14T22:13:20.123456Z");
+        assert_eq!(site_resync["lastUpdate"], "2023-11-14T22:13:20.123456Z");
+        let site_resync: SiteResyncMetrics = serde_json::from_value(site_resync).expect("site resync metrics should deserialize");
+        assert_eq!(site_resync.collected_at, timestamp);
+        assert_eq!(site_resync.start_time, timestamp);
+        assert_eq!(site_resync.last_update, timestamp);
+
+        let os = serde_json::to_value(OsMetrics {
+            collected_at: timestamp,
+            ..Default::default()
+        })
+        .expect("os metrics should serialize");
+        assert_eq!(os["collected"], "2023-11-14T22:13:20.123456Z");
+        let os: OsMetrics = serde_json::from_value(os).expect("os metrics should deserialize");
+        assert_eq!(os.collected_at, timestamp);
+    }
 
     #[test]
     fn scanner_metrics_serializes_cycle_active_presence() {
@@ -1438,10 +1601,51 @@ mod tests {
     }
 
     #[test]
+    fn usage_freshness_deferred_fields_are_backward_compatible_and_merge() {
+        let legacy: ScannerUsageFreshnessSnapshot = serde_json::from_value(serde_json::json!({
+            "dirty_pending_buckets": 2,
+            "last_usage_save_result": "success"
+        }))
+        .expect("legacy usage freshness should decode");
+        assert!(!legacy.deferred_pending);
+        assert_eq!(legacy.deferred_total, 0);
+
+        let mut merged = ScannerUsageFreshnessSnapshot::default();
+        merged.merge(&ScannerUsageFreshnessSnapshot {
+            deferred_pending: true,
+            deferred_total: 2,
+            last_deferred_unix_secs: 20,
+            last_deferred_reason: "data_movement".to_string(),
+            ..Default::default()
+        });
+        merged.merge(&ScannerUsageFreshnessSnapshot {
+            deferred_total: 1,
+            last_deferred_unix_secs: 10,
+            last_deferred_reason: "older".to_string(),
+            ..Default::default()
+        });
+        assert!(merged.deferred_pending);
+        assert_eq!(merged.deferred_total, 3);
+        assert_eq!(merged.last_deferred_unix_secs, 20);
+        assert_eq!(merged.last_deferred_reason, "data_movement");
+
+        merged.merge(&ScannerUsageFreshnessSnapshot {
+            deferred_pending: false,
+            last_durable_success_unix_secs: 30,
+            last_publication_unix_secs: 30,
+            last_publication_state: "success".to_string(),
+            ..Default::default()
+        });
+        assert!(!merged.deferred_pending);
+        assert_eq!(merged.last_durable_success_unix_secs, 30);
+        assert_eq!(merged.last_publication_state, "success");
+    }
+
+    #[test]
     fn scanner_metrics_merge_prefers_an_active_first_cycle() {
-        let collected_at = Utc::now();
-        let idle_started = collected_at - chrono::Duration::hours(1);
-        let active_started = collected_at - chrono::Duration::seconds(5);
+        let collected_at = Timestamp::now();
+        let idle_started = collected_at - SignedDuration::from_hours(1);
+        let active_started = collected_at - SignedDuration::from_secs(5);
         let mut scanner = ScannerMetrics {
             collected_at,
             current_cycle: 0,
@@ -1451,7 +1655,7 @@ mod tests {
         };
 
         scanner.merge(&ScannerMetrics {
-            collected_at: collected_at + chrono::Duration::seconds(1),
+            collected_at: collected_at + SignedDuration::from_secs(1),
             current_cycle: 0,
             current_cycle_active: Some(true),
             current_started: active_started,
@@ -1481,14 +1685,14 @@ mod tests {
 
     #[test]
     fn scanner_metrics_merge_preserves_legacy_nonzero_active_signal() {
-        let collected_at = Utc::now();
+        let collected_at = Timestamp::now();
         let mut scanner = ScannerMetrics {
             collected_at,
             ..Default::default()
         };
 
         scanner.merge(&ScannerMetrics {
-            collected_at: collected_at + chrono::Duration::seconds(1),
+            collected_at: collected_at + SignedDuration::from_secs(1),
             current_cycle: 7,
             ..Default::default()
         });
@@ -1517,7 +1721,7 @@ mod tests {
 
     #[test]
     fn scanner_metrics_merge_preserves_explicit_inactive_nonzero_cycle() {
-        let collected_at = Utc::now();
+        let collected_at = Timestamp::now();
         let mut scanner = ScannerMetrics::default();
 
         scanner.merge(&ScannerMetrics {
@@ -1533,18 +1737,18 @@ mod tests {
 
     #[test]
     fn scanner_metrics_merge_cycle_active_is_order_independent() {
-        let collected_at = Utc::now();
+        let collected_at = Timestamp::now();
         let legacy_active = ScannerMetrics {
             collected_at,
             current_cycle: 7,
-            current_started: collected_at - chrono::Duration::seconds(10),
+            current_started: collected_at - SignedDuration::from_secs(10),
             ..Default::default()
         };
         let explicit_idle = ScannerMetrics {
             collected_at,
             current_cycle: 0,
             current_cycle_active: Some(false),
-            current_started: collected_at - chrono::Duration::hours(1),
+            current_started: collected_at - SignedDuration::from_hours(1),
             ..Default::default()
         };
 
@@ -1575,21 +1779,21 @@ mod tests {
 
     #[test]
     fn scanner_metrics_merge_cycle_authority_is_order_independent() {
-        let collected_at = Utc::now();
-        let completion = collected_at - chrono::Duration::minutes(1);
+        let collected_at = Timestamp::now();
+        let completion = collected_at - SignedDuration::from_mins(1);
         let earlier_active = ScannerMetrics {
             collected_at,
             current_cycle: 7,
             current_cycle_active: Some(true),
-            current_started: collected_at - chrono::Duration::seconds(10),
+            current_started: collected_at - SignedDuration::from_secs(10),
             cycles_completed_at: vec![completion],
             ..Default::default()
         };
         let later_active = ScannerMetrics {
-            collected_at: collected_at + chrono::Duration::seconds(1),
+            collected_at: collected_at + SignedDuration::from_secs(1),
             current_cycle: 7,
             current_cycle_active: Some(true),
-            current_started: collected_at - chrono::Duration::seconds(5),
+            current_started: collected_at - SignedDuration::from_secs(5),
             cycles_completed_at: vec![completion],
             ..Default::default()
         };
@@ -1607,13 +1811,13 @@ mod tests {
         let stale_idle = ScannerMetrics {
             collected_at,
             current_cycle_active: Some(false),
-            current_started: collected_at - chrono::Duration::hours(1),
+            current_started: collected_at - SignedDuration::from_hours(1),
             ..Default::default()
         };
         let completed_idle = ScannerMetrics {
-            collected_at: collected_at + chrono::Duration::seconds(1),
+            collected_at: collected_at + SignedDuration::from_secs(1),
             current_cycle_active: Some(false),
-            current_started: collected_at - chrono::Duration::seconds(5),
+            current_started: collected_at - SignedDuration::from_secs(5),
             cycles_completed_at: vec![completion],
             ..Default::default()
         };
@@ -1631,29 +1835,29 @@ mod tests {
 
     #[test]
     fn scanner_metrics_merge_cycle_authority_is_associative() {
-        let collected_at = Utc::now();
-        let older_completion = collected_at - chrono::Duration::minutes(3);
-        let last_completion = collected_at - chrono::Duration::minutes(1);
+        let collected_at = Timestamp::now();
+        let older_completion = collected_at - SignedDuration::from_mins(3);
+        let last_completion = collected_at - SignedDuration::from_mins(1);
         let cycle_seven = ScannerMetrics {
             collected_at,
             current_cycle: 7,
             current_cycle_active: Some(true),
-            current_started: collected_at - chrono::Duration::seconds(10),
+            current_started: collected_at - SignedDuration::from_secs(10),
             cycles_completed_at: vec![older_completion, last_completion],
             ..Default::default()
         };
         let cycle_eight = ScannerMetrics {
-            collected_at: collected_at + chrono::Duration::seconds(1),
+            collected_at: collected_at + SignedDuration::from_secs(1),
             current_cycle: 8,
             current_cycle_active: Some(true),
-            current_started: collected_at - chrono::Duration::seconds(5),
+            current_started: collected_at - SignedDuration::from_secs(5),
             cycles_completed_at: vec![last_completion],
             ..Default::default()
         };
         let newer_idle = ScannerMetrics {
-            collected_at: collected_at + chrono::Duration::hours(1),
+            collected_at: collected_at + SignedDuration::from_hours(1),
             current_cycle_active: Some(false),
-            current_started: collected_at - chrono::Duration::hours(1),
+            current_started: collected_at - SignedDuration::from_hours(1),
             ..Default::default()
         };
 
@@ -1694,7 +1898,7 @@ mod tests {
 
     #[test]
     fn scanner_metrics_merge_aggregates_partial_cycles_by_source() {
-        let collected_at = Utc::now();
+        let collected_at = Timestamp::now();
         let mut scanner = ScannerMetrics {
             collected_at,
             last_cycle_partial_source: "usage".to_string(),
@@ -1717,7 +1921,7 @@ mod tests {
         };
 
         scanner.merge(&ScannerMetrics {
-            collected_at: collected_at + chrono::Duration::seconds(1),
+            collected_at: collected_at + SignedDuration::from_secs(1),
             last_cycle_partial_source: "lifecycle".to_string(),
             last_cycle_partial_source_code: 2,
             pacing_pressure: ScannerPacingPressureSnapshot {
@@ -1769,7 +1973,7 @@ mod tests {
 
     #[test]
     fn scanner_metrics_merge_preserves_pause_pressure_without_duration() {
-        let collected_at = Utc::now();
+        let collected_at = Timestamp::now();
         let mut scanner = ScannerMetrics {
             collected_at,
             pacing_pressure: ScannerPacingPressureSnapshot {
@@ -1780,7 +1984,7 @@ mod tests {
         };
 
         scanner.merge(&ScannerMetrics {
-            collected_at: collected_at + chrono::Duration::seconds(1),
+            collected_at: collected_at + SignedDuration::from_secs(1),
             pacing_pressure: ScannerPacingPressureSnapshot::default(),
             ..Default::default()
         });
@@ -1805,7 +2009,7 @@ mod tests {
 
     #[test]
     fn scanner_metrics_merge_aggregates_lifecycle_transition_status() {
-        let collected_at = Utc::now();
+        let collected_at = Timestamp::now();
         let mut scanner = ScannerMetrics {
             collected_at,
             current_cycle_lifecycle_expiry_actions: 2,
@@ -1843,7 +2047,7 @@ mod tests {
         };
 
         scanner.merge(&ScannerMetrics {
-            collected_at: collected_at + chrono::Duration::seconds(1),
+            collected_at: collected_at + SignedDuration::from_secs(1),
             current_cycle_lifecycle_expiry_actions: 11,
             current_cycle_lifecycle_transition_actions: 13,
             last_cycle_lifecycle_expiry_actions: 17,
@@ -1909,7 +2113,7 @@ mod tests {
 
     #[test]
     fn scanner_metrics_merge_aggregates_maintenance_control_status() {
-        let collected_at = Utc::now();
+        let collected_at = Timestamp::now();
         let mut scanner = ScannerMetrics {
             collected_at,
             maintenance_control: ScannerMaintenanceControlSnapshot {
@@ -1930,7 +2134,7 @@ mod tests {
         };
 
         scanner.merge(&ScannerMetrics {
-            collected_at: collected_at + chrono::Duration::seconds(1),
+            collected_at: collected_at + SignedDuration::from_secs(1),
             maintenance_control: ScannerMaintenanceControlSnapshot {
                 primary_control: "blocked_source".to_string(),
                 sources: vec![
@@ -1990,7 +2194,7 @@ mod tests {
 
     #[test]
     fn scanner_metrics_merge_aggregates_replication_repair_status() {
-        let collected_at = Utc::now();
+        let collected_at = Timestamp::now();
         let mut scanner = ScannerMetrics {
             collected_at,
             replication_repair: vec![ScannerReplicationRepairSnapshot {
@@ -2005,7 +2209,7 @@ mod tests {
         };
 
         scanner.merge(&ScannerMetrics {
-            collected_at: collected_at + chrono::Duration::seconds(1),
+            collected_at: collected_at + SignedDuration::from_secs(1),
             replication_repair: vec![
                 ScannerReplicationRepairSnapshot {
                     source: "bucket_replication".to_string(),
@@ -2066,7 +2270,7 @@ mod tests {
 
     #[test]
     fn scanner_metrics_merge_preserves_replication_repair_metadata_from_newer_nodes() {
-        let collected_at = Utc::now();
+        let collected_at = Timestamp::now();
         let mut scanner = ScannerMetrics {
             collected_at,
             replication_repair: vec![ScannerReplicationRepairSnapshot {
@@ -2091,7 +2295,7 @@ mod tests {
         };
 
         scanner.merge(&ScannerMetrics {
-            collected_at: collected_at + chrono::Duration::seconds(1),
+            collected_at: collected_at + SignedDuration::from_secs(1),
             replication_repair: vec![ScannerReplicationRepairSnapshot {
                 source: "bucket_replication".to_string(),
                 kind: "object".to_string(),
@@ -2149,7 +2353,7 @@ mod tests {
 
     #[test]
     fn scanner_metrics_merge_preserves_distributed_status_fields() {
-        let collected_at = Utc::now();
+        let collected_at = Timestamp::now();
         let mut scanner = ScannerMetrics {
             collected_at,
             active_scan_paths: 1,
@@ -2223,7 +2427,7 @@ mod tests {
         };
 
         scanner.merge(&ScannerMetrics {
-            collected_at: collected_at + chrono::Duration::seconds(1),
+            collected_at: collected_at + SignedDuration::from_secs(1),
             active_scan_paths: 2,
             oldest_active_path_age_seconds: 45,
             active_paths: vec!["node-b/disk-b/bucket-b".to_string()],

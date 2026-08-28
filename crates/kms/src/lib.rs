@@ -70,6 +70,7 @@ pub mod backends;
 pub mod backup;
 mod cache;
 pub mod config;
+pub mod config_secret;
 pub mod deletion_worker;
 mod encryption;
 mod error;
@@ -255,6 +256,10 @@ pub use cache::KmsCacheStats;
 pub use config::*;
 pub use deletion_worker::DeletionReferenceChecker;
 pub use encryption::is_data_key_envelope;
+// Re-exported so the object layer binds encryption context exactly the way the
+// KMS backends do. A second canonicalization is how the object layer once
+// serialized a HashMap directly while the Static backend already sorted keys.
+pub use encryption::context_aad;
 pub use error::{KmsError, KmsUnavailableError, Result};
 pub use key_impact::{KeyImpactReport, KeyReference, KeyReferenceKind, ReferenceCompleteness, ReferenceCoverage, ReferenceScope};
 pub use manager::KmsManager;

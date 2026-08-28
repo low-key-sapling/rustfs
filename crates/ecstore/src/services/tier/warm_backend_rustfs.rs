@@ -21,22 +21,43 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::client::{
-    admin_handler_utils::AdminError,
-    api_put_object::PutObjectOptions,
-    credentials::{Credentials, SignatureType, Static, Value},
-    transition_api::{Options, ReadCloser, ReaderImpl, TransitionClient, TransitionCore},
-};
 use crate::services::tier::{
     tier_config::TierRustFS,
     warm_backend::{TransitionCandidateProbe, WarmBackend, WarmBackendGetOpts, build_transition_put_options},
     warm_backend_s3::WarmBackendS3,
 };
+use rustfs_s3_client::{
+    admin_handler_utils::AdminError,
+    api_put_object::PutObjectOptions,
+    credentials::{Credentials, SignatureType, Static, Value},
+    transition_api::{Options, ReadCloser, ReaderImpl, TransitionClient, TransitionCore},
+};
+use rustfs_utils::egress::{OutboundUrlError, validate_outbound_url};
 
 const MAX_MULTIPART_PUT_OBJECT_SIZE: i64 = 1024 * 1024 * 1024 * 1024 * 5;
 const MAX_PARTS_COUNT: i64 = 10000;
 const _MAX_PART_SIZE: i64 = 1024 * 1024 * 1024 * 5;
 const MIN_PART_SIZE: i64 = 1024 * 1024 * 128;
+// Debug-only opt-in for single-host test/dev setups; release builds always reject loopback.
+const ALLOW_LOOPBACK_TIER_ENDPOINT_ENV: &str = "RUSTFS_TIER_RUSTFS_ALLOW_LOOPBACK_ENDPOINT";
+
+fn validate_rustfs_tier_endpoint(url: &url::Url) -> Result<(), OutboundUrlError> {
+    let allow_loopback = cfg!(debug_assertions)
+        && std::env::var(ALLOW_LOOPBACK_TIER_ENDPOINT_ENV)
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+    validate_rustfs_tier_endpoint_inner(url, allow_loopback)
+}
+
+fn validate_rustfs_tier_endpoint_inner(url: &url::Url, allow_loopback: bool) -> Result<(), OutboundUrlError> {
+    match validate_outbound_url(url) {
+        Err(OutboundUrlError::ForbiddenHost {
+            reason: "loopback address" | "loopback host",
+            ..
+        }) if allow_loopback => Ok(()),
+        result => result,
+    }
+}
 
 pub struct WarmBackendRustFS(WarmBackendS3);
 
@@ -54,6 +75,7 @@ impl WarmBackendRustFS {
             Ok(u) => u,
             Err(e) => return Err(std::io::Error::other(e)),
         };
+        validate_rustfs_tier_endpoint(&u).map_err(|err| std::io::Error::other(format!("tier endpoint is not allowed: {err}")))?;
 
         let creds = Credentials::new(Static(Value {
             access_key_id: conf.access_key.clone(),
@@ -65,7 +87,6 @@ impl WarmBackendRustFS {
         let opts = Options {
             creds,
             secure: u.scheme() == "https",
-            trailing_headers: true,
             region: conf.region.clone(),
             ..Default::default()
         };
@@ -196,5 +217,24 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("host"), "expected host validation error, got: {err}");
+    }
+
+    #[tokio::test]
+    async fn new_rejects_loopback_endpoint_before_network_setup() {
+        let conf = rustfs_tier("https://127.0.0.1:9000");
+
+        match WarmBackendRustFS::new(&conf, "tier").await {
+            Ok(_) => panic!("loopback endpoint should be rejected"),
+            Err(err) => assert!(err.to_string().contains("not allowed")),
+        }
+    }
+
+    #[test]
+    fn loopback_opt_in_does_not_allow_other_private_endpoints() {
+        let loopback = url::Url::parse("https://127.0.0.1:9000").unwrap();
+        assert!(validate_rustfs_tier_endpoint_inner(&loopback, true).is_ok());
+
+        let private = url::Url::parse("https://10.0.0.1:9000").unwrap();
+        assert!(validate_rustfs_tier_endpoint_inner(&private, true).is_err());
     }
 }

@@ -27,6 +27,11 @@ use uuid::Uuid;
 pub const REPLICATION_RESET: &str = "replication-reset";
 pub const REPLICATION_STATUS: &str = "replication-status";
 
+/// The S3 wire spelling of the unversioned ("null") version id. Owned here as
+/// part of the replication wire contracts; `rustfs-filemeta` keeps its own
+/// copy of the same literal (the crates are intentionally independent).
+pub const NULL_VERSION_ID: &str = "null";
+
 // ReplicateQueued - replication being queued trail
 pub const REPLICATE_QUEUED: &str = "replicate:queue";
 
@@ -48,6 +53,14 @@ pub const REPLICATE_HEAL: &str = "replicate:heal";
 pub const REPLICATE_HEAL_DELETE: &str = "replicate:heal:delete";
 
 /// StatusType of Replication for x-amz-replication-status header
+///
+/// NOTE: `rustfs-filemeta` owns a sibling copy of this enum (plus
+/// `VersionPurgeStatusType` and `ReplicationState`) bound to the xl.meta disk
+/// format, while this copy is bound to the MRF/resync persistence format.
+/// When adding or renaming a variant here, reconcile the sibling and the
+/// conversion layer — the reconciliation tests in
+/// `crates/ecstore/src/bucket/replication/replication_filemeta_boundary.rs`
+/// fail to compile until both sides agree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, Hash)]
 pub enum ReplicationStatusType {
     /// Pending - replication is pending.
@@ -239,6 +252,13 @@ pub struct ReplicationState {
     pub targets: HashMap<String, ReplicationStatusType>,
     pub purge_targets: HashMap<String, VersionPurgeStatusType>,
     pub reset_statuses_map: HashMap<String, String>,
+    /// Skipped by serde: this state has a positional wire form, so the map
+    /// travels in the object's internal metadata and is re-derived on read.
+    /// Kept in step with the filemeta crate's copy of the same state.
+    #[serde(skip)]
+    pub target_delete_marker_version_ids: HashMap<String, String>,
+    #[serde(skip)]
+    pub target_delete_marker_version_ids_corrupt: bool,
 }
 
 impl ReplicationState {
@@ -311,6 +331,7 @@ impl ReplicationState {
             arn: arn.to_string(),
             prev_replication_status: self.targets.get(arn).cloned().unwrap_or_default(),
             version_purge_status: self.purge_targets.get(arn).cloned().unwrap_or_default(),
+            target_delete_marker_version_id: self.target_delete_marker_version_ids.get(arn).cloned(),
             resync_timestamp,
             ..Default::default()
         }
@@ -414,6 +435,9 @@ pub struct ReplicatedTargetInfo {
     pub endpoint: String,
     pub secure: bool,
     pub error: Option<String>,
+    /// Version the target assigned to the delete marker it just created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_delete_marker_version_id: Option<String>,
 }
 
 impl ReplicatedTargetInfo {
@@ -572,7 +596,7 @@ impl MrfOpKind {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct MrfReplicateEntry {
     #[serde(rename = "bucket")]
     pub bucket: String,
@@ -619,6 +643,17 @@ pub struct MrfReplicateEntry {
 
     #[serde(rename = "targetARNs", skip_serializing_if = "Vec::is_empty", default)]
     pub target_arns: Vec<String>,
+
+    // Force-delete entries use the target ARN list above as their immutable target set.
+    // The id distinguishes a durable intent from legacy MRF delete entries.
+    #[serde(rename = "forceDeleteID", skip_serializing_if = "Option::is_none", default)]
+    pub force_delete_id: Option<Uuid>,
+    #[serde(rename = "forceDeleteGeneration", skip_serializing_if = "Option::is_none", default)]
+    pub force_delete_generation: Option<i64>,
+
+    // Replay is allowed only after the source-side recursive delete has committed.
+    #[serde(rename = "forceDeleteLocalCommit", default)]
+    pub force_delete_local_commit: bool,
 }
 
 fn retry_count_to_mrf(retry_count: u32) -> i32 {
@@ -865,6 +900,7 @@ impl ReplicationWorkerOperation for ReplicateObjectInfo {
             delete_marker: false,
             delete_marker_mtime: None,
             target_arns: self.admitted_target_arns(),
+            ..Default::default()
         }
     }
 
@@ -945,6 +981,7 @@ impl ReplicateObjectInfo {
             delete_marker: false,
             delete_marker_mtime: None,
             target_arns: self.admitted_target_arns(),
+            ..Default::default()
         }
     }
 }
@@ -1009,6 +1046,11 @@ fn version_purge_statuses_string(targets: &HashMap<String, VersionPurgeStatusTyp
     if result.is_empty() { None } else { Some(result) }
 }
 
+/// Kept in step with the bounds used by the filemeta crate's copy.
+const MAX_REPLICATION_TARGET_VERSION_ENTRIES: usize = 1_000;
+const MAX_REPLICATION_TARGET_ARN_LEN: usize = 1_024;
+const MAX_REPLICATION_TARGET_VERSION_ID_LEN: usize = 1_024;
+
 pub fn get_replication_state(rinfos: &ReplicatedInfos, prev_state: &ReplicationState, _vid: Option<String>) -> ReplicationState {
     let reset_status_map: Vec<(String, String)> = rinfos
         .targets
@@ -1035,6 +1077,35 @@ pub fn get_replication_state(rinfos: &ReplicatedInfos, prev_state: &ReplicationS
         reset_statuses_map.insert(key, value);
     }
 
+    // Carry forward the recorded per-target delete-marker versions, dropping
+    // anything outside the bounds, then fold in what this round's targets
+    // reported. A map already past the cap is discarded rather than trusted.
+    let mut target_delete_marker_version_ids = prev_state.target_delete_marker_version_ids.clone();
+    target_delete_marker_version_ids.retain(|arn, version_id| {
+        !arn.is_empty()
+            && arn.len() <= MAX_REPLICATION_TARGET_ARN_LEN
+            && !version_id.is_empty()
+            && version_id.len() <= MAX_REPLICATION_TARGET_VERSION_ID_LEN
+    });
+    if target_delete_marker_version_ids.len() > MAX_REPLICATION_TARGET_VERSION_ENTRIES {
+        target_delete_marker_version_ids.clear();
+    }
+    for target in &rinfos.targets {
+        let Some(version_id) = target.target_delete_marker_version_id.as_ref() else {
+            continue;
+        };
+        if (!target_delete_marker_version_ids.contains_key(&target.arn)
+            && target_delete_marker_version_ids.len() >= MAX_REPLICATION_TARGET_VERSION_ENTRIES)
+            || target.arn.is_empty()
+            || target.arn.len() > MAX_REPLICATION_TARGET_ARN_LEN
+            || version_id.is_empty()
+            || version_id.len() > MAX_REPLICATION_TARGET_VERSION_ID_LEN
+        {
+            continue;
+        }
+        target_delete_marker_version_ids.insert(target.arn.clone(), version_id.clone());
+    }
+
     ReplicationState {
         replicate_decision_str: prev_state.replicate_decision_str.clone(),
         reset_statuses_map,
@@ -1045,6 +1116,8 @@ pub fn get_replication_state(rinfos: &ReplicatedInfos, prev_state: &ReplicationS
         replication_timestamp: rinfos.replication_timestamp,
         purge_targets,
         version_purge_status_internal: vpurge_statuses,
+        target_delete_marker_version_ids,
+        target_delete_marker_version_ids_corrupt: prev_state.target_delete_marker_version_ids_corrupt,
 
         ..Default::default()
     }

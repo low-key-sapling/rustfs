@@ -17,24 +17,91 @@
 use crate::audit::{KmsAuditOperation, KmsAuditRecord, KmsAuditSink};
 use crate::backends::KmsBackend;
 use crate::cache::{KmsCache, KmsCacheStats};
-use crate::config::{ENV_KMS_ALLOW_IMMEDIATE_DELETION, KmsConfig};
+use crate::config::{ENV_KMS_ALLOW_IMMEDIATE_DELETION, ENV_KMS_ROTATION_MAX_AGE_SECS, ENV_KMS_ROTATION_MAX_WRAPS, KmsConfig};
 use crate::deletion_worker::DeletionReferenceChecker;
 use crate::error::{KmsError, Result};
 use crate::types::{
     CancelKeyDeletionRequest, CancelKeyDeletionResponse, CreateKeyRequest, CreateKeyResponse,
     DEFAULT_PENDING_DELETION_WINDOW_DAYS, DecryptRequest, DecryptResponse, DeleteKeyRequest, DeleteKeyResponse,
     DescribeDataKeyWrappingRequest, DescribeDataKeyWrappingResponse, DescribeKeyRequest, DescribeKeyResponse, EncryptRequest,
-    EncryptResponse, GenerateDataKeyRequest, GenerateDataKeyResponse, ListKeysRequest, ListKeysResponse,
+    EncryptResponse, GenerateDataKeyRequest, GenerateDataKeyResponse, KeyInfo, ListKeysRequest, ListKeysResponse,
     MAX_PENDING_DELETION_WINDOW_DAYS, MIN_PENDING_DELETION_WINDOW_DAYS, OperationContext, RewrapDataKeyRequest,
-    RewrapDataKeyResponse,
+    RewrapDataKeyResponse, RotationDueReason,
 };
+use jiff::Zoned;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::warn;
 
 /// KMS Manager coordinates operations between backends and caching
+/// Smallest rotation age that can be configured.
+///
+/// A threshold shorter than this would report every key as overdue moments
+/// after it was rotated, which trains operators to ignore the signal.
+const MIN_ROTATION_MAX_AGE: Duration = Duration::from_secs(3600);
+
+/// Smallest wrap budget that can be configured.
+///
+/// Wraps are accounted in reserved blocks, so any threshold below one block
+/// would be crossed by a single reservation and report a key that has barely
+/// wrapped anything as overdue.
+const MIN_ROTATION_MAX_WRAPS: u64 = 1_000_000;
+
+/// Rotation age from the environment, or `None` when the signal is off.
+///
+/// Unset leaves it off rather than guessing a policy: how often a deployment
+/// must rotate is a compliance decision, and inventing a default would report
+/// keys as overdue against a rule nobody chose. An unparsable value is refused
+/// the same way, loudly, instead of falling back to a number the operator did
+/// not write.
+fn configured_rotation_max_age() -> Option<Duration> {
+    parse_rotation_max_age(std::env::var(ENV_KMS_ROTATION_MAX_AGE_SECS).ok().as_deref())
+}
+
+fn parse_rotation_max_age(value: Option<&str>) -> Option<Duration> {
+    let value = value?;
+    let Ok(seconds) = value.trim().parse::<u64>() else {
+        warn!(
+            variable = ENV_KMS_ROTATION_MAX_AGE_SECS,
+            "ignoring unparsable KMS rotation age; rotation readiness stays unreported"
+        );
+        return None;
+    };
+    if seconds == 0 {
+        return None;
+    }
+    Some(Duration::from_secs(seconds).max(MIN_ROTATION_MAX_AGE))
+}
+
+/// Wrap budget from the environment, or `None` when the signal is off.
+///
+/// Same discipline as the age threshold: unset means unreported rather than a
+/// guessed policy, and an unparsable value is refused loudly instead of
+/// falling back to a number the operator did not write. Clamped to
+/// [`MIN_ROTATION_MAX_WRAPS`] because the backend accounts for wraps in
+/// reserved blocks, so a threshold below one block would trip on the first
+/// reservation regardless of how many wraps actually happened.
+fn configured_rotation_max_wraps() -> Option<u64> {
+    parse_rotation_max_wraps(std::env::var(ENV_KMS_ROTATION_MAX_WRAPS).ok().as_deref())
+}
+
+fn parse_rotation_max_wraps(value: Option<&str>) -> Option<u64> {
+    let value = value?;
+    let Ok(wraps) = value.trim().parse::<u64>() else {
+        warn!(
+            variable = ENV_KMS_ROTATION_MAX_WRAPS,
+            "ignoring unparsable KMS rotation wrap budget; rotation readiness stays unreported"
+        );
+        return None;
+    };
+    if wraps == 0 {
+        return None;
+    }
+    Some(wraps.max(MIN_ROTATION_MAX_WRAPS))
+}
+
 #[derive(Clone)]
 pub struct KmsManager {
     backend: Arc<dyn KmsBackend>,
@@ -45,6 +112,11 @@ pub struct KmsManager {
     audit_sink: Option<Arc<dyn KmsAuditSink>>,
     allow_immediate_deletion: bool,
     reference_checker: Option<Arc<dyn DeletionReferenceChecker>>,
+    /// Age beyond which a key is reported as due for rotation; `None` leaves
+    /// the verdict unreported. Read once at construction so a listing cannot
+    /// change its answer halfway through.
+    rotation_max_age: Option<Duration>,
+    rotation_max_wraps: Option<u64>,
 }
 
 impl KmsManager {
@@ -65,6 +137,8 @@ impl KmsManager {
             audit_sink: None,
             allow_immediate_deletion: config.allow_immediate_deletion,
             reference_checker: None,
+            rotation_max_age: configured_rotation_max_age(),
+            rotation_max_wraps: configured_rotation_max_wraps(),
         }
     }
 
@@ -248,10 +322,67 @@ impl KmsManager {
     /// List keys on behalf of `context`'s principal
     pub async fn list_keys_with_context(&self, request: ListKeysRequest, context: &OperationContext) -> Result<ListKeysResponse> {
         let started = Instant::now();
-        let result = self.backend.list_keys(request).await;
+        let mut result = self.backend.list_keys(request).await;
+        if let Ok(response) = result.as_mut() {
+            let rotates = self.backend.capabilities().rotate;
+            let now = Zoned::now();
+            for key in &mut response.keys {
+                self.apply_rotation_readiness(key, rotates, &now);
+            }
+        }
         // Listing spans keys, so the record carries no key id.
         self.audit(KmsAuditOperation::ListKeys, context, None, started, &result);
         result
+    }
+
+    /// Fill in the advisory rotation verdict for one listed key.
+    ///
+    /// Decided here rather than in each backend so no two backends can disagree
+    /// about what "overdue" means, and so a backend that cannot rotate is never
+    /// the one deciding whether it should. Nothing consults the verdict before
+    /// encrypting or decrypting: a key reported as due keeps serving traffic.
+    fn apply_rotation_readiness(&self, key: &mut KeyInfo, backend_rotates: bool, now: &Zoned) {
+        if !backend_rotates {
+            // Reported, not silently omitted: an operator chasing an overdue key
+            // needs to know the answer is "this backend cannot rotate at all",
+            // which is a backend choice to revisit rather than a key to fix.
+            key.rotation_due = false;
+            key.rotation_due_reason = Some(RotationDueReason::Unsupported);
+            return;
+        }
+        key.rotation_due = false;
+        key.rotation_due_reason = None;
+
+        // The wrap budget is checked first: it is the cryptographic bound (the
+        // AES-GCM random-nonce ceiling), whereas the age threshold is a policy
+        // choice, so when both are crossed the reason an operator most needs to
+        // see is the one they cannot negotiate.
+        if let (Some(max_wraps), Some(wraps)) = (self.rotation_max_wraps, key.wrap_budget_reserved)
+            && wraps >= max_wraps
+        {
+            key.rotation_due = true;
+            key.rotation_due_reason = Some(RotationDueReason::Wraps);
+            return;
+        }
+
+        let Some(max_age) = self.rotation_max_age else {
+            return;
+        };
+
+        // A key that was never rotated is measured from when it was created:
+        // that is how long its material has been in use, which is the quantity
+        // the threshold is about.
+        let (since, reason) = match key.rotated_at.as_ref() {
+            Some(rotated_at) => (rotated_at, RotationDueReason::Age),
+            None => (&key.created_at, RotationDueReason::NeverRotated),
+        };
+        // Saturating: a timestamp from a node running ahead must not read as an
+        // enormous age and report a fresh key as overdue.
+        let age = Duration::from_secs((now.timestamp().as_second() - since.timestamp().as_second()).max(0) as u64);
+        if age >= max_age {
+            key.rotation_due = true;
+            key.rotation_due_reason = Some(reason);
+        }
     }
 
     /// Get cache statistics, or `None` when caching is disabled
@@ -542,9 +673,8 @@ mod tests {
     use crate::audit::KmsAuditOutcome;
     use crate::backends::local::LocalKmsBackend;
     use crate::error::KmsError;
-    use crate::types::{KeyMetadata, KeySpec, KeyState, KeyUsage};
+    use crate::types::{KeyMetadata, KeySpec, KeyState, KeyStatus, KeyUsage};
     use async_trait::async_trait;
-    use base64::Engine as _;
     use jiff::Zoned;
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -655,6 +785,7 @@ mod tests {
                 keys: Vec::new(),
                 next_marker: None,
                 truncated: false,
+                unreadable_key_ids: Vec::new(),
             })
         }
 
@@ -978,8 +1109,13 @@ mod tests {
             .await
             .expect("enable should succeed");
 
-        let base64 = base64::engine::general_purpose::STANDARD;
-        let encodings = |bytes: &[u8]| vec![hex::encode(bytes), base64.encode(bytes)];
+        let base64 = base64_simd::STANDARD;
+        let encodings = |bytes: &[u8]| {
+            vec![
+                hex_simd::encode_to_string(bytes, hex_simd::AsciiCase::Lower),
+                base64.encode_to_string(bytes),
+            ]
+        };
         let mut forbidden = vec![grant_token.to_string()];
         forbidden.extend(encodings(&data_key.plaintext_key));
         forbidden.extend(encodings(&decrypted.plaintext));
@@ -1576,5 +1712,226 @@ mod tests {
                 .key_state;
             assert_eq!(state, KeyState::Enabled, "cancelling must restore the key");
         }
+    }
+    /// The threshold is a compliance decision, so nothing is inferred: unset
+    /// and unparsable both leave the signal off rather than reporting keys
+    /// overdue against a rule nobody wrote. A value below the floor is raised,
+    /// because a threshold of a few seconds reports every key as overdue moments
+    /// after it was rotated and trains operators to ignore the signal.
+    #[test]
+    fn rotation_age_is_configured_or_absent_never_guessed() {
+        assert_eq!(parse_rotation_max_age(None), None);
+        assert_eq!(parse_rotation_max_age(Some("not-a-number")), None);
+        assert_eq!(parse_rotation_max_age(Some("")), None);
+        assert_eq!(parse_rotation_max_age(Some("-1")), None);
+        assert_eq!(parse_rotation_max_age(Some("0")), None);
+
+        assert_eq!(parse_rotation_max_age(Some("1")), Some(MIN_ROTATION_MAX_AGE));
+        assert_eq!(parse_rotation_max_age(Some(" 86400 ")), Some(Duration::from_secs(86_400)));
+        assert_eq!(
+            parse_rotation_max_age(Some(&MIN_ROTATION_MAX_AGE.as_secs().to_string())),
+            Some(MIN_ROTATION_MAX_AGE)
+        );
+    }
+
+    fn readiness_manager(rotation_max_age: Option<Duration>) -> KmsManager {
+        readiness_manager_with(rotation_max_age, None)
+    }
+
+    fn readiness_manager_with(rotation_max_age: Option<Duration>, rotation_max_wraps: Option<u64>) -> KmsManager {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config = KmsConfig::local(temp_dir.path().to_path_buf()).with_insecure_development_defaults();
+        let mut manager = KmsManager::new(Arc::new(ScriptedBackend::succeeding()), config);
+        manager.rotation_max_age = rotation_max_age;
+        manager.rotation_max_wraps = rotation_max_wraps;
+        manager
+    }
+
+    fn aged_key(rotated_at: Option<Zoned>, created_at: Zoned) -> KeyInfo {
+        KeyInfo {
+            key_id: "key-a".to_string(),
+            description: None,
+            algorithm: "AES_256".to_string(),
+            usage: KeyUsage::EncryptDecrypt,
+            status: KeyStatus::Active,
+            version: 1,
+            metadata: HashMap::new(),
+            tags: HashMap::new(),
+            created_at,
+            rotated_at,
+            created_by: None,
+            rotation_due: false,
+            rotation_due_reason: None,
+            wrap_budget_reserved: None,
+        }
+    }
+
+    /// The whole decision matrix, including the one case that must never fire:
+    /// a backend that cannot rotate is never told to rotate.
+    #[test]
+    fn rotation_readiness_reports_but_never_asks_the_impossible() {
+        let now = Zoned::now();
+        let long_ago = &now - jiff::Span::new().days(400);
+        let recently = &now - jiff::Span::new().hours(1);
+        let day = Duration::from_secs(86_400);
+
+        // A backend without rotation is reported as such and never as overdue,
+        // however ancient the key and however short the threshold.
+        let manager = readiness_manager(Some(Duration::from_secs(1)));
+        let mut key = aged_key(None, long_ago.clone());
+        manager.apply_rotation_readiness(&mut key, false, &now);
+        assert!(!key.rotation_due, "a backend that cannot rotate must never be told to");
+        assert_eq!(key.rotation_due_reason, Some(RotationDueReason::Unsupported));
+
+        // No threshold configured: no verdict, on any key.
+        let manager = readiness_manager(None);
+        let mut key = aged_key(None, long_ago.clone());
+        manager.apply_rotation_readiness(&mut key, true, &now);
+        assert!(!key.rotation_due);
+        assert_eq!(key.rotation_due_reason, None);
+
+        let manager = readiness_manager(Some(day));
+
+        // Rotated, but longer ago than the threshold.
+        let mut key = aged_key(Some(long_ago.clone()), long_ago.clone());
+        manager.apply_rotation_readiness(&mut key, true, &now);
+        assert!(key.rotation_due);
+        assert_eq!(key.rotation_due_reason, Some(RotationDueReason::Age));
+
+        // Never rotated, and in use longer than the threshold. Measured from
+        // creation, and distinguished from a stale rotation so an operator can
+        // tell "overdue again" from "never once".
+        let mut key = aged_key(None, long_ago.clone());
+        manager.apply_rotation_readiness(&mut key, true, &now);
+        assert!(key.rotation_due);
+        assert_eq!(key.rotation_due_reason, Some(RotationDueReason::NeverRotated));
+
+        // Rotated within the threshold, and created long ago: recency wins.
+        let mut key = aged_key(Some(recently), long_ago);
+        manager.apply_rotation_readiness(&mut key, true, &now);
+        assert!(!key.rotation_due);
+        assert_eq!(key.rotation_due_reason, None);
+
+        // A timestamp from a node running ahead must not read as an enormous
+        // age and report a fresh key as overdue.
+        let ahead = &now + jiff::Span::new().days(2);
+        let mut key = aged_key(Some(ahead.clone()), ahead);
+        manager.apply_rotation_readiness(&mut key, true, &now);
+        assert!(!key.rotation_due, "clock skew must not manufacture an overdue key");
+    }
+
+    /// The wrap-budget half of the verdict: the cryptographic bound, checked
+    /// independently of the age policy and reported under its own reason.
+    #[test]
+    fn rotation_readiness_reports_an_exhausted_wrap_budget() {
+        let now = Zoned::now();
+        let recently = &now - jiff::Span::new().hours(1);
+        let long_ago = &now - jiff::Span::new().days(400);
+        let day = Duration::from_secs(86_400);
+        let budget = 2_000_000;
+
+        let with_wraps = |manager: &KmsManager, wraps: Option<u64>, rotated_at: Option<Zoned>| {
+            let mut key = aged_key(rotated_at, recently.clone());
+            key.wrap_budget_reserved = wraps;
+            manager.apply_rotation_readiness(&mut key, true, &now);
+            (key.rotation_due, key.rotation_due_reason)
+        };
+
+        // Budget configured and exceeded on a freshly rotated key: due, and the
+        // reason names the wrap budget rather than an age nobody crossed.
+        let manager = readiness_manager_with(Some(day), Some(budget));
+        assert_eq!(
+            with_wraps(&manager, Some(budget), Some(recently.clone())),
+            (true, Some(RotationDueReason::Wraps))
+        );
+        // At the threshold exactly, not only past it: the bound is a ceiling.
+        assert_eq!(
+            with_wraps(&manager, Some(budget + 1), Some(recently.clone())),
+            (true, Some(RotationDueReason::Wraps))
+        );
+        // Under the threshold: no verdict from the wrap half.
+        assert_eq!(with_wraps(&manager, Some(budget - 1), Some(recently.clone())), (false, None));
+
+        // The cryptographic bound outranks the policy one when both are crossed.
+        let mut key = aged_key(Some(long_ago.clone()), long_ago);
+        key.wrap_budget_reserved = Some(budget);
+        manager.apply_rotation_readiness(&mut key, true, &now);
+        assert_eq!(key.rotation_due_reason, Some(RotationDueReason::Wraps));
+
+        // No wrap threshold configured: an enormous count reports nothing, the
+        // same way an unset age threshold does.
+        let age_only = readiness_manager_with(Some(day), None);
+        assert_eq!(with_wraps(&age_only, Some(u64::MAX), Some(recently.clone())), (false, None));
+
+        // Backend reports no count (Transit, AWS, or a pre-accounting record):
+        // the wrap half stays silent instead of guessing, and the age half
+        // still decides.
+        let wraps_only = readiness_manager_with(None, Some(budget));
+        assert_eq!(with_wraps(&wraps_only, None, Some(recently.clone())), (false, None));
+        assert_eq!(
+            with_wraps(&wraps_only, Some(budget), Some(recently.clone())),
+            (true, Some(RotationDueReason::Wraps))
+        );
+
+        // A backend that cannot rotate is never told to, whatever it wrapped.
+        let mut key = aged_key(None, recently);
+        key.wrap_budget_reserved = Some(u64::MAX);
+        wraps_only.apply_rotation_readiness(&mut key, false, &now);
+        assert!(!key.rotation_due);
+        assert_eq!(key.rotation_due_reason, Some(RotationDueReason::Unsupported));
+    }
+
+    /// Threshold parsing matches the age threshold's discipline: unset and
+    /// unparsable both disable the signal rather than inventing a policy.
+    #[test]
+    fn rotation_wrap_threshold_parsing_refuses_to_guess() {
+        assert_eq!(parse_rotation_max_wraps(None), None);
+        assert_eq!(parse_rotation_max_wraps(Some("not-a-number")), None);
+        assert_eq!(parse_rotation_max_wraps(Some("")), None);
+        assert_eq!(parse_rotation_max_wraps(Some("-1")), None);
+        assert_eq!(parse_rotation_max_wraps(Some("0")), None);
+        // Clamped: below one reservation block the first reservation would trip it.
+        assert_eq!(parse_rotation_max_wraps(Some("1")), Some(MIN_ROTATION_MAX_WRAPS));
+        assert_eq!(
+            parse_rotation_max_wraps(Some(" 5000000 ")),
+            Some(5_000_000),
+            "a configured budget above the floor is honored verbatim"
+        );
+    }
+
+    /// The two fields are additive on the wire: a payload written before they
+    /// existed still deserializes, and a key with no verdict serializes exactly
+    /// as it did before.
+    #[test]
+    fn rotation_readiness_fields_are_additive_on_the_wire() {
+        let legacy = serde_json::json!({
+            "key_id": "key-a",
+            "description": null,
+            "algorithm": "AES_256",
+            "usage": "EncryptDecrypt",
+            "status": "Active",
+            "version": 1,
+            "metadata": {},
+            "tags": {},
+            "created_at": "2026-01-01T00:00:00Z[UTC]",
+            "rotated_at": null,
+            "created_by": null,
+        });
+        let decoded: KeyInfo = serde_json::from_value(legacy).expect("a payload without the fields must still decode");
+        assert!(!decoded.rotation_due);
+        assert_eq!(decoded.rotation_due_reason, None);
+
+        let encoded = serde_json::to_value(&decoded).expect("encode");
+        assert_eq!(encoded.get("rotation_due"), Some(&serde_json::Value::Bool(false)));
+        assert!(
+            encoded.get("rotation_due_reason").is_none(),
+            "an absent verdict must not add a field for old consumers to trip over"
+        );
+
+        let mut due = decoded;
+        due.rotation_due = true;
+        due.rotation_due_reason = Some(RotationDueReason::NeverRotated);
+        let encoded = serde_json::to_value(&due).expect("encode");
+        assert_eq!(encoded.get("rotation_due_reason").and_then(|value| value.as_str()), Some("never_rotated"));
     }
 }

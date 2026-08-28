@@ -27,6 +27,7 @@ Registered in [`src/lib.rs`](src/lib.rs). Grouped by concern:
 | **reliant** | [`src/reliant/`](src/reliant) | Tests that reuse an **externally started** server (SQL/select, conditional writes, lifecycle, deleted-object reads, node-interact). Run via [`scripts/run_e2e_tests.sh`](../../scripts/run_e2e_tests.sh); see [`src/reliant/README.md`](src/reliant/README.md) |
 | **cluster** | `cluster_concurrency_test`, `stale_multipart_cleanup_cluster_test`, `namespace_lock_quorum_test`, `admin_timeout_regression_test`, `object_lambda_test`, `replication_extension_test` | Multi-node scenarios via `RustFSTestClusterEnvironment` |
 | **chaos / reliability** | [`src/chaos.rs`](src/chaos.rs), `reliability_disk_fault_test`, `heal_erasure_disk_rebuild_test`, `server_startup_failfast_test` | Disk offline/replace/corrupt, EC rebuild, heal, fail-fast startup |
+| **upgrade compatibility** | `upgrade_compatibility_test` | Pinned previous-release writes followed by current-build reads on the same data directory |
 
 ## How to run
 
@@ -48,16 +49,14 @@ cargo nextest run --profile e2e-smoke -p e2e_test
 cargo nextest run -j1 --run-ignored ignored-only -p rustfs-scanner -p rustfs \
   -E 'binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))'
 
-# Protocols suite — fixed ports, MUST be single-threaded, gated by build features
-RUSTFS_BUILD_FEATURES=ftps,webdav,sftp \
-  cargo test -p e2e_test test_protocol_core_suite -- --test-threads=1 --nocapture
 ```
 
 The protocols suite has its own contract (fixed bind ports 9022–9301,
-`--test-threads=1`, feature-gated scheduling) documented in
+single-worker execution, feature-gated scheduling) documented in
 [`src/protocols/README.md`](src/protocols/README.md). `RUSTFS_BUILD_FEATURES`
 selects which features the spawned binary is built with; leave it unset to run
-every protocol entry.
+every protocol entry. Use the exact profile command under
+[Troubleshooting](#troubleshooting) for CI-equivalent execution.
 
 ### `#[ignore]` semantics
 
@@ -74,7 +73,7 @@ The reason string on each attribute is the classifier. Current classes:
 
 - **Needs a pre-started server** — `"requires running RustFS server at
   localhost:9000"` / `"Connects to existing rustfs server"`. These are the
-  `reliant/*` and `policy/test_runner` tests; start a server first (e.g.
+  `reliant/*` tests; start a server first (e.g.
   [`scripts/run_e2e_tests.sh`](../../scripts/run_e2e_tests.sh)) or use
   `--run-ignored`.
 - **Heavy / external tool** — `"Starts a rustfs server; enable when running
@@ -125,7 +124,7 @@ via `create_s3_client(idx)` / `create_all_clients()`. See
 | `find_available_port` | Random free port (isolation primitive) |
 | `rustfs_binary_path` / `_with_features` | Locate/build the binary; honors `RUSTFS_BUILD_FEATURES` |
 | `requested_rustfs_build_features` / `rustfs_build_feature_enabled` | Feature-gate a test to what the binary was built with |
-| `awscurl_available` + `execute_awscurl` / `awscurl_post` / `_get` / `_put` / `_delete` / `awscurl_post_sts_form_urlencoded` | Admin/STS API calls via `awscurl` (skip gracefully when absent) |
+| `execute_awscurl` / `awscurl_post` / `_get` / `_put` / `_delete` / `awscurl_post_sts_form_urlencoded` | Admin/STS API calls via `awscurl`; missing binaries are test failures |
 | `replication_fast_env` | Env vars that shrink replication timers (from repl-4); pass to `start_rustfs_server_with_env` |
 | `local_http_client` / `init_logging` | Loopback HTTP client; idempotent tracing init |
 | `RustFSTestClusterEnvironment` (`new`/`start`/`start_node`/`stop_node`/`create_all_clients`) | Multi-node harness |
@@ -159,27 +158,27 @@ construction (random port + isolated temp dir) and need no serialization.
 ## CI map
 
 `e2e_test` is **excluded** from the main `cargo nextest run --profile ci --all`
-pass ([`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) line 158,
-`--exclude e2e_test`) — the whole crate is too slow to gate every PR. Subsets
-join CI through the nextest profile system only (never as ad-hoc jobs):
+pass (`--exclude e2e_test`) — the whole crate is too slow to gate every PR.
+Subsets join CI through nextest profiles; the fixed-port protocol suite uses
+the same profile for membership and execution with one nightly worker.
 
 | Suite | Runs where | Status |
 | --- | --- | --- |
 | Smoke subset (`e2e-smoke` profile) | `e2e-tests` job, every PR | **Active** (backlog#1149 ci-4) |
+| Full single-node suite (`e2e-full` profile) | `e2e-full` job, merge queue + main | **Active** (backlog#1149 ci-5) |
 | `s3s-e2e` black-box | `e2e-tests` + `e2e-tests-rio-v2` jobs | **Active** (external conformance tool) |
 | ILM / lifecycle (ignored) | `test-ilm-integration-serial` lane, `-j1` | **Active** (backlog#1148 ilm-1) |
-| KMS suite | — | Not in CI yet (backlog#1149 ci-5) |
-| Protocols (FTPS/WebDAV/SFTP) | — | Not in CI yet (backlog#1149 ci-7) |
+| KMS suite | `e2e-full` job, merge queue + main | **Active** |
+| Direct upgrade from pinned previous release | `e2e-upgrade.yml`, storage-sensitive PRs + release tags + weekly | **Active** |
+| Cluster faults (`e2e-nightly` profile) | consolidated nightly workflow | **Active** (backlog#1149 ci-7) |
+| Protocols (FTPS/WebDAV/SFTP) | consolidated nightly workflow, serial | **Active** (backlog#1149 ci-7) |
 | Replication (fast subset) | `e2e-smoke` profile, `e2e-tests` job, every PR | **Active** (backlog#1147 repl-1) |
-| Replication (slow + dual-node) | `e2e-repl-nightly` profile, scheduled workflow | **Active** (backlog#1147 repl-1) |
-| `reliant/*` (pre-started server) | — | Manual only |
+| Replication (slow + multi-node) | `e2e-repl-nightly` profile, consolidated nightly workflow | **Active** (backlog#1147 repl-1) |
+| `reliant/*` | 19 tests in PR smoke; remaining default tests in `e2e-full` | **Active** except `#[ignore]` |
 
-Links: [`ci.yml`](../../.github/workflows/ci.yml) `e2e-tests` (line 347),
-`test-ilm-integration-serial` (line 196). The `e2e-smoke` `default-filter` in
-[`.config/nextest.toml`](../../.config/nextest.toml) is the **single wiring
-mechanism** — extend that filter (or add a sibling profile) to admit more
-tests; do not add e2e jobs to `ci.yml`. repl-1 / ilm-3 are landing in parallel
-and may add lanes; keep the table above easy to extend.
+The profile filters in [`.config/nextest.toml`](../../.config/nextest.toml) are
+the wiring source of truth. Committed test-ID digests under
+`.config/e2e-*-selection.txt` make every membership change explicit.
 
 ## Troubleshooting
 
@@ -188,9 +187,15 @@ and may add lanes; keep the table above easy to extend.
 ```bash
 # Smoke (e2e-tests job) — includes the 20 fast replication tests
 cargo nextest run --profile e2e-smoke -p e2e_test
-# Replication nightly lane (16 slow + dual-node tests; install awscurl for the
-# STS dual-node test, else it skips gracefully)
+# Full single-node merge/main lane
+cargo nextest run --profile e2e-full -p e2e_test
+# Cluster fault nightly lane
+cargo nextest run --profile e2e-nightly -p e2e_test
+# Replication nightly lane; awscurl is required for STS paths
 cargo nextest run --profile e2e-repl-nightly -p e2e_test
+# Fixed-port protocol nightly lane
+RUSTFS_BUILD_FEATURES=ftps,webdav,sftp \
+  cargo nextest run -j 1 --profile e2e-protocols -p e2e_test --no-capture
 # ILM serial lane
 cargo nextest run -j1 --run-ignored ignored-only -p rustfs-scanner -p rustfs \
   -E 'binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))'
@@ -218,9 +223,8 @@ The `s3s-e2e` CI job selects a random `RUSTFS_TEST_PORT` (see the `e2e-tests`
 job) to dodge this; local single-node tests already use random ports, so a
 lingering orphan is usually the cause of a spurious bind failure.
 
-**`awscurl` not found.** `awscurl`-dependent tests skip gracefully with a
-visible log line (`awscurl_available()`); install `awscurl` to actually run
-them.
+**`awscurl` not found.** `awscurl`-dependent tests fail closed with a process
+spawn error. Install the pinned CI version before running their profiles.
 
 ## Related
 
@@ -255,10 +259,9 @@ A test module may join the smoke filter only if every test in it is:
 2. **Single-node** — spawns its own server via
    `RustFSTestEnvironment`/`start_rustfs_server` on a random port with an
    isolated temp dir. No `RustFSTestClusterEnvironment`, no fixed ports.
-3. **Dependency-free** — no pre-started server at `localhost:9000`, no Vault,
-   no fixed protocol ports. Tools that may be absent on the runner (e.g.
-   `awscurl`) are acceptable only when the test skips gracefully with a
-   visible log line (see `bucket_policy_check_test.rs`).
+3. **Hermetic dependencies** — no pre-started server at `localhost:9000`, no
+   Vault, and no fixed protocol ports. Any required CLI must be pinned and
+   installed by the workflow; a missing CLI must fail the test.
 4. **Not `#[ignore]`** — ignored tests are activation work (backlog#1149
    ci-13 / backlog#1148 ilm-3), not smoke candidates.
 
@@ -273,4 +276,11 @@ current subset is.
 `docs/testing/e2e-suite-inventory.md` records the per-module test counts as
 listed by `cargo nextest list -p e2e_test`. Regenerate it when adding or
 moving e2e tests so acceptance numbers in the test-strategy issues
-(backlog#1147–#1155) stay auditable.
+(backlog#1147–#1155) stay auditable. When a profile membership change is
+intentional, review its JSON listing before updating the matching
+`.config/e2e-*-selection.txt` test-ID digest. Update only the platform that
+produced the listing:
+
+```bash
+python3 scripts/check_test_wiring.py --update-profile e2e-full /path/to/listing.json linux
+```

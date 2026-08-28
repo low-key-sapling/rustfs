@@ -24,6 +24,7 @@ const CONFIG_UPDATE: AdminActionRef = AdminActionRef::new("ConfigUpdateAdminActi
 const CONSOLE_LOG: AdminActionRef = AdminActionRef::new("ConsoleLogAdminAction");
 const COMMIT_TABLE: AdminActionRef = AdminActionRef::new("CommitTableAction");
 const CREATE_POLICY: AdminActionRef = AdminActionRef::new("CreatePolicyAdminAction");
+const CREATE_USER: AdminActionRef = AdminActionRef::new("CreateUserAdminAction");
 const CREATE_SERVICE_ACCOUNT: AdminActionRef = AdminActionRef::new("CreateServiceAccountAdminAction");
 const CREATE_TABLE: AdminActionRef = AdminActionRef::new("CreateTableAction");
 const DECOMMISSION: AdminActionRef = AdminActionRef::new("DecommissionAdminAction");
@@ -38,6 +39,7 @@ const EXPORT_IAM: AdminActionRef = AdminActionRef::new("ExportIAMAction");
 const FORCE_UNLOCK: AdminActionRef = AdminActionRef::new("ForceUnlockAdminAction");
 const GET_BUCKET_TARGET: AdminActionRef = AdminActionRef::new("GetBucketTargetAction");
 const GET_GROUP: AdminActionRef = AdminActionRef::new("GetGroupAdminAction");
+const GET_USER: AdminActionRef = AdminActionRef::new("GetUserAdminAction");
 const GET_METRICS: AdminActionRef = AdminActionRef::new("GetMetricsAction");
 const GET_POLICY: AdminActionRef = AdminActionRef::new("GetPolicyAdminAction");
 const GET_REPLICATION_METRICS: AdminActionRef = AdminActionRef::new("GetReplicationMetricsAction");
@@ -63,6 +65,7 @@ const KMS_DISABLE_KEY: AdminActionRef = AdminActionRef::new("kms:DisableKey");
 const KMS_ENABLE_KEY: AdminActionRef = AdminActionRef::new("kms:EnableKey");
 const KMS_GENERATE_DATA_KEY: AdminActionRef = AdminActionRef::new("kms:GenerateDataKey");
 const KMS_LIST_KEYS: AdminActionRef = AdminActionRef::new("kms:ListKeys");
+const KMS_REKEY: AdminActionRef = AdminActionRef::new("kms:Rekey");
 const KMS_RESTORE: AdminActionRef = AdminActionRef::new("kms:Restore");
 const KMS_ROTATE_KEY: AdminActionRef = AdminActionRef::new("kms:RotateKey");
 const KMS_SERVICE_CONTROL: AdminActionRef = AdminActionRef::new("kms:ServiceControl");
@@ -90,6 +93,7 @@ const SET_TABLE_BUCKET: AdminActionRef = AdminActionRef::new("SetTableBucketActi
 const SET_TABLE_LIFECYCLE: AdminActionRef = AdminActionRef::new("SetTableLifecycleAction");
 const SET_TABLE_METADATA_LOCATION: AdminActionRef = AdminActionRef::new("SetTableMetadataLocationAction");
 const SET_TABLE_NAMESPACE: AdminActionRef = AdminActionRef::new("SetTableNamespaceAction");
+const UPDATE_TABLE_NAMESPACE_PROPERTIES: AdminActionRef = AdminActionRef::new("UpdateTableNamespacePropertiesAction");
 const SET_TIER: AdminActionRef = AdminActionRef::new("SetTierAction");
 const SITE_REPLICATION_ADD: AdminActionRef = AdminActionRef::new("SiteReplicationAddAction");
 const SITE_REPLICATION_INFO: AdminActionRef = AdminActionRef::new("SiteReplicationInfoAction");
@@ -152,6 +156,14 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(HttpMethod::Get, "/rustfs/admin/v3/list-users", LIST_USERS, RouteRiskLevel::Sensitive),
     admin(HttpMethod::Delete, "/rustfs/admin/v3/remove-user", DELETE_USER, RouteRiskLevel::High),
     admin(HttpMethod::Put, "/rustfs/admin/v3/set-user-status", ENABLE_USER, RouteRiskLevel::High),
+    // Resetting somebody else's secret key is the same capability as creating
+    // them, so it carries the same action.
+    admin(HttpMethod::Put, "/rustfs/admin/v3/set-user-secret-key", CREATE_USER, RouteRiskLevel::High),
+    admin(HttpMethod::Get, "/rustfs/admin/v3/user/mfa", GET_USER, RouteRiskLevel::Sensitive),
+    // Clearing another identity's second factor is break-glass: whoever can
+    // re-enable a disabled account can already take the identity over, so this
+    // shares that action rather than inventing a weaker one.
+    admin(HttpMethod::Delete, "/rustfs/admin/v3/user/mfa", ENABLE_USER, RouteRiskLevel::High),
     admin(HttpMethod::Get, "/rustfs/admin/v3/groups", LIST_GROUPS, RouteRiskLevel::Sensitive),
     admin(HttpMethod::Get, "/rustfs/admin/v3/group", GET_GROUP, RouteRiskLevel::Sensitive),
     admin(
@@ -334,6 +346,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(HttpMethod::Post, "/rustfs/admin/v3/heal/{bucket}", HEAL, RouteRiskLevel::High),
     admin(HttpMethod::Post, "/rustfs/admin/v3/heal/{bucket}/{prefix}", HEAL, RouteRiskLevel::High),
     admin(HttpMethod::Post, "/rustfs/admin/v3/background-heal/status", HEAL, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v4/heal/replacement-recovery",
+        HEAL,
+        RouteRiskLevel::Sensitive,
+    ),
     admin(HttpMethod::Get, "/rustfs/admin/v3/tier", LIST_TIER, RouteRiskLevel::Sensitive),
     admin(HttpMethod::Get, "/rustfs/admin/v3/tier-stats", LIST_TIER, RouteRiskLevel::Sensitive),
     admin(HttpMethod::Get, "/rustfs/admin/v3/tier/{tier}", LIST_TIER, RouteRiskLevel::Sensitive),
@@ -421,6 +439,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(HttpMethod::Get, "/rustfs/admin/v3/config", CONFIG_UPDATE, RouteRiskLevel::High),
     admin(HttpMethod::Put, "/rustfs/admin/v3/config", CONFIG_UPDATE, RouteRiskLevel::High),
     admin(HttpMethod::Get, "/rustfs/admin/v3/scanner/status", SERVER_INFO, RouteRiskLevel::Sensitive),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/scanner/cycle-state/reset",
+        CONFIG_UPDATE,
+        RouteRiskLevel::High,
+    ),
     admin(
         HttpMethod::Get,
         "/rustfs/admin/v3/ilm/expiry/status",
@@ -798,6 +822,21 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         RouteRiskLevel::High,
     ),
     admin(HttpMethod::Post, "/rustfs/admin/v3/kms/keys/rotate", KMS_ROTATE_KEY, RouteRiskLevel::High),
+    // The rekey sweep walks and rewrites object metadata across buckets, so it
+    // carries its own cluster-scoped action rather than reusing a per-key one.
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/keys/rekey", KMS_REKEY, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/kms/keys/rekey/status",
+        KMS_REKEY,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/kms/keys/rekey/cancel",
+        KMS_REKEY,
+        RouteRiskLevel::High,
+    ),
     // Backup and restore act on the material of every key at once, so they
     // carry their own actions rather than reusing any per-key one.
     admin(HttpMethod::Get, "/rustfs/admin/v3/kms/backup", KMS_BACKUP, RouteRiskLevel::Sensitive),
@@ -912,11 +951,18 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         RouteRiskLevel::Sensitive,
     ),
     admin(
+        HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/properties",
+        UPDATE_TABLE_NAMESPACE_PROPERTIES,
+        RouteRiskLevel::High,
+    ),
+    admin(
         HttpMethod::Delete,
         "/iceberg/v1/{warehouse}/namespaces/{namespace}",
         DELETE_TABLE_NAMESPACE,
         RouteRiskLevel::High,
     ),
+    admin(HttpMethod::Post, "/iceberg/v1/{warehouse}/tables/rename", SET_TABLE, RouteRiskLevel::High),
     admin(
         HttpMethod::Get,
         "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables",
@@ -1189,9 +1235,21 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         RouteRiskLevel::Sensitive,
     ),
     admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/properties",
+        UPDATE_TABLE_NAMESPACE_PROPERTIES,
+        RouteRiskLevel::High,
+    ),
+    admin(
         HttpMethod::Delete,
         "/_iceberg/v1/{warehouse}/namespaces/{namespace}",
         DELETE_TABLE_NAMESPACE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/tables/rename",
+        SET_TABLE,
         RouteRiskLevel::High,
     ),
     admin(
@@ -1433,16 +1491,66 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         REPLICATION_DIFF,
         RouteRiskLevel::Sensitive,
     ),
+    // The default stream enumerates object names/version ids and requires
+    // ReplicationDiff (MinIO parity); only ?aggregate=true relaxes to
+    // GetReplicationMetrics in the handler.
     admin(
         HttpMethod::Get,
         "/rustfs/admin/v3/replication/mrf",
-        GET_REPLICATION_METRICS,
+        REPLICATION_DIFF,
         RouteRiskLevel::Sensitive,
     ),
 ];
 
 pub const DEFERRED_ADMIN_ROUTE_POLICIES: &[DeferredAdminRoutePolicy] = &[
     deferred(HttpMethod::Get, "/rustfs/admin/v3/accountinfo", DeferredRoutePolicyReason::S3Action),
+    // The self-service account routes act on the caller, never on a target
+    // named in the request, so they gate on possession of the credential (plus,
+    // for the mutation, knowledge of the current secret) rather than on an
+    // admin action. Giving them one would be wrong in both directions: it would
+    // stop an ordinary user from managing their own password, and it would let
+    // any holder of that action manage somebody else's.
+    deferred(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/account/info",
+        DeferredRoutePolicyReason::CredentialOnly,
+    ),
+    deferred(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/account/password",
+        DeferredRoutePolicyReason::CredentialOnly,
+    ),
+    // The MFA self-service family gates the same way, plus a proof of the
+    // second factor (and, for disable, of the account password) inside the
+    // handler.
+    deferred(HttpMethod::Get, "/rustfs/admin/v3/account/mfa", DeferredRoutePolicyReason::CredentialOnly),
+    deferred(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/account/mfa/enroll",
+        DeferredRoutePolicyReason::CredentialOnly,
+    ),
+    deferred(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/account/mfa/activate",
+        DeferredRoutePolicyReason::CredentialOnly,
+    ),
+    deferred(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/account/mfa/disable",
+        DeferredRoutePolicyReason::CredentialOnly,
+    ),
+    deferred(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/account/mfa/recovery-codes",
+        DeferredRoutePolicyReason::CredentialOnly,
+    ),
+    // The login challenge is signed with the identity's own credentials, so
+    // possession of them is the whole authorization.
+    deferred(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/mfa/challenge",
+        DeferredRoutePolicyReason::CredentialOnly,
+    ),
     deferred(
         HttpMethod::Get,
         "/rustfs/admin/v3/user-info",
@@ -1530,6 +1638,11 @@ pub const DEFERRED_ADMIN_ROUTE_POLICIES: &[DeferredAdminRoutePolicy] = &[
         DeferredRoutePolicyReason::MultipleActions,
     ),
     deferred(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/usage/{bucket}",
+        DeferredRoutePolicyReason::MultipleActions,
+    ),
+    deferred(
         HttpMethod::Post,
         "/rustfs/admin/v3/object-zip-downloads",
         DeferredRoutePolicyReason::S3Action,
@@ -1564,6 +1677,10 @@ pub const DEFERRED_ADMIN_ROUTE_POLICIES: &[DeferredAdminRoutePolicy] = &[
     ),
 ];
 
+#[allow(
+    dead_code,
+    reason = "asserted by this file's tests; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub fn validate_admin_route_policy_specs() -> Result<(), AdminRouteMatrixError> {
     validate_admin_route_specs(ADMIN_ROUTE_POLICY_SPECS)
 }
@@ -1641,15 +1758,27 @@ mod tests {
         let table_specs = ADMIN_ROUTE_POLICY_SPECS
             .iter()
             .filter(|spec| spec.path().starts_with("/iceberg/v1") || spec.path().starts_with("/_iceberg/v1"));
-        assert_eq!(table_specs.count(), 94);
+        assert_eq!(table_specs.count(), 98);
         assert_action(HttpMethod::Put, "/iceberg/v1/buckets/{warehouse}", SET_TABLE_BUCKET);
         assert_action(HttpMethod::Get, "/_iceberg/v1/buckets/{warehouse}", GET_TABLE_BUCKET);
         assert_action(HttpMethod::Get, "/iceberg/v1/{warehouse}/namespaces", GET_TABLE_NAMESPACE);
         assert_action(HttpMethod::Get, "/_iceberg/v1/{warehouse}/namespaces", GET_TABLE_NAMESPACE);
         assert_action(HttpMethod::Head, "/iceberg/v1/{warehouse}/namespaces/{namespace}", GET_TABLE_NAMESPACE);
         assert_action(HttpMethod::Head, "/_iceberg/v1/{warehouse}/namespaces/{namespace}", GET_TABLE_NAMESPACE);
+        assert_action(
+            HttpMethod::Post,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/properties",
+            UPDATE_TABLE_NAMESPACE_PROPERTIES,
+        );
+        assert_action(
+            HttpMethod::Post,
+            "/_iceberg/v1/{warehouse}/namespaces/{namespace}/properties",
+            UPDATE_TABLE_NAMESPACE_PROPERTIES,
+        );
         assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables", CREATE_TABLE);
         assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables", CREATE_TABLE);
+        assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/tables/rename", SET_TABLE);
+        assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/tables/rename", SET_TABLE);
         assert_action(
             HttpMethod::Get,
             "/iceberg/v1/{warehouse}/namespaces/{namespace}/views",
@@ -1968,6 +2097,12 @@ mod tests {
     fn route_policy_allows_server_info_for_ilm_expiry_status() {
         assert_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/expiry/status", SERVER_INFO);
         assert_not_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/expiry/status", SET_TIER);
+    }
+
+    #[test]
+    fn route_policy_requires_config_update_for_scanner_cycle_reset() {
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/scanner/cycle-state/reset", CONFIG_UPDATE);
+        assert_not_action(HttpMethod::Post, "/rustfs/admin/v3/scanner/cycle-state/reset", SERVER_INFO);
     }
 
     #[test]

@@ -22,7 +22,7 @@ use rustfs_iam::{
     store::{MappedPolicy, object::ObjectStore},
     sys::{IamSys, is_safe_claim_policy_name},
 };
-use rustfs_madmin::{SITE_REPL_API_VERSION, SRIAMItem, SRSTSCredential};
+use rustfs_madmin::{SITE_REPL_API_VERSION, SR_IAM_ITEM_STS_ACC, SRIAMItem, SRSTSCredential};
 use rustfs_policy::auth::get_new_credentials_with_metadata;
 use s3s::{S3Error, S3ErrorCode};
 use serde_json::Value;
@@ -238,7 +238,7 @@ fn issue_credentials(
 
 fn site_replication_item(credentials: &rustfs_credentials::Credentials, updated_at: OffsetDateTime) -> SRIAMItem {
     SRIAMItem {
-        r#type: "sts-credential".to_string(),
+        r#type: SR_IAM_ITEM_STS_ACC.to_string(),
         sts_credential: Some(SRSTSCredential {
             access_key: credentials.access_key.clone(),
             secret_key: credentials.secret_key.clone(),
@@ -430,12 +430,16 @@ mod tests {
     #[test]
     fn issued_credentials_and_replication_item_use_minio_parent_shape() {
         let transaction = transaction();
+        let expected_parent = transaction
+            .authorization
+            .oidc_virtual_parent()
+            .expect("test authorization should have a virtual parent");
         let secret = "federated-session-test-signing-secret";
         let selected_policy_names = vec!["readonly".to_string()];
 
         let credentials =
             issue_credentials(&transaction, &selected_policy_names, Some(secret)).expect("credential issuance should succeed");
-        assert_eq!(credentials.parent_user, "TwyekekG2eMes0qk9Tgh7KXEitwGi1z2W1f2KccrXGA");
+        assert_eq!(credentials.parent_user, expected_parent);
         assert_eq!(credentials.groups, Some(vec!["devs".to_string()]));
         assert_eq!(credentials.status, "on");
         assert!(!credentials.access_key.is_empty());
@@ -468,11 +472,8 @@ mod tests {
                 ("preferred_username".to_string(), serde_json::json!("user")),
                 ("groups".to_string(), serde_json::json!(["devs"])),
                 ("roles".to_string(), serde_json::json!(["admin", "reader"])),
-                ("parent".to_string(), serde_json::json!("TwyekekG2eMes0qk9Tgh7KXEitwGi1z2W1f2KccrXGA")),
-                (
-                    OIDC_VIRTUAL_PARENT_CLAIM.to_string(),
-                    serde_json::json!("TwyekekG2eMes0qk9Tgh7KXEitwGi1z2W1f2KccrXGA"),
-                ),
+                ("parent".to_string(), serde_json::json!(expected_parent)),
+                (OIDC_VIRTUAL_PARENT_CLAIM.to_string(), serde_json::json!(expected_parent)),
                 ("policy".to_string(), serde_json::json!("readonly")),
             ])
         );
@@ -493,13 +494,13 @@ mod tests {
         assert_eq!(
             serde_json::to_value(item).expect("replication item should serialize"),
             serde_json::json!({
-                "type": "sts-credential",
+                "type": "sts-account",
                 "name": "",
                 "stsCredential": {
                     "accessKey": "<access-key>",
                     "secretKey": "<secret-key>",
                     "sessionToken": "<session-token>",
-                    "parentUser": "TwyekekG2eMes0qk9Tgh7KXEitwGi1z2W1f2KccrXGA",
+                    "parentUser": expected_parent,
                     "parentPolicyMapping": OIDC_STS_REQUIRES_VIRTUAL_PARENT_RECEIVER_POLICY,
                     "apiVersion": SITE_REPL_API_VERSION,
                 },

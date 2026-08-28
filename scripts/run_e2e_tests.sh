@@ -20,6 +20,8 @@ DATA_DIR="$TARGET_DIR/rustfs_test_data"
 RUSTFS_PID=""
 TEST_FILTER=""
 TEST_TYPE="all"
+RUSTFS_BUILD_FEATURES="${RUSTFS_BUILD_FEATURES:-ftps,webdav,sftp}"
+export RUSTFS_BUILD_FEATURES
 
 # Function to print colored output
 print_info() {
@@ -92,7 +94,7 @@ build_rustfs() {
     print_info "Building RustFS..."
     cd "$PROJECT_ROOT"
     
-    if ! cargo build --bin zffs; then
+    if ! cargo build --bin zffs --features "$RUSTFS_BUILD_FEATURES"; then
         print_error "Failed to build RustFS"
         exit 1
     fi
@@ -146,7 +148,7 @@ start_rustfs() {
     
     # Wait for RustFS to be ready
     print_info "Waiting for RustFS to be ready..."
-    local max_attempts=15  # Reduced from 30 to 15 seconds
+    local max_attempts=60
     local attempt=0
     
     while [ $attempt -lt $max_attempts ]; do
@@ -158,25 +160,10 @@ start_rustfs() {
             exit 1
         fi
         
-        # Try simple HTTP connection first (most reliable)
-        if curl -s --noproxy localhost --connect-timeout 2 --max-time 3 "http://localhost:9000/" >/dev/null 2>&1; then
+        if curl --silent --show-error --fail --noproxy localhost --connect-timeout 2 --max-time 3 \
+            "http://localhost:9000/health/ready" >/dev/null 2>&1; then
             print_success "RustFS is ready!"
             return 0
-        fi
-        
-        # Try health endpoint if available
-        if curl -s --noproxy localhost --connect-timeout 2 --max-time 3 "http://localhost:9000/health" >/dev/null 2>&1; then
-            print_success "RustFS is ready!"
-            return 0
-        fi
-        
-        # Try port connectivity check (faster than HTTP)
-        if nc -z localhost 9000 2>/dev/null; then
-            print_info "Port 9000 is open, verifying HTTP response..."
-            if curl -s --noproxy localhost --connect-timeout 1 --max-time 2 "http://localhost:9000/" >/dev/null 2>&1; then
-                print_success "RustFS is ready!"
-                return 0
-            fi
         fi
         
         sleep 1
@@ -185,61 +172,38 @@ start_rustfs() {
     done
     
     echo
-    print_warning "RustFS health check failed within $max_attempts seconds"
-    print_info "Checking if RustFS process is still running..."
-    if kill -0 "$RUSTFS_PID" 2>/dev/null; then
-        print_info "RustFS process is still running (PID: $RUSTFS_PID)"
-        print_info "Trying final connection attempts..."
-        
-        # Quick final attempts with shorter timeouts
-        for i in 1 2 3; do
-            if curl -s --noproxy localhost --connect-timeout 1 --max-time 2 "http://localhost:9000/" >/dev/null 2>&1; then
-                print_success "RustFS is now ready!"
-                return 0
-            fi
-            if nc -z localhost 9000 2>/dev/null; then
-                print_info "Port 9000 is accessible, continuing with tests..."
-                return 0
-            fi
-            sleep 1
-        done
-        
-        print_warning "RustFS may be slow to respond, but process is running"
-        print_info "Continuing with tests anyway..."
-        return 0
-    else
-        print_error "RustFS process has died"
-        print_error "Log output:"
-        cat "$TARGET_DIR/rustfs.log" || true
-        return 1
-    fi
+    print_error "RustFS readiness check failed within $max_attempts seconds"
+    print_error "Log output:"
+    cat "$TARGET_DIR/rustfs.log" || true
+    return 1
 }
 
 # Function to run tests
 run_tests() {
     print_info "Running e2e tests..."
     cd "$PROJECT_ROOT"
-    
-    local test_cmd="cargo test --package e2e_test --lib"
-    
+
+    local test_cmd=(cargo test --package e2e_test --lib)
+
     case "$TEST_TYPE" in
         "specific")
-            test_cmd="$test_cmd -- $TEST_FILTER --exact --show-output --ignored"
+            test_cmd+=(-- "$TEST_FILTER")
             print_info "Running specific test: $TEST_FILTER"
             ;;
         "file")
-            test_cmd="$test_cmd -- $TEST_FILTER --show-output --ignored"
+            test_cmd+=(-- "$TEST_FILTER")
             print_info "Running tests in file/module: $TEST_FILTER"
             ;;
         "all")
-            test_cmd="$test_cmd -- --show-output --ignored"
+            test_cmd+=(--)
             print_info "Running all e2e tests"
             ;;
     esac
-    
-    print_info "Test command: $test_cmd"
-    
-    if eval "$test_cmd"; then
+    test_cmd+=(--show-output --include-ignored --test-threads=1)
+
+    print_info "Test command: ${test_cmd[*]}"
+
+    if "${test_cmd[@]}"; then
         print_success "All tests passed!"
         return 0
     else
@@ -292,13 +256,7 @@ main() {
     # Start RustFS
     if ! start_rustfs; then
         print_error "Failed to start RustFS properly"
-        print_info "Checking if we can still run tests..."
-        if [ ! -z "$RUSTFS_PID" ] && kill -0 "$RUSTFS_PID" 2>/dev/null; then
-            print_info "RustFS process is still running, attempting to continue..."
-        else
-            print_error "RustFS is not running, cannot proceed with tests"
-            exit 1
-        fi
+        exit 1
     fi
     
     # Run tests

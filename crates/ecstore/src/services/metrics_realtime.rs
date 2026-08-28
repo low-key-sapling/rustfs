@@ -15,8 +15,10 @@
 use crate::diagnostics::admin_server_info::get_local_server_property;
 use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::admin::StorageAdminApi;
+#[cfg(test)]
 use chrono::Utc;
-use rustfs_common::{heal_channel::DriveState, metrics::global_metrics};
+use jiff::Timestamp;
+use rustfs_heal_contracts::heal_channel::DriveState;
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_madmin::metrics::{
     DiskIOStats, DiskMetric, LastMinute as MadminLastMinute, NetDevLine, NetMetrics, RPCMetrics, RealtimeMetrics,
@@ -30,6 +32,7 @@ use rustfs_madmin::metrics::{
     ScannerSourceCycleSnapshot as MadminScannerSourceCycleSnapshot, ScannerSourceWorkSnapshot as MadminScannerSourceWorkSnapshot,
     ScannerUsageFreshnessSnapshot as MadminScannerUsageFreshnessSnapshot, TimedAction as MadminTimedAction,
 };
+use rustfs_scanner_contracts::metrics::global_metrics;
 use rustfs_utils::os::get_drive_stats;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -67,7 +70,19 @@ impl MetricType {
     }
 }
 
-fn to_madmin_scanner_metrics(metrics: rustfs_common::metrics::ScannerMetricsReport) -> MadminScannerMetrics {
+fn unix_millis_to_jiff_timestamp(millis: u64, fallback: Timestamp) -> Timestamp {
+    let millis = match i64::try_from(millis) {
+        Ok(millis) => millis,
+        Err(_) => return fallback,
+    };
+
+    match Timestamp::from_millisecond(millis) {
+        Ok(timestamp) => timestamp,
+        Err(_) => fallback,
+    }
+}
+
+fn to_madmin_scanner_metrics(metrics: rustfs_scanner_contracts::metrics::ScannerMetricsReport) -> MadminScannerMetrics {
     MadminScannerMetrics {
         collected_at: metrics.collected_at,
         current_cycle: metrics.current_cycle,
@@ -206,6 +221,14 @@ fn to_madmin_scanner_metrics(metrics: rustfs_common::metrics::ScannerMetricsRepo
             last_usage_save_unix_secs: metrics.usage_freshness.last_usage_save_unix_secs,
             last_usage_save_result: metrics.usage_freshness.last_usage_save_result,
             last_usage_save_result_code: metrics.usage_freshness.last_usage_save_result_code,
+            last_durable_success_unix_secs: metrics.usage_freshness.last_durable_success_unix_secs,
+            last_publication_unix_secs: metrics.usage_freshness.last_publication_unix_secs,
+            last_publication_state: metrics.usage_freshness.last_publication_state,
+            last_publication_reason: metrics.usage_freshness.last_publication_reason,
+            deferred_pending: metrics.usage_freshness.deferred_pending,
+            deferred_total: metrics.usage_freshness.deferred_total,
+            last_deferred_unix_secs: metrics.usage_freshness.last_deferred_unix_secs,
+            last_deferred_reason: metrics.usage_freshness.last_deferred_reason,
         },
         maintenance_control: MadminScannerMaintenanceControlSnapshot {
             primary_control: metrics.maintenance_control.primary_control,
@@ -242,6 +265,10 @@ fn to_madmin_scanner_metrics(metrics: rustfs_common::metrics::ScannerMetricsRepo
         cycle_max_duration_seconds: metrics.cycle_max_duration_seconds,
         cycle_max_objects: metrics.cycle_max_objects,
         cycle_max_directories: metrics.cycle_max_directories,
+        cycle_timeout_total: metrics.cycle_timeout_total,
+        cycle_recovery_required_total: metrics.cycle_recovery_required_total,
+        cycle_last_progress_age: metrics.cycle_last_progress_age,
+        leader_lease_without_progress: metrics.leader_lease_without_progress,
         bitrot_cycle_enabled: metrics.bitrot_cycle_enabled,
         bitrot_cycle_seconds: metrics.bitrot_cycle_seconds,
         scan_checkpoint: metrics.scan_checkpoint.map(|checkpoint| MadminScannerCheckpointReport {
@@ -386,7 +413,7 @@ pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts)
     if types.contains(&MetricType::DISK) {
         debug!("start get disk metrics");
         let mut aggr = DiskMetric {
-            collected_at: Utc::now(),
+            collected_at: Timestamp::now(),
             ..Default::default()
         };
         for (name, disk) in collect_local_disks_metrics(&opts.disks).await.into_iter() {
@@ -412,7 +439,7 @@ pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts)
     if types.contains(&MetricType::NET) {
         let snapshot = global_internode_metrics().snapshot();
         real_time_metrics.aggregated.net = Some(NetMetrics {
-            collected_at: Utc::now(),
+            collected_at: Timestamp::now(),
             interface_name: "internode".to_string(),
             net_stats: NetDevLine {
                 name: "internode".to_string(),
@@ -428,10 +455,9 @@ pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts)
     // if types.contains(&MetricType::CPU) {}
 
     if types.contains(&MetricType::RPC) {
-        let collected_at = Utc::now();
+        let collected_at = Timestamp::now();
         let snapshot = global_internode_metrics().snapshot();
-        let last_connect_time =
-            chrono::DateTime::<Utc>::from_timestamp_millis(snapshot.last_dial_unix_millis as i64).unwrap_or(collected_at);
+        let last_connect_time = unix_millis_to_jiff_timestamp(snapshot.last_dial_unix_millis, collected_at);
 
         real_time_metrics.aggregated.rpc = Some(RPCMetrics {
             collected_at,
@@ -538,10 +564,14 @@ async fn collect_local_disks_metrics(disks: &HashSet<String>) -> HashMap<String,
 #[cfg(test)]
 mod test {
     use super::*;
-    use rustfs_common::metrics::CurrentCycle;
     use rustfs_io_metrics::internode_metrics::global_internode_metrics;
+    use rustfs_scanner_contracts::metrics::CurrentCycle;
     use serial_test::serial;
     use std::time::Duration;
+
+    fn chrono_to_jiff_timestamp(timestamp: chrono::DateTime<Utc>) -> jiff::Timestamp {
+        jiff::Timestamp::try_from(std::time::SystemTime::from(timestamp)).expect("test timestamp should fit in jiff")
+    }
 
     #[test]
     fn tes_types() {
@@ -589,12 +619,16 @@ mod test {
     #[test]
     fn scanner_metrics_mapping_preserves_partial_source_status() {
         let current_started = Utc::now() - chrono::Duration::seconds(5);
-        let scanner = to_madmin_scanner_metrics(rustfs_common::metrics::ScannerMetricsReport {
+        let scanner = to_madmin_scanner_metrics(rustfs_scanner_contracts::metrics::ScannerMetricsReport {
             current_cycle_active: true,
-            current_started,
+            current_started: chrono_to_jiff_timestamp(current_started),
             last_cycle_partial_source: "usage".to_string(),
             last_cycle_partial_source_code: 1,
-            partial_cycles_by_source: vec![rustfs_common::metrics::ScannerSourceCycleSnapshot {
+            cycle_timeout_total: 3,
+            cycle_recovery_required_total: 2,
+            cycle_last_progress_age: 17,
+            leader_lease_without_progress: true,
+            partial_cycles_by_source: vec![rustfs_scanner_contracts::metrics::ScannerSourceCycleSnapshot {
                 source: "usage".to_string(),
                 cycles: 2,
             }],
@@ -602,9 +636,13 @@ mod test {
         });
 
         assert_eq!(scanner.current_cycle_active, Some(true));
-        assert_eq!(scanner.current_started, current_started);
+        assert_eq!(scanner.current_started, chrono_to_jiff_timestamp(current_started));
         assert_eq!(scanner.last_cycle_partial_source, "usage");
         assert_eq!(scanner.last_cycle_partial_source_code, 1);
+        assert_eq!(scanner.cycle_timeout_total, 3);
+        assert_eq!(scanner.cycle_recovery_required_total, 2);
+        assert_eq!(scanner.cycle_last_progress_age, 17);
+        assert!(scanner.leader_lease_without_progress);
         let usage = scanner
             .partial_cycles_by_source
             .iter()
@@ -616,11 +654,11 @@ mod test {
     #[tokio::test]
     #[serial]
     async fn collect_local_metrics_preserves_scanner_cycle_started_time() {
-        let previous_init_time = *rustfs_common::globals::GLOBAL_INIT_TIME.read().await;
+        let previous_init_time = *rustfs_scanner_contracts::GLOBAL_INIT_TIME.read().await;
         let previous_cycle = global_metrics().get_cycle().await;
         let init_time = Utc::now() - chrono::Duration::hours(1);
         let cycle_started = Utc::now() - chrono::Duration::seconds(5);
-        *rustfs_common::globals::GLOBAL_INIT_TIME.write().await = Some(init_time);
+        *rustfs_scanner_contracts::GLOBAL_INIT_TIME.write().await = Some(init_time);
         let cycle = CurrentCycle {
             current: 0,
             next: 1,
@@ -635,7 +673,7 @@ mod test {
             .finish_scan_cycle_work_with_cycle(cycle_start, previous_cycle.clone().unwrap_or_default())
             .await;
         global_metrics().set_cycle(previous_cycle).await;
-        *rustfs_common::globals::GLOBAL_INIT_TIME.write().await = previous_init_time;
+        *rustfs_scanner_contracts::GLOBAL_INIT_TIME.write().await = previous_init_time;
 
         let encoded = rmp_serde::to_vec_named(&realtime).expect("realtime metrics should encode");
         let decoded: RealtimeMetrics = rmp_serde::from_slice(&encoded).expect("realtime metrics should decode");
@@ -643,13 +681,13 @@ mod test {
         aggregated.merge(decoded);
         let scanner = aggregated.aggregated.scanner.expect("scanner metrics");
         assert_eq!(scanner.current_cycle_active, Some(true));
-        assert_eq!(scanner.current_started, cycle_started);
+        assert_eq!(scanner.current_started, chrono_to_jiff_timestamp(cycle_started));
     }
 
     #[test]
     fn scanner_metrics_mapping_preserves_pacing_pressure() {
-        let scanner = to_madmin_scanner_metrics(rustfs_common::metrics::ScannerMetricsReport {
-            pacing_pressure: rustfs_common::metrics::ScannerPacingPressureSnapshot {
+        let scanner = to_madmin_scanner_metrics(rustfs_scanner_contracts::metrics::ScannerMetricsReport {
+            pacing_pressure: rustfs_scanner_contracts::metrics::ScannerPacingPressureSnapshot {
                 primary_pressure: "cycle_budget".to_string(),
                 current_queued_scans: 4,
                 current_active_scans: 2,
@@ -674,12 +712,12 @@ mod test {
 
     #[test]
     fn scanner_metrics_mapping_preserves_lifecycle_transition_status() {
-        let scanner = to_madmin_scanner_metrics(rustfs_common::metrics::ScannerMetricsReport {
+        let scanner = to_madmin_scanner_metrics(rustfs_scanner_contracts::metrics::ScannerMetricsReport {
             current_cycle_lifecycle_expiry_actions: 2,
             current_cycle_lifecycle_transition_actions: 3,
             last_cycle_lifecycle_expiry_actions: 5,
             last_cycle_lifecycle_transition_actions: 7,
-            lifecycle_expiry: rustfs_common::metrics::ScannerLifecycleExpirySnapshot {
+            lifecycle_expiry: rustfs_scanner_contracts::metrics::ScannerLifecycleExpirySnapshot {
                 current_queue_capacity: 16,
                 current_queued: 5,
                 current_active: 2,
@@ -691,7 +729,7 @@ mod test {
                 scanner_not_enqueued: 2,
                 delete_failed: 1,
             },
-            lifecycle_transition: rustfs_common::metrics::ScannerLifecycleTransitionSnapshot {
+            lifecycle_transition: rustfs_scanner_contracts::metrics::ScannerLifecycleTransitionSnapshot {
                 current_queue_capacity: 16,
                 current_queued: 5,
                 current_active: 2,
@@ -740,10 +778,10 @@ mod test {
 
     #[test]
     fn scanner_metrics_mapping_preserves_maintenance_control_status() {
-        let scanner = to_madmin_scanner_metrics(rustfs_common::metrics::ScannerMetricsReport {
-            maintenance_control: rustfs_common::metrics::ScannerMaintenanceControlSnapshot {
+        let scanner = to_madmin_scanner_metrics(rustfs_scanner_contracts::metrics::ScannerMetricsReport {
+            maintenance_control: rustfs_scanner_contracts::metrics::ScannerMaintenanceControlSnapshot {
                 primary_control: "blocked_source".to_string(),
-                sources: vec![rustfs_common::metrics::ScannerMaintenanceSourceSnapshot {
+                sources: vec![rustfs_scanner_contracts::metrics::ScannerMaintenanceSourceSnapshot {
                     source: "lifecycle".to_string(),
                     state: "blocked".to_string(),
                     reason: "missed_work".to_string(),
@@ -777,8 +815,8 @@ mod test {
 
     #[test]
     fn scanner_metrics_mapping_preserves_usage_freshness_status() {
-        let scanner = to_madmin_scanner_metrics(rustfs_common::metrics::ScannerMetricsReport {
-            usage_freshness: rustfs_common::metrics::ScannerUsageFreshnessSnapshot {
+        let scanner = to_madmin_scanner_metrics(rustfs_scanner_contracts::metrics::ScannerMetricsReport {
+            usage_freshness: rustfs_scanner_contracts::metrics::ScannerUsageFreshnessSnapshot {
                 dirty_pending_buckets: 3,
                 last_dirty_mark_unix_secs: 10,
                 last_dirty_clear_unix_secs: 11,
@@ -787,6 +825,14 @@ mod test {
                 last_usage_save_unix_secs: 12,
                 last_usage_save_result: "success".to_string(),
                 last_usage_save_result_code: 1,
+                last_durable_success_unix_secs: 13,
+                last_publication_unix_secs: 14,
+                last_publication_state: "published".to_string(),
+                last_publication_reason: "complete".to_string(),
+                deferred_pending: true,
+                deferred_total: 15,
+                last_deferred_unix_secs: 16,
+                last_deferred_reason: "data_movement".to_string(),
             },
             ..Default::default()
         });
@@ -799,11 +845,19 @@ mod test {
         assert_eq!(scanner.usage_freshness.last_usage_save_unix_secs, 12);
         assert_eq!(scanner.usage_freshness.last_usage_save_result, "success");
         assert_eq!(scanner.usage_freshness.last_usage_save_result_code, 1);
+        assert_eq!(scanner.usage_freshness.last_durable_success_unix_secs, 13);
+        assert_eq!(scanner.usage_freshness.last_publication_unix_secs, 14);
+        assert_eq!(scanner.usage_freshness.last_publication_state, "published");
+        assert_eq!(scanner.usage_freshness.last_publication_reason, "complete");
+        assert!(scanner.usage_freshness.deferred_pending);
+        assert_eq!(scanner.usage_freshness.deferred_total, 15);
+        assert_eq!(scanner.usage_freshness.last_deferred_unix_secs, 16);
+        assert_eq!(scanner.usage_freshness.last_deferred_reason, "data_movement");
     }
 
     #[test]
     fn scanner_metrics_mapping_preserves_distributed_status_fields() {
-        let scanner = to_madmin_scanner_metrics(rustfs_common::metrics::ScannerMetricsReport {
+        let scanner = to_madmin_scanner_metrics(rustfs_scanner_contracts::metrics::ScannerMetricsReport {
             active_scan_paths: 2,
             oldest_active_path_age_seconds: 45,
             active_paths: vec!["disk-a/bucket-a".to_string(), "disk-b/bucket-b".to_string()],
@@ -859,7 +913,7 @@ mod test {
             cycle_max_directories: 38,
             bitrot_cycle_enabled: true,
             bitrot_cycle_seconds: 39.0,
-            scan_checkpoint: Some(rustfs_common::metrics::ScannerCheckpointReport {
+            scan_checkpoint: Some(rustfs_scanner_contracts::metrics::ScannerCheckpointReport {
                 version: 1,
                 resume_after: "bucket-a/prefix-a".to_string(),
                 reason: "directories".to_string(),
@@ -869,7 +923,7 @@ mod test {
             scan_checkpoint_cleared: 41,
             scan_checkpoint_ignored: 42,
             scan_checkpoint_stale: 43,
-            source_work: vec![rustfs_common::metrics::ScannerSourceWorkSnapshot {
+            source_work: vec![rustfs_scanner_contracts::metrics::ScannerSourceWorkSnapshot {
                 source: "usage".to_string(),
                 checked: 44,
                 queued: 45,
@@ -878,7 +932,7 @@ mod test {
                 skipped: 48,
                 missed: 49,
             }],
-            current_cycle_source_work: vec![rustfs_common::metrics::ScannerSourceWorkSnapshot {
+            current_cycle_source_work: vec![rustfs_scanner_contracts::metrics::ScannerSourceWorkSnapshot {
                 source: "lifecycle".to_string(),
                 checked: 50,
                 queued: 51,
@@ -887,7 +941,7 @@ mod test {
                 skipped: 54,
                 missed: 55,
             }],
-            last_cycle_source_work: vec![rustfs_common::metrics::ScannerSourceWorkSnapshot {
+            last_cycle_source_work: vec![rustfs_scanner_contracts::metrics::ScannerSourceWorkSnapshot {
                 source: "heal".to_string(),
                 checked: 56,
                 queued: 57,
@@ -896,7 +950,7 @@ mod test {
                 skipped: 60,
                 missed: 61,
             }],
-            replication_repair: vec![rustfs_common::metrics::ScannerReplicationRepairSnapshot {
+            replication_repair: vec![rustfs_scanner_contracts::metrics::ScannerReplicationRepairSnapshot {
                 source: "bucket_replication".to_string(),
                 kind: "object".to_string(),
                 scanner_role: "repair_admission".to_string(),
@@ -908,7 +962,7 @@ mod test {
                 skipped: 66,
                 missed: 67,
             }],
-            current_cycle_replication_repair: vec![rustfs_common::metrics::ScannerReplicationRepairSnapshot {
+            current_cycle_replication_repair: vec![rustfs_scanner_contracts::metrics::ScannerReplicationRepairSnapshot {
                 source: "bucket_replication".to_string(),
                 kind: "delete_marker".to_string(),
                 scanner_role: "repair_admission".to_string(),
@@ -920,7 +974,7 @@ mod test {
                 skipped: 72,
                 missed: 73,
             }],
-            last_cycle_replication_repair: vec![rustfs_common::metrics::ScannerReplicationRepairSnapshot {
+            last_cycle_replication_repair: vec![rustfs_scanner_contracts::metrics::ScannerReplicationRepairSnapshot {
                 source: "site_replication".to_string(),
                 kind: "active_resync".to_string(),
                 scanner_role: "boundary_signal".to_string(),

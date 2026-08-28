@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![recursion_limit = "256"]
+
 //! RustFS — high-performance S3-compatible object storage.
 //!
 //! This library exposes the [`embedded`] module which lets you start a
@@ -74,17 +76,23 @@ pub mod allocator_reclaim;
 pub mod app;
 pub mod auth;
 pub mod auth_keystone;
+pub(crate) mod bitrot_selftest;
 pub mod capacity;
+pub mod cgroup_resources;
 pub mod cluster_snapshot;
 pub mod config;
+pub mod connect;
 pub mod delete_tail_activity;
 pub mod diagnose;
 pub mod embedded;
 pub mod error;
 pub mod init;
+pub mod inspect;
 pub(crate) mod kms_deletion_gate;
+pub(crate) mod kms_rekey;
 pub mod license;
 pub mod memory_observability;
+pub mod module_switches;
 pub(crate) mod product;
 pub mod profiling;
 #[cfg(any(feature = "ftps", feature = "webdav", feature = "sftp"))]
@@ -92,6 +100,8 @@ pub mod protocols;
 pub mod runtime_capabilities;
 pub(crate) mod runtime_sources;
 pub mod server;
+pub mod shared_types;
+pub(crate) mod site_replication;
 pub(crate) mod site_replication_reconcile;
 pub(crate) mod startup_audit;
 pub(crate) mod startup_auth;

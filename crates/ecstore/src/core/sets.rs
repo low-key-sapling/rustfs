@@ -14,14 +14,14 @@
 // limitations under the License.
 
 use crate::disk::error_reduce::count_errs;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, is_all_volume_not_found, is_err_object_not_found, is_err_strict_volume_not_found};
 use crate::layout::set_heal::{formats_to_drives_info, new_heal_format_sets};
 use crate::multipart_listing::paginate_multipart_listing;
 use crate::storage_api_contracts::{
     bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
     list::{StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions},
     multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo},
-    object::{DeletedObject, ObjectIO as _, ObjectOperations as _, ObjectToDelete},
+    object::{DeleteAccounting, DeletedObject, ObjectIO as _, ObjectOperations as _, ObjectToDelete},
     range::HTTPRangeSpec,
 };
 use crate::{
@@ -46,9 +46,9 @@ use futures::{
     stream::{FuturesUnordered, StreamExt},
 };
 use http::HeaderMap;
-use rustfs_common::heal_channel::HealOpts;
-use rustfs_common::heal_channel::{DriveState, HealItemType};
 use rustfs_filemeta::FileInfo;
+use rustfs_heal_contracts::heal_channel::HealOpts;
+use rustfs_heal_contracts::heal_channel::{DriveState, HealItemType};
 use rustfs_lock::NamespaceLockWrapper;
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_utils::{crc_hash, path::path_join_buf, sip_hash};
@@ -70,6 +70,10 @@ type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
 type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
 
 const LIST_MULTIPART_SETS_CONCURRENCY: usize = 4;
+
+fn is_idempotent_delete_prefix_error(err: &Error) -> bool {
+    is_err_object_not_found(err) || is_err_strict_volume_not_found(err)
+}
 
 #[derive(Debug, Clone)]
 pub struct Sets {
@@ -99,6 +103,89 @@ impl Drop for Sets {
         if let Some(exit_signal) = self.exit_signal.take() {
             let _ = exit_signal.send(());
         }
+    }
+}
+
+#[cfg(test)]
+struct HealFormatAfterSaveBarrierState {
+    pool_key: usize,
+    disk_index: usize,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static HEAL_FORMAT_AFTER_SAVE_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Arc<HealFormatAfterSaveBarrierState>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct HealFormatAfterSaveBarrier {
+    state: Arc<HealFormatAfterSaveBarrierState>,
+}
+
+#[cfg(test)]
+impl HealFormatAfterSaveBarrier {
+    pub(crate) fn install(pool: &Arc<Sets>, disk_index: usize) -> Self {
+        let state = Arc::new(HealFormatAfterSaveBarrierState {
+            pool_key: Arc::as_ptr(pool) as usize,
+            disk_index,
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut barrier = HEAL_FORMAT_AFTER_SAVE_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("heal format after-save barrier should not be poisoned");
+        assert!(barrier.is_none(), "heal format after-save barrier must be unique");
+        *barrier = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(crate) async fn wait_until_paused(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("format heal should reach the after-save barrier");
+    }
+
+    pub(crate) fn release(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for HealFormatAfterSaveBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut barrier = HEAL_FORMAT_AFTER_SAVE_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("heal format after-save barrier should not be poisoned");
+        if barrier.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *barrier = None;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn pause_heal_format_after_save(pool: &Sets, disk_index: usize) {
+    let pool_key = std::ptr::from_ref(pool) as usize;
+    let barrier = {
+        let mut barrier = HEAL_FORMAT_AFTER_SAVE_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("heal format after-save barrier should not be poisoned");
+        if barrier
+            .as_ref()
+            .is_some_and(|state| state.pool_key == pool_key && state.disk_index == disk_index)
+        {
+            barrier.take()
+        } else {
+            None
+        }
+    };
+    if let Some(barrier) = barrier {
+        barrier.arrived.notify_one();
+        barrier.release.notified().await;
     }
 }
 
@@ -245,7 +332,7 @@ impl Sets {
 
         self.connect_disks().await;
 
-        // TODO: config interval
+        // TODO(backlog): make monitor_and_connect interval configurable instead of hardcoded 15s
         let mut interval = tokio::time::interval(Duration::from_secs(15));
         loop {
             tokio::select! {
@@ -280,6 +367,23 @@ impl Sets {
 
     pub fn get_disks_by_key(&self, key: &str) -> Arc<SetDisks> {
         self.get_disks(self.get_hashed_set_index(key))
+    }
+
+    pub(crate) fn get_disks_for_heal_object(&self, key: &str, opts: &HealOpts) -> Result<Arc<SetDisks>> {
+        match opts.set {
+            Some(set_idx) => self.disk_set.get(set_idx).cloned().ok_or_else(|| {
+                StorageError::InvalidArgument(
+                    "heal".to_string(),
+                    "set".to_string(),
+                    format!(
+                        "invalid heal set index {set_idx} for pool {} with {} sets",
+                        self.pool_idx,
+                        self.disk_set.len()
+                    ),
+                )
+            }),
+            None => Ok(self.get_disks_by_key(key)),
+        }
     }
 
     pub(crate) async fn storage_info_snapshot(&self) -> rustfs_madmin::StorageInfo {
@@ -339,8 +443,18 @@ impl Sets {
             futures.push(set.delete_object(bucket, object, opt.clone()));
         }
 
-        if let Some(err) = join_all(futures).await.into_iter().find_map(Result::err) {
-            return Err(err);
+        let errs = join_all(futures)
+            .await
+            .into_iter()
+            .map(|result| result.err())
+            .collect::<Vec<_>>();
+        if is_all_volume_not_found(&errs) {
+            return Err(StorageError::BucketNotFound(bucket.to_string()));
+        }
+        for err in errs.into_iter().flatten() {
+            if !is_idempotent_delete_prefix_error(&err) {
+                return Err(err);
+            }
         }
 
         Ok(())
@@ -380,6 +494,66 @@ fn apply_delete_objects_results(
             .get(i)
             .expect("delete_objects should return objects aligned with input objects")
             .clone();
+    }
+}
+
+fn apply_delete_accounting_results(
+    accounting: &mut [Option<DeleteAccounting>],
+    set_objects: &[DelObj],
+    set_accounting: &[Option<DeleteAccounting>],
+) {
+    for (obj, value) in set_objects.iter().zip(set_accounting.iter()) {
+        accounting[obj.orig_idx] = value.clone();
+    }
+}
+
+impl Sets {
+    pub(crate) async fn delete_objects_with_accounting(
+        &self,
+        bucket: &str,
+        objects: Vec<ObjectToDelete>,
+        opts: ObjectOptions,
+    ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
+        let mut del_objects = vec![DeletedObject::default(); objects.len()];
+        let mut del_errs = vec![None; objects.len()];
+        let mut accounting = vec![None; objects.len()];
+        let mut set_obj_map = HashMap::new();
+
+        for (i, obj) in objects.iter().enumerate() {
+            let idx = self.get_hashed_set_index(obj.object_name.as_str());
+            set_obj_map.entry(idx).or_insert_with(Vec::new).push(DelObj {
+                orig_idx: i,
+                obj: obj.clone(),
+            });
+        }
+
+        let max_concurrent = set_obj_map.len().min(num_cpus::get()).max(1);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+        let mut futures = FuturesUnordered::new();
+        let bucket = bucket.to_owned();
+
+        for (set_index, set_objects) in set_obj_map {
+            let disks = self.get_disks(set_index);
+            let objects = set_objects.iter().map(|entry| entry.obj.clone()).collect::<Vec<_>>();
+            let bucket = bucket.clone();
+            let opts = opts.clone();
+            let semaphore = semaphore.clone();
+            futures.push(async move {
+                let _permit = semaphore
+                    .acquire_owned()
+                    .await
+                    .expect("delete_objects semaphore should remain open");
+                let (deleted, errors, accounting) = disks.delete_objects_with_accounting(&bucket, objects, opts).await;
+                (set_objects, deleted, errors, accounting)
+            });
+        }
+
+        while let Some((set_objects, deleted, errors, set_accounting)) = futures.next().await {
+            apply_delete_objects_results(&mut del_objects, &mut del_errs, &set_objects, &deleted, errors);
+            apply_delete_accounting_results(&mut accounting, &set_objects, &set_accounting);
+        }
+
+        (del_objects, del_errs, accounting)
     }
 }
 
@@ -624,65 +798,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for Sets {
         objects: Vec<ObjectToDelete>,
         opts: ObjectOptions,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>) {
-        // Default return value
-        let mut del_objects = vec![DeletedObject::default(); objects.len()];
-
-        let mut del_errs = Vec::with_capacity(objects.len());
-        for _ in 0..objects.len() {
-            del_errs.push(None)
-        }
-
-        let mut set_obj_map = HashMap::new();
-
-        // hash key
-        for (i, obj) in objects.iter().enumerate() {
-            let idx = self.get_hashed_set_index(obj.object_name.as_str());
-
-            if !set_obj_map.contains_key(&idx) {
-                set_obj_map.insert(
-                    idx,
-                    vec![DelObj {
-                        // set_idx: idx,
-                        orig_idx: i,
-                        obj: obj.clone(),
-                    }],
-                );
-            } else if let Some(val) = set_obj_map.get_mut(&idx) {
-                val.push(DelObj {
-                    // set_idx: idx,
-                    orig_idx: i,
-                    obj: obj.clone(),
-                });
-            }
-        }
-
-        let max_concurrent = set_obj_map.len().min(num_cpus::get()).max(1);
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
-        let mut futures = FuturesUnordered::new();
-        let bucket = bucket.to_string();
-
-        for (k, v) in set_obj_map {
-            let disks = self.get_disks(k);
-            let objs: Vec<ObjectToDelete> = v.iter().map(|v| v.obj.clone()).collect();
-            let bucket = bucket.clone();
-            let opts = opts.clone();
-            let semaphore = semaphore.clone();
-
-            futures.push(async move {
-                let _permit = semaphore
-                    .acquire_owned()
-                    .await
-                    .expect("delete_objects semaphore should remain open");
-                let (dobjects, errs) = disks.delete_objects(&bucket, objs, opts).await;
-                (v, dobjects, errs)
-            });
-        }
-
-        while let Some((v, dobjects, errs)) = futures.next().await {
-            apply_delete_objects_results(&mut del_objects, &mut del_errs, &v, &dobjects, errs);
-        }
-
-        (del_objects, del_errs)
+        let (deleted, errors, _) = self.delete_objects_with_accounting(bucket, objects, opts).await;
+        (deleted, errors)
     }
 
     #[tracing::instrument(skip(self))]
@@ -735,7 +852,7 @@ impl crate::storage_api_contracts::list::ListOperations for Sets {
     type WalkCancellation = CancellationToken;
     type WalkResultSender = tokio::sync::mpsc::Sender<ObjectInfoOrErr>;
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn list_objects_v2(
         self: Arc<Self>,
         bucket: &str,
@@ -816,8 +933,19 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for Sets {
                 let upload_id_marker = upload_id_marker.clone();
                 let delimiter = delimiter.clone();
                 async move {
-                    set.list_multipart_uploads(bucket, prefix, key_marker, upload_id_marker, delimiter, per_set_limit)
-                        .await
+                    // ECStore owns the bucket lifecycle fence and calls the
+                    // incarnation-aware pool helper. This lower-level trait
+                    // surface has no ECStore guard to propagate.
+                    set.list_multipart_uploads_for_incarnation(
+                        bucket,
+                        prefix,
+                        key_marker,
+                        upload_id_marker,
+                        delimiter,
+                        per_set_limit,
+                        None,
+                    )
+                    .await
                 }
             })
             .buffer_unordered(LIST_MULTIPART_SETS_CONCURRENCY)
@@ -943,14 +1071,15 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for Sets {
     }
 }
 
-#[async_trait::async_trait]
-impl crate::storage_api_contracts::heal::HealOperations for Sets {
-    type Error = Error;
-    type HealResultItem = HealResultItem;
-    type HealOptions = HealOpts;
-
-    #[tracing::instrument(skip(self))]
-    async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
+impl Sets {
+    pub(crate) async fn heal_format_with_fence<F>(
+        &self,
+        dry_run: bool,
+        mut fence_lost: F,
+    ) -> Result<(HealResultItem, Option<Error>)>
+    where
+        F: FnMut() -> bool + Send,
+    {
         let (disks, init_errs) = init_storage_disks_with_errors(
             &self.endpoints.endpoints,
             &DiskOption {
@@ -1016,22 +1145,42 @@ impl crate::storage_api_contracts::heal::HealOperations for Sets {
             for (i, set) in new_format_sets.iter().enumerate() {
                 for (j, fm) in set.iter().enumerate() {
                     if let Some(fm) = fm {
-                        res.after.drives[i * self.set_drive_count + j].uuid = fm.erasure.this.to_string();
-                        res.after.drives[i * self.set_drive_count + j].state = DriveState::Ok.to_string();
                         tmp_new_formats[i * self.set_drive_count + j] = Some(fm.clone());
                     }
                 }
             }
             // Save new formats `format.json` on unformatted disks.
-            for (fm, disk) in tmp_new_formats.iter_mut().zip(disks.iter()) {
-                if fm.is_some() && disk.is_some() && save_format_file(disk, fm).await.is_err() {
-                    let _ = disk.as_ref().unwrap().close().await;
-                    *fm = None;
+            for (index, (fm, disk)) in tmp_new_formats.iter_mut().zip(disks.iter()).enumerate() {
+                if fm.is_some() && disk.is_some() {
+                    if fence_lost() {
+                        return Ok((res, Some(StorageError::SlowDown)));
+                    }
+                    if let Err(err) = save_format_file(disk, fm).await {
+                        if let Some(disk) = disk.as_ref() {
+                            let _ = disk.close().await;
+                        }
+                        return Ok((res, Some(err.into())));
+                    }
+                    #[cfg(test)]
+                    pause_heal_format_after_save(self, index).await;
+                    if fence_lost() {
+                        return Ok((res, Some(StorageError::SlowDown)));
+                    }
+                    if let Some(saved_format) = fm.as_ref() {
+                        res.after.drives[index].uuid = saved_format.erasure.this.to_string();
+                        res.after.drives[index].state = DriveState::Ok.to_string();
+                    }
                 }
             }
 
+            if fence_lost() {
+                return Ok((res, Some(StorageError::SlowDown)));
+            }
             for (index, fm) in tmp_new_formats.iter().enumerate() {
                 if let Some(fm) = fm {
+                    if fence_lost() {
+                        return Ok((res, Some(StorageError::SlowDown)));
+                    }
                     let (m, n) = match ref_format.find_disk_index_by_disk_id(fm.erasure.this) {
                         Ok((m, n)) => (m, n),
                         Err(_) => continue,
@@ -1043,12 +1192,27 @@ impl crate::storage_api_contracts::heal::HealOperations for Sets {
                     }
 
                     if let Some(Some(disk)) = disks.get(index) {
+                        if fence_lost() {
+                            return Ok((res, Some(StorageError::SlowDown)));
+                        }
                         self.disk_set[m].renew_disk(&disk.endpoint()).await;
                     }
                 }
             }
         }
         Ok((res, None))
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::storage_api_contracts::heal::HealOperations for Sets {
+    type Error = Error;
+    type HealResultItem = HealResultItem;
+    type HealOptions = HealOpts;
+
+    #[tracing::instrument(skip(self))]
+    async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
+        self.heal_format_with_fence(dry_run, || false).await
     }
     #[tracing::instrument(skip(self))]
     async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
@@ -1068,7 +1232,7 @@ impl crate::storage_api_contracts::heal::HealOperations for Sets {
 
         Ok(result)
     }
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip(self, opts), fields(bucket = %bucket, object = %object, version_id = %version_id))]
     async fn heal_object(
         &self,
         bucket: &str,
@@ -1076,7 +1240,7 @@ impl crate::storage_api_contracts::heal::HealOperations for Sets {
         version_id: &str,
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)> {
-        self.get_disks_by_key(object)
+        self.get_disks_for_heal_object(object, opts)?
             .heal_object(bucket, object, version_id, opts)
             .await
     }
@@ -1092,11 +1256,11 @@ impl crate::storage_api_contracts::heal::HealOperations for Sets {
 
         Err(Error::DiskNotFound)
     }
-    #[tracing::instrument(skip(self))]
-    async fn check_abandoned_parts(&self, _bucket: &str, _object: &str, _opts: &HealOpts) -> Result<()> {
-        // Multipart orphan reconciliation is intentionally retained above the pool/set layers
-        // until there is a concrete caller and a stable lower-level contract to implement.
-        Err(StorageError::NotImplemented)
+    #[tracing::instrument(level = "debug", skip(self, opts), fields(bucket = %bucket, object = %object, dry_run = opts.dry_run))]
+    async fn check_abandoned_parts(&self, bucket: &str, object: &str, opts: &HealOpts) -> Result<()> {
+        self.get_disks_for_heal_object(object, opts)?
+            .check_abandoned_parts(bucket, object, opts)
+            .await
     }
 }
 
@@ -1171,6 +1335,106 @@ async fn init_storage_disks_with_errors(
     }
 
     (disks, errs)
+}
+
+#[cfg(test)]
+pub(crate) async fn make_local_two_set_sets() -> (Vec<tempfile::TempDir>, Arc<Sets>) {
+    make_local_two_set_sets_with_ctx(bootstrap_ctx()).await
+}
+
+#[cfg(any(test, feature = "test-util"))]
+pub(crate) async fn make_local_two_set_sets_with_ctx(ctx: Arc<InstanceContext>) -> (Vec<tempfile::TempDir>, Arc<Sets>) {
+    make_local_two_set_sets_for_pool_with_ctx(ctx, 0).await
+}
+
+#[cfg(any(test, feature = "test-util"))]
+pub(crate) async fn make_local_two_set_sets_for_pool_with_ctx(
+    ctx: Arc<InstanceContext>,
+    pool_idx: usize,
+) -> (Vec<tempfile::TempDir>, Arc<Sets>) {
+    use crate::layout::endpoint::Endpoint;
+    use rustfs_lock::client::local::LocalClient;
+
+    let format = FormatV3::new(2, 2);
+    let mut temp_dirs = Vec::new();
+    let mut all_endpoints = Vec::new();
+    let mut disk_sets = Vec::new();
+
+    for set_index in 0..2 {
+        let mut endpoints = Vec::new();
+        let mut disks = Vec::new();
+        for disk_index in 0..2 {
+            let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+            let mut endpoint = Endpoint::try_from(temp_dir.path().to_str().expect("tempdir path should be utf8"))
+                .expect("endpoint should parse");
+            endpoint.set_pool_index(pool_idx);
+            endpoint.set_set_index(set_index);
+            endpoint.set_disk_index(disk_index);
+            let disk = new_disk(
+                &endpoint,
+                &DiskOption {
+                    cleanup: false,
+                    health_check: false,
+                },
+            )
+            .await
+            .expect("disk should be created");
+            let mut disk_format = format.clone();
+            disk_format.erasure.this = format.erasure.sets[set_index][disk_index];
+            save_format_file(&Some(disk.clone()), &Some(disk_format))
+                .await
+                .expect("format should be saved");
+            temp_dirs.push(temp_dir);
+            all_endpoints.push(endpoint.clone());
+            endpoints.push(endpoint);
+            disks.push(Some(disk));
+        }
+        let lockers = (0..2)
+            .map(|_| {
+                Arc::new(LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::Enabled(Arc::new(
+                    rustfs_lock::FastObjectLockManager::new(),
+                ))))) as Arc<dyn rustfs_lock::LockClient>
+            })
+            .collect();
+        disk_sets.push(
+            SetDisks::new_with_instance_ctx(
+                "test-owner".to_string(),
+                Arc::new(RwLock::new(disks)),
+                2,
+                1,
+                set_index,
+                pool_idx,
+                endpoints,
+                format.clone(),
+                lockers,
+                Arc::clone(&ctx),
+            )
+            .await,
+        );
+    }
+
+    let sets = Arc::new(Sets {
+        id: format.id,
+        disk_set: disk_sets,
+        pool_idx,
+        endpoints: PoolEndpoints {
+            legacy: false,
+            set_count: 2,
+            drives_per_set: 2,
+            endpoints: Endpoints::from(all_endpoints),
+            cmd_line: String::new(),
+            platform: String::new(),
+        },
+        format,
+        parity_count: 1,
+        set_count: 2,
+        set_drive_count: 2,
+        default_parity_count: 1,
+        distribution_algo: DistributionAlgoVersion::V1,
+        exit_signal: None,
+        ctx,
+    });
+    (temp_dirs, sets)
 }
 
 #[cfg(test)]
@@ -1276,6 +1540,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn delete_prefix_error_classification_only_ignores_absence() {
+        assert!(is_idempotent_delete_prefix_error(&StorageError::FileNotFound));
+        assert!(is_idempotent_delete_prefix_error(&StorageError::ObjectNotFound(
+            "bucket".to_string(),
+            "prefix".to_string()
+        )));
+        assert!(is_idempotent_delete_prefix_error(&StorageError::VolumeNotFound));
+        assert!(is_idempotent_delete_prefix_error(&StorageError::BucketNotFound("bucket".to_string())));
+        assert!(!is_idempotent_delete_prefix_error(&StorageError::DiskNotFound));
+        assert!(!is_idempotent_delete_prefix_error(&StorageError::ErasureWriteQuorum));
+    }
+
     #[tokio::test]
     async fn sets_get_pool_and_set_returns_matching_coordinates() {
         let format = FormatV3::new(2, 2);
@@ -1318,84 +1595,211 @@ mod tests {
         assert_eq!(result, (Some(3), Some(1), Some(0)));
     }
 
-    async fn two_set_test_sets() -> (Vec<tempfile::TempDir>, Arc<Sets>) {
-        let format = FormatV3::new(2, 2);
-        let mut temp_dirs = Vec::new();
-        let mut all_endpoints = Vec::new();
-        let mut disk_sets = Vec::new();
+    #[tokio::test]
+    async fn heal_object_uses_explicit_set_scope() {
+        let (_temp_dirs, sets) = make_local_two_set_sets().await;
+        let selected = sets
+            .get_disks_for_heal_object(
+                "object",
+                &HealOpts {
+                    set: Some(1),
+                    ..Default::default()
+                },
+            )
+            .expect("requested set should be selected");
 
-        for set_index in 0..2 {
-            let mut endpoints = Vec::new();
-            let mut disks = Vec::new();
-            for disk_index in 0..2 {
-                let temp_dir = tempfile::tempdir().expect("tempdir should be created");
-                let mut endpoint = Endpoint::try_from(temp_dir.path().to_str().expect("tempdir path should be utf8"))
-                    .expect("endpoint should parse");
-                endpoint.set_pool_index(0);
-                endpoint.set_set_index(set_index);
-                endpoint.set_disk_index(disk_index);
-                let disk = new_disk(
-                    &endpoint,
-                    &DiskOption {
-                        cleanup: false,
-                        health_check: false,
-                    },
-                )
+        assert!(Arc::ptr_eq(&selected, &sets.disk_set[1]));
+    }
+
+    #[tokio::test]
+    async fn heal_object_without_set_scope_keeps_hash_routing() {
+        let (_temp_dirs, sets) = make_local_two_set_sets().await;
+        let object = "object";
+        let selected = sets
+            .get_disks_for_heal_object(object, &HealOpts::default())
+            .expect("hash-routed set should be selected");
+
+        assert!(Arc::ptr_eq(&selected, &sets.get_disks_by_key(object)));
+    }
+
+    #[tokio::test]
+    async fn heal_object_rejects_invalid_set_scope() {
+        let (_temp_dirs, sets) = make_local_two_set_sets().await;
+        let err = sets
+            .get_disks_for_heal_object(
+                "object",
+                &HealOpts {
+                    set: Some(2),
+                    ..Default::default()
+                },
+            )
+            .expect_err("out-of-range set scope must fail closed");
+
+        assert!(
+            matches!(err, StorageError::InvalidArgument(_, ref field, ref reason)
+                if field == "set" && reason.contains("invalid heal set index 2 for pool 0 with 2 sets")),
+            "unexpected invalid set error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_prefix_surfaces_a_hard_error_from_any_set() {
+        let (_temp_dirs, sets) = make_local_two_set_sets().await;
+        let bucket = format!("delete-prefix-{}", Uuid::new_v4().simple());
+        sets.make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created across both sets");
+
+        let healthy_disks = sets.disk_set[0].disks.read().await.clone();
+        for disk in healthy_disks.iter().flatten() {
+            disk.write_all(&bucket, "blocked/prefix/object", bytes::Bytes::from_static(b"data"))
                 .await
-                .expect("disk should be created");
-                let mut disk_format = format.clone();
-                disk_format.erasure.this = format.erasure.sets[set_index][disk_index];
-                save_format_file(&Some(disk.clone()), &Some(disk_format))
-                    .await
-                    .expect("format should be saved");
-                temp_dirs.push(temp_dir);
-                all_endpoints.push(endpoint.clone());
-                endpoints.push(endpoint);
-                disks.push(Some(disk));
-            }
-            disk_sets.push(
-                SetDisks::new(
-                    "test-owner".to_string(),
-                    Arc::new(RwLock::new(disks)),
-                    2,
-                    1,
-                    set_index,
-                    0,
-                    endpoints,
-                    format.clone(),
-                    vec![Arc::new(LocalClient::new()), Arc::new(LocalClient::new())],
-                )
-                .await,
-            );
+                .expect("healthy set should contain the prefix");
         }
 
-        let sets = Arc::new(Sets {
-            id: format.id,
-            disk_set: disk_sets,
-            pool_idx: 0,
-            endpoints: PoolEndpoints {
-                legacy: false,
-                set_count: 2,
-                drives_per_set: 2,
-                endpoints: Endpoints::from(all_endpoints),
-                cmd_line: String::new(),
-                platform: String::new(),
+        let failing_disks = sets.disk_set[1].disks.read().await.clone();
+        for disk in failing_disks.iter().flatten() {
+            disk.write_all(&bucket, "blocked", bytes::Bytes::from_static(b"not-a-directory"))
+                .await
+                .expect("failing set should contain a parent file");
+        }
+
+        let err = sets
+            .delete_object(
+                &bucket,
+                "blocked/prefix",
+                ObjectOptions {
+                    delete_prefix: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a hard failure from one set must not be reported as success");
+
+        match err {
+            StorageError::PrefixAccessDenied(error_bucket, error_prefix) => {
+                assert_eq!(error_bucket, bucket);
+                assert_eq!(error_prefix, "blocked/prefix");
+            }
+            other => panic!("unexpected recursive delete error: {other:?}"),
+        }
+        for disk in healthy_disks.iter().flatten() {
+            assert!(
+                matches!(disk.read_all(&bucket, "blocked/prefix/object").await, Err(DiskError::FileNotFound)),
+                "the healthy set should still complete its prefix deletion"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_prefix_keeps_a_missing_bucket_idempotent_across_sets() {
+        let (_temp_dirs, sets) = make_local_two_set_sets().await;
+        let bucket = format!("delete-prefix-{}", Uuid::new_v4().simple());
+        sets.make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created across both sets");
+
+        let healthy_disks = sets.disk_set[0].disks.read().await.clone();
+        for disk in healthy_disks.iter().flatten() {
+            disk.write_all(&bucket, "existing/prefix/object", bytes::Bytes::from_static(b"data"))
+                .await
+                .expect("healthy set should contain the prefix");
+        }
+        let missing_bucket_disks = sets.disk_set[1].disks.read().await.clone();
+        for disk in missing_bucket_disks.iter().flatten() {
+            disk.delete_volume(&bucket, true)
+                .await
+                .expect("the bucket should be removed from one set");
+        }
+
+        sets.delete_object(
+            &bucket,
+            "existing/prefix",
+            ObjectOptions {
+                delete_prefix: true,
+                ..Default::default()
             },
-            format,
-            parity_count: 1,
-            set_count: 2,
-            set_drive_count: 2,
-            default_parity_count: 1,
-            distribution_algo: DistributionAlgoVersion::V1,
-            exit_signal: None,
-            ctx: bootstrap_ctx(),
-        });
-        (temp_dirs, sets)
+        )
+        .await
+        .expect("a missing bucket on one set should remain an idempotent success");
+        for disk in healthy_disks.iter().flatten() {
+            assert!(
+                matches!(disk.read_all(&bucket, "existing/prefix/object").await, Err(DiskError::FileNotFound)),
+                "the healthy set should still complete its prefix deletion"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_prefix_preserves_a_completely_missing_bucket_error() {
+        let (_temp_dirs, sets) = make_local_two_set_sets().await;
+        let bucket = format!("delete-prefix-missing-{}", Uuid::new_v4().simple());
+
+        let err = sets
+            .delete_object(
+                &bucket,
+                "missing/prefix",
+                ObjectOptions {
+                    delete_prefix: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a completely missing bucket must not be reported as a successful object deletion");
+
+        assert_eq!(err, StorageError::BucketNotFound(bucket));
+    }
+
+    #[tokio::test]
+    async fn delete_prefix_fails_when_one_set_is_entirely_offline() {
+        let (_temp_dirs, sets) = make_local_two_set_sets().await;
+        let bucket = format!("delete-prefix-{}", Uuid::new_v4().simple());
+        sets.make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created across both sets");
+
+        let online_disks = sets.disk_set[0].disks.read().await.clone();
+        let offline_disks = sets.disk_set[1].disks.read().await.clone();
+        for disk in online_disks.iter().chain(offline_disks.iter()).flatten() {
+            disk.write_all(&bucket, "offline/prefix/object", bytes::Bytes::from_static(b"data"))
+                .await
+                .expect("each set should contain the prefix before the outage");
+        }
+        *sets.disk_set[1].disks.write().await = vec![None, None];
+
+        let err = sets
+            .delete_object(
+                &bucket,
+                "offline/prefix",
+                ObjectOptions {
+                    delete_prefix: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("an entirely offline set must make the recursive delete fail");
+
+        assert!(
+            matches!(err, StorageError::InsufficientWriteQuorum(ref error_bucket, ref error_prefix)
+                if error_bucket == &bucket && error_prefix == "offline/prefix"),
+            "unexpected offline-set error: {err:?}"
+        );
+        for disk in online_disks.iter().flatten() {
+            assert!(matches!(
+                disk.read_all(&bucket, "offline/prefix/object").await,
+                Err(DiskError::FileNotFound)
+            ));
+        }
+        for disk in offline_disks.iter().flatten() {
+            disk.read_all(&bucket, "offline/prefix/object")
+                .await
+                .expect("the offline set's untouched prefix must still be present");
+        }
     }
 
     #[tokio::test]
     async fn set_format_heal_accepts_quorum_from_a_nonzero_set() {
-        let (_temp_dirs, sets) = two_set_test_sets().await;
+        let (_temp_dirs, sets) = make_local_two_set_sets().await;
 
         let (result, err) = sets.disk_set[1]
             .heal_format(false)
@@ -1500,7 +1904,7 @@ mod tests {
     #[serial]
     async fn list_multipart_uploads_merges_all_sets_without_pagination_loss() {
         let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::Erasure).await;
-        let (_temp_dirs, sets) = two_set_test_sets().await;
+        let (_temp_dirs, sets) = make_local_two_set_sets().await;
         let bucket = format!("multipart-list-{}", Uuid::new_v4().simple());
         sets.make_bucket(&bucket, &MakeBucketOptions::default())
             .await
@@ -1556,7 +1960,19 @@ mod tests {
             upload_id_marker = page.next_upload_id_marker;
         }
 
-        assert_eq!(actual, expected, "set-level merge must return every upload exactly once");
+        // Compare only the decoded `<uuid>x<timestamp>` suffixes: the full
+        // upload id embeds the process-global deployment id, which a
+        // concurrently running test can swap between create and list time.
+        let normalize = |uploads: &[(String, String)]| {
+            let mut normalized = uploads
+                .iter()
+                .map(|(key, upload_id)| (key.clone(), runtime_sources::upload_uuid_suffix(upload_id)))
+                .collect::<Vec<_>>();
+            normalized.sort();
+            normalized
+        };
+        let actual = normalize(&actual);
+        assert_eq!(actual, normalize(&expected), "set-level merge must return every upload exactly once");
         let mut deduped = actual.clone();
         deduped.dedup();
         assert_eq!(deduped.len(), actual.len(), "set-level pagination must not duplicate uploads");
@@ -1704,7 +2120,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sets_check_abandoned_parts_returns_typed_not_implemented_error() {
+    async fn sets_check_abandoned_parts_rejects_invalid_set_scope() {
         let format = FormatV3::new(1, 1);
         let sets = Sets {
             id: format.id,
@@ -1729,10 +2145,21 @@ mod tests {
         };
 
         let err = sets
-            .check_abandoned_parts("bucket", "object", &HealOpts::default())
+            .check_abandoned_parts(
+                "bucket",
+                "object",
+                &HealOpts {
+                    set: Some(1),
+                    ..Default::default()
+                },
+            )
             .await
-            .expect_err("abandoned-parts ownership should stay above the pool/set storage layers");
-        assert!(matches!(err, StorageError::NotImplemented));
+            .expect_err("out-of-range abandoned-parts set scope must fail closed");
+        assert!(
+            matches!(err, StorageError::InvalidArgument(_, ref field, ref reason)
+                if field == "set" && reason.contains("invalid heal set index 1")),
+            "unexpected invalid set error: {err:?}"
+        );
     }
 
     // Builds a single-set `Sets` over `SET_DRIVE_COUNT` local temp-dir disks,
@@ -1917,6 +2344,39 @@ mod tests {
             res.before.drives[2].state,
             DriveState::Missing.to_string(),
             "unformatted disk must be Missing on its real index, not on a placeholder"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn replacement_format_only_writes_the_requested_slot() {
+        let (_dirs, _ref_format, sets) = setup_heal_format_sets(1, false).await;
+        let target = sets.endpoints.endpoints.as_ref()[1].to_string();
+        let untouched = sets.endpoints.endpoints.as_ref()[2].to_string();
+        let set = set_level_heal_view(&sets).await;
+
+        let (result, error) = set
+            .heal_replacement_format(false, std::slice::from_ref(&target))
+            .await
+            .expect("target-scoped replacement format should run");
+
+        assert!(error.is_none(), "target format must not report an error: {error:?}");
+        assert!(
+            result
+                .after
+                .drives
+                .iter()
+                .any(|drive| drive.endpoint == target && drive.state == DriveState::Ok.to_string()),
+            "requested replacement slot must be formatted"
+        );
+        let untouched_format = std::path::Path::new(&sets.endpoints.endpoints.as_ref()[2].get_file_path())
+            .join(crate::disk::RUSTFS_META_BUCKET)
+            .join(crate::disk::FORMAT_CONFIG_FILE);
+        assert!(
+            !tokio::fs::try_exists(untouched_format)
+                .await
+                .expect("untouched replacement format path should be inspectable"),
+            "unrequested slot {untouched} must remain unformatted"
         );
     }
 

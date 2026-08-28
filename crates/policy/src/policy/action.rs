@@ -355,37 +355,6 @@ pub enum S3Action {
     GetBucketQuotaAction,
 }
 
-// #[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, EnumString, IntoStaticStr, Debug, Copy)]
-// #[serde(try_from = "&str", into = "&str")]
-// pub enum AdminAction {
-//     #[strum(serialize = "admin:*")]
-//     AllActions,
-//     #[strum(serialize = "admin:Profiling")]
-//     ProfilingAdminAction,
-//     #[strum(serialize = "admin:ServerTrace")]
-//     TraceAdminAction,
-//     #[strum(serialize = "admin:ConsoleLog")]
-//     ConsoleLogAdminAction,
-//     #[strum(serialize = "admin:ServerInfo")]
-//     ServerInfoAdminAction,
-//     #[strum(serialize = "admin:OBDInfo")]
-//     HealthInfoAdminAction,
-//     #[strum(serialize = "admin:TopLocksInfo")]
-//     TopLocksAdminAction,
-//     #[strum(serialize = "admin:LicenseInfo")]
-//     LicenseInfoAdminAction,
-//     #[strum(serialize = "admin:BandwidthMonitor")]
-//     BandwidthMonitorAction,
-//     #[strum(serialize = "admin:InspectData")]
-//     InspectDataAction,
-//     #[strum(serialize = "admin:Prometheus")]
-//     PrometheusAdminAction,
-//     #[strum(serialize = "admin:ListServiceAccounts")]
-//     ListServiceAccountsAdminAction,
-//     #[strum(serialize = "admin:CreateServiceAccount")]
-//     CreateServiceAccountAdminAction,
-// }
-
 // AdminAction - admin policy action.
 #[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, IntoStaticStr, Debug, Copy, EnumString)]
 #[serde(try_from = "&str", into = "&str")]
@@ -743,6 +712,12 @@ pub enum KmsAction {
     /// Preflight or execute a KMS restore.
     #[strum(serialize = "kms:Restore")]
     RestoreAction,
+    /// Run the bulk rekey sweep that rewraps stored object DEK envelopes onto
+    /// current master key versions. Cluster-scoped: it walks and rewrites
+    /// object metadata across buckets, so it is never conferred by a per-key
+    /// role template.
+    #[strum(serialize = "kms:Rekey")]
+    RekeyAction,
 }
 
 #[cfg(test)]
@@ -785,6 +760,7 @@ mod tests {
             ("kms:Decrypt", KmsAction::DecryptAction),
             ("kms:Backup", KmsAction::BackupAction),
             ("kms:Restore", KmsAction::RestoreAction),
+            ("kms:Rekey", KmsAction::RekeyAction),
         ] {
             let action = Action::try_from(raw).expect("Should parse KMS action");
             assert_eq!(action, Action::KmsAction(expected));

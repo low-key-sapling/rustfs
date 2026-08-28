@@ -81,6 +81,7 @@ pub enum StorageErrorCode {
     InsufficientWriteQuorum,
     PreconditionFailed,
     EntityTooSmall,
+    EntityTooLarge,
     InvalidRangeSpec,
     NotModified,
     InvalidPartNumber,
@@ -103,6 +104,9 @@ pub enum StorageErrorCode {
     SourceStalled,
     Timeout,
     InvalidPath,
+    QuotaExceeded,
+    RemoteClientUnavailable,
+    RemoteNotInitialized,
 }
 
 impl StorageErrorCode {
@@ -166,6 +170,7 @@ impl StorageErrorCode {
             Self::InsufficientWriteQuorum => 0x3A,
             Self::PreconditionFailed => 0x3B,
             Self::EntityTooSmall => 0x3C,
+            Self::EntityTooLarge => 0x56,
             Self::InvalidRangeSpec => 0x3D,
             Self::NotModified => 0x3E,
             Self::InvalidPartNumber => 0x3F,
@@ -188,6 +193,9 @@ impl StorageErrorCode {
             Self::SourceStalled => 0x50,
             Self::Timeout => 0x51,
             Self::InvalidPath => 0x52,
+            Self::QuotaExceeded => 0x53,
+            Self::RemoteClientUnavailable => 0x54,
+            Self::RemoteNotInitialized => 0x55,
         }
     }
 
@@ -251,6 +259,7 @@ impl StorageErrorCode {
             0x3A => Some(Self::InsufficientWriteQuorum),
             0x3B => Some(Self::PreconditionFailed),
             0x3C => Some(Self::EntityTooSmall),
+            0x56 => Some(Self::EntityTooLarge),
             0x3D => Some(Self::InvalidRangeSpec),
             0x3E => Some(Self::NotModified),
             0x3F => Some(Self::InvalidPartNumber),
@@ -273,6 +282,9 @@ impl StorageErrorCode {
             0x50 => Some(Self::SourceStalled),
             0x51 => Some(Self::Timeout),
             0x52 => Some(Self::InvalidPath),
+            0x53 => Some(Self::QuotaExceeded),
+            0x54 => Some(Self::RemoteClientUnavailable),
+            0x55 => Some(Self::RemoteNotInitialized),
             _ => None,
         }
     }
@@ -341,12 +353,16 @@ mod tests {
         (StorageErrorCode::InsufficientWriteQuorum, 0x3A),
         (StorageErrorCode::PreconditionFailed, 0x3B),
         (StorageErrorCode::EntityTooSmall, 0x3C),
+        (StorageErrorCode::EntityTooLarge, 0x56),
         (StorageErrorCode::InvalidRangeSpec, 0x3D),
         (StorageErrorCode::NotModified, 0x3E),
         (StorageErrorCode::InvalidPartNumber, 0x3F),
         (StorageErrorCode::RebalanceAlreadyRunning, 0x40),
         (StorageErrorCode::OperationCanceled, 0x41),
         (StorageErrorCode::NamespaceLockQuorumUnavailable, 0x42),
+        (StorageErrorCode::QuotaExceeded, 0x53),
+        (StorageErrorCode::RemoteClientUnavailable, 0x54),
+        (StorageErrorCode::RemoteNotInitialized, 0x55),
     ];
 
     const DISK_PRESERVATION_ERROR_CODES: &[(StorageErrorCode, u32)] = &[

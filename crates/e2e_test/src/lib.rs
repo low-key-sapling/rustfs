@@ -39,10 +39,19 @@ pub mod fault_proxy;
 #[cfg(test)]
 mod reliability_disk_fault_test;
 
+// Privileged Linux-only 3x4 replacement rebuild proof for rustfs#5869/#1791.
+#[cfg(all(test, target_os = "linux"))]
+mod replacement_privileged_e2e_test;
+
 // dist-13 (backlog#1150/#1155): e2e regression net proving a large-object
 // degraded EC read never returns a silently truncated body (rustfs#4594/#4560/#4585).
 #[cfg(test)]
 mod degraded_read_eof_regression_test;
+
+// rustfs#4784: a mid-stream GET failure must be reportable from the source
+// server's log alone — naming the object, at the default log level.
+#[cfg(test)]
+mod get_stream_failure_observability_test;
 
 // backlog#1183: GET codec-streaming fast path must be byte/header identical to
 // the legacy duplex path before its rollout gates can be flipped on by default.
@@ -51,6 +60,15 @@ mod get_codec_streaming_compat_test;
 
 #[cfg(test)]
 mod version_id_regression_test;
+
+// Pinned previous-release -> current-build on-disk compatibility.
+#[cfg(test)]
+mod upgrade_compatibility_test;
+
+// Receiver-side replication LWW (rustfs/backlog#1953): stale inbound
+// replication metadata must not overwrite a newer local category state.
+#[cfg(test)]
+mod replication_lww_receiver_test;
 
 // Data usage regression tests
 #[cfg(test)]
@@ -266,6 +284,7 @@ mod console_smoke_test;
 // plus non-admin 403 probes per endpoint (sec-4 pattern).
 #[cfg(test)]
 mod admin_iam_crud_test;
+mod admin_mfa_test;
 
 #[cfg(test)]
 mod admin_pools_test;
@@ -290,6 +309,14 @@ mod overwrite_cleanup_regression_test;
 #[cfg(test)]
 mod list_buckets_double_slash_test;
 
+// Regression coverage for bucket-scoped ListBuckets authorization fallback.
+#[cfg(test)]
+mod list_buckets_auth_test;
+
+// ListBuckets visibility follows IAM authorization, not bucket policy.
+#[cfg(test)]
+mod list_buckets_iam_filter_test;
+
 // Regression test for backlog#629(b): region-aware CreateBucket SigV4.
 #[cfg(test)]
 mod create_bucket_region_test;
@@ -297,5 +324,33 @@ mod create_bucket_region_test;
 // Regression coverage for backlog#618 item 8: copy-source invalid-date header.
 #[cfg(test)]
 mod copy_source_invalid_date_test;
+
+// P0 regression: event notification startup race (rustfs#5387, #5681, #5401, #5183, #5115, #4796)
+#[cfg(test)]
+mod notification_startup_regression_test;
+
+// P0 regression: lifecycle/ILM object expiration (rustfs#5407, #5167, #4963, #5615, #4879)
+#[cfg(test)]
+mod lifecycle_regression_test;
+
+// P0 regression: delete operations consistency (rustfs#5375, #5349, #5339, #5029, #4978, #760)
+#[cfg(test)]
+mod delete_regression_test;
+
+// P1 regression: listing/metacache completeness (rustfs#5166, #5156, #5051, #4810, #4648, #3191)
+#[cfg(test)]
+mod listing_regression_test;
+
+// P1 regression: bucket statistics accuracy (rustfs#5615, #5008, #5116, #5055, #3898, #1012)
+#[cfg(test)]
+mod bucket_stats_regression_test;
+
+// P1 regression: distributed startup/quorum (rustfs#5416, #2945, #2794, #2601, #4040, #5655)
+#[cfg(test)]
+mod distributed_startup_regression_test;
+
+// P1 regression: tier/ILM transition (rustfs#5218, #5130, #5011, #4826, #5024)
+#[cfg(test)]
+mod tier_transition_regression_test;
 
 pub mod tls_gen;

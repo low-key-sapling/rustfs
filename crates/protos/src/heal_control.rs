@@ -20,14 +20,14 @@
 //! contextual lease and nonce validation.
 
 use rmp_serde::Deserializer;
-use rustfs_common::heal_channel::{
+use rustfs_heal_contracts::heal_channel::{
     HealAdmissionDropReason, HealAdmissionResult, HealChannelPriority, HealChannelRequest, HealChannelResponse,
     HealRequestSource, HealScanMode,
 };
 use serde::{Deserialize, Serialize, de::SeqAccess, de::Visitor};
 use std::{fmt, io::Cursor, io::Write};
 
-const ENVELOPE_VERSION: u8 = 1;
+const ENVELOPE_VERSION: u8 = 2;
 pub const ENVELOPE_MAX_SIZE: usize = 64 * 1024;
 pub const RESULT_MAX_SIZE: usize = 16 * 1024 * 1024;
 pub const NONCE_SIZE: usize = 16;
@@ -101,6 +101,8 @@ pub struct StartCommand {
     update_parity: Option<bool>,
     recursive: Option<bool>,
     dry_run: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    no_lock: Option<bool>,
     timeout_seconds: Option<u64>,
     source: HealRequestSource,
 }
@@ -132,6 +134,7 @@ impl TryFrom<HealChannelRequest> for StartCommand {
             update_parity: request.update_parity,
             recursive: request.recursive,
             dry_run: request.dry_run,
+            no_lock: request.no_lock,
             timeout_seconds: request.timeout_seconds,
             source: request.source,
         })
@@ -164,6 +167,7 @@ impl StartCommand {
             update_parity: self.update_parity,
             recursive: self.recursive,
             dry_run: self.dry_run,
+            no_lock: self.no_lock,
             timeout_seconds: self.timeout_seconds,
             source: self.source,
         })
@@ -173,16 +177,38 @@ impl StartCommand {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
-    Start { request: StartCommand },
-    Query { heal_path: String, client_token: String },
-    Cancel { heal_path: String, client_token: String },
+    Start {
+        request: StartCommand,
+    },
+    Query {
+        heal_path: String,
+        client_token: String,
+        /// Incremental result cursor (HS-06): only items with a sequence
+        /// greater than this are returned. Absent = legacy full snapshot.
+        /// Optional + defaulted so older peers stay wire-compatible.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since_seq: Option<u64>,
+    },
+    Cancel {
+        heal_path: String,
+        client_token: String,
+    },
 }
 
 #[derive(Debug)]
 pub enum ExecutableCommand {
-    Start { request: HealChannelRequest },
-    Query { heal_path: String, client_token: String },
-    Cancel { heal_path: String, client_token: String },
+    Start {
+        request: HealChannelRequest,
+    },
+    Query {
+        heal_path: String,
+        client_token: String,
+        since_seq: Option<u64>,
+    },
+    Cancel {
+        heal_path: String,
+        client_token: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -223,8 +249,22 @@ impl Envelope {
         )
     }
 
-    pub fn query(request_id: String, metadata: RequestMetadata, heal_path: String, client_token: String) -> Result<Self, String> {
-        Self::new(request_id, metadata, Command::Query { heal_path, client_token })
+    pub fn query(
+        request_id: String,
+        metadata: RequestMetadata,
+        heal_path: String,
+        client_token: String,
+        since_seq: Option<u64>,
+    ) -> Result<Self, String> {
+        Self::new(
+            request_id,
+            metadata,
+            Command::Query {
+                heal_path,
+                client_token,
+                since_seq,
+            },
+        )
     }
 
     pub fn cancel(
@@ -282,7 +322,15 @@ impl Envelope {
             Command::Start { request } => ExecutableCommand::Start {
                 request: request.into_channel_request(self.request_id.clone())?,
             },
-            Command::Query { heal_path, client_token } => ExecutableCommand::Query { heal_path, client_token },
+            Command::Query {
+                heal_path,
+                client_token,
+                since_seq,
+            } => ExecutableCommand::Query {
+                heal_path,
+                client_token,
+                since_seq,
+            },
             Command::Cancel { heal_path, client_token } => ExecutableCommand::Cancel { heal_path, client_token },
         };
         Ok((self.request_id, self.coordinator_epoch, command))
@@ -301,6 +349,11 @@ pub enum Admission {
     Full,
     DroppedQueueFull,
     DroppedPolicy,
+    /// HS-06: admin start rejected because the same target is already being
+    /// healed (RUSTFS_HEAL_OVERLAP_POLICY=minio_error only).
+    DroppedAlreadyRunning,
+    /// HS-06: admin start rejected because its path overlaps an active heal.
+    DroppedOverlappingPaths,
 }
 
 impl From<HealAdmissionResult> for Admission {
@@ -311,6 +364,8 @@ impl From<HealAdmissionResult> for Admission {
             HealAdmissionResult::Full => Self::Full,
             HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull) => Self::DroppedQueueFull,
             HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped) => Self::DroppedPolicy,
+            HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning) => Self::DroppedAlreadyRunning,
+            HealAdmissionResult::Dropped(HealAdmissionDropReason::OverlappingPaths) => Self::DroppedOverlappingPaths,
         }
     }
 }
@@ -327,6 +382,8 @@ impl Admission {
             Self::Full => HealAdmissionResult::Full,
             Self::DroppedQueueFull => HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull),
             Self::DroppedPolicy => HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped),
+            Self::DroppedAlreadyRunning => HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning),
+            Self::DroppedOverlappingPaths => HealAdmissionResult::Dropped(HealAdmissionDropReason::OverlappingPaths),
         }
     }
 }
@@ -557,10 +614,10 @@ fn encode_bounded(value: &impl Serialize, value_name: &str, max_size: usize) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        Admission, ENVELOPE_MAX_SIZE, Envelope, Outcome, RESULT_MAX_SIZE, RequestMetadata, ResultEnvelope, decode_envelope,
-        decode_result, encode_result,
+        Admission, ENVELOPE_MAX_SIZE, Envelope, ExecutableCommand, Outcome, RESULT_MAX_SIZE, RequestMetadata, ResultEnvelope,
+        decode_envelope, decode_result, encode_result,
     };
-    use rustfs_common::heal_channel::{HealChannelRequest, HealChannelResponse, HealRequestSource};
+    use rustfs_heal_contracts::heal_channel::{HealChannelRequest, HealChannelResponse, HealRequestSource};
     use serde::de::{DeserializeSeed, SeqAccess, Visitor, value::Error as ValueError};
 
     fn test_request(request_id: String) -> HealChannelRequest {
@@ -588,6 +645,7 @@ mod tests {
             metadata(2, 7),
             "bucket/prefix".to_string(),
             "token".to_string(),
+            None,
         )
         .unwrap();
         let cancel = Envelope::cancel(
@@ -632,7 +690,26 @@ mod tests {
     }
 
     #[test]
-    fn v1_query_and_result_wire_fixtures_are_stable() {
+    fn v2_start_round_trips_no_lock() {
+        for no_lock in [None, Some(false), Some(true)] {
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let mut request = test_request(request_id);
+            request.no_lock = no_lock;
+
+            let envelope = Envelope::start(request, metadata(1, 7)).expect("v2 start should encode nolock");
+            let encoded = super::encode_envelope(&envelope).expect("v2 start should serialize");
+            let decoded = super::decode_envelope(&encoded).expect("v2 start should deserialize");
+            let (_, _, ExecutableCommand::Start { request }) = decoded.into_execution().expect("v2 start command should decode")
+            else {
+                panic!("expected start command");
+            };
+
+            assert_eq!(request.no_lock, no_lock);
+        }
+    }
+
+    #[test]
+    fn v2_command_and_result_wire_fixtures_are_stable() {
         let request_id = "00112233-4455-6677-8899-aabbccddeeff".to_string();
         let start = Envelope::start(
             test_request(request_id.clone()),
@@ -644,6 +721,7 @@ mod tests {
             RequestMetadata::new([0x11; 16], 1_700_000_000_000, 1_700_000_030_000, 9),
             "bucket/prefix".to_string(),
             "client-token".to_string(),
+            None,
         )
         .unwrap();
         let cancel = Envelope::cancel(
@@ -700,23 +778,23 @@ mod tests {
             .collect::<String>();
         assert_eq!(
             start_hex,
-            "87a776657273696f6e01a9726571756573744964d92430303131323233332d343435352d363637372d383839392d616162626363646465656666a56e6f6e6365dc001011111111111111111111111111111111ae6973737565644174556e69784d73cf0000018bcfe56800af657870697265734174556e69784d73cf0000018bcfe5dd30b0636f6f7264696e61746f7245706f636809a7636f6d6d616e6482a6616374696f6ea57374617274a772657175657374de0010a46469736bc0a66275636b6574a66275636b6574ac6f626a656374507265666978a6707265666978af6f626a65637456657273696f6e4964c0aa666f7263655374617274c2a87072696f72697479a66e6f726d616ca9706f6f6c496e64657801a8736574496e64657802a87363616e4d6f6465c0af72656d6f7665436f72727570746564c0af72656372656174654d697373696e67c0ac757064617465506172697479c0a9726563757273697665c0a664727952756ec0ae74696d656f75745365636f6e6473c0a6736f75726365a561646d696e"
+            "87a776657273696f6e02a9726571756573744964d92430303131323233332d343435352d363637372d383839392d616162626363646465656666a56e6f6e6365dc001011111111111111111111111111111111ae6973737565644174556e69784d73cf0000018bcfe56800af657870697265734174556e69784d73cf0000018bcfe5dd30b0636f6f7264696e61746f7245706f636809a7636f6d6d616e6482a6616374696f6ea57374617274a772657175657374de0010a46469736bc0a66275636b6574a66275636b6574ac6f626a656374507265666978a6707265666978af6f626a65637456657273696f6e4964c0aa666f7263655374617274c2a87072696f72697479a66e6f726d616ca9706f6f6c496e64657801a8736574496e64657802a87363616e4d6f6465c0af72656d6f7665436f72727570746564c0af72656372656174654d697373696e67c0ac757064617465506172697479c0a9726563757273697665c0a664727952756ec0ae74696d656f75745365636f6e6473c0a6736f75726365a561646d696e"
         );
         assert_eq!(
             cancel_hex,
-            "87a776657273696f6e01a9726571756573744964d92430303131323233332d343435352d363637372d383839392d616162626363646465656666a56e6f6e6365dc001011111111111111111111111111111111ae6973737565644174556e69784d73cf0000018bcfe56800af657870697265734174556e69784d73cf0000018bcfe5dd30b0636f6f7264696e61746f7245706f636809a7636f6d6d616e6483a6616374696f6ea663616e63656ca96865616c5f70617468ad6275636b65742f707265666978ac636c69656e745f746f6b656eac636c69656e742d746f6b656e"
+            "87a776657273696f6e02a9726571756573744964d92430303131323233332d343435352d363637372d383839392d616162626363646465656666a56e6f6e6365dc001011111111111111111111111111111111ae6973737565644174556e69784d73cf0000018bcfe56800af657870697265734174556e69784d73cf0000018bcfe5dd30b0636f6f7264696e61746f7245706f636809a7636f6d6d616e6483a6616374696f6ea663616e63656ca96865616c5f70617468ad6275636b65742f707265666978ac636c69656e745f746f6b656eac636c69656e742d746f6b656e"
         );
         assert_eq!(
             start_result_hex,
-            "84a776657273696f6e01a9726571756573744964d92430303131323233332d343435352d363637372d383839392d616162626363646465656666b0636f6f7264696e61746f7245706f636809a76f7574636f6d6583a6726573756c74a57374617274a77461736b5f6964d92466666565646463632d626261612d393938382d373736362d353534343333323231313030a961646d697373696f6eae64726f707065645f706f6c696379"
+            "84a776657273696f6e02a9726571756573744964d92430303131323233332d343435352d363637372d383839392d616162626363646465656666b0636f6f7264696e61746f7245706f636809a76f7574636f6d6583a6726573756c74a57374617274a77461736b5f6964d92466666565646463632d626261612d393938382d373736362d353534343333323231313030a961646d697373696f6eae64726f707065645f706f6c696379"
         );
         assert_eq!(
             envelope_hex,
-            "87a776657273696f6e01a9726571756573744964d92430303131323233332d343435352d363637372d383839392d616162626363646465656666a56e6f6e6365dc001011111111111111111111111111111111ae6973737565644174556e69784d73cf0000018bcfe56800af657870697265734174556e69784d73cf0000018bcfe5dd30b0636f6f7264696e61746f7245706f636809a7636f6d6d616e6483a6616374696f6ea57175657279a96865616c5f70617468ad6275636b65742f707265666978ac636c69656e745f746f6b656eac636c69656e742d746f6b656e"
+            "87a776657273696f6e02a9726571756573744964d92430303131323233332d343435352d363637372d383839392d616162626363646465656666a56e6f6e6365dc001011111111111111111111111111111111ae6973737565644174556e69784d73cf0000018bcfe56800af657870697265734174556e69784d73cf0000018bcfe5dd30b0636f6f7264696e61746f7245706f636809a7636f6d6d616e6483a6616374696f6ea57175657279a96865616c5f70617468ad6275636b65742f707265666978ac636c69656e745f746f6b656eac636c69656e742d746f6b656e"
         );
         assert_eq!(
             result_hex,
-            "84a776657273696f6e01a9726571756573744964d92430303131323233332d343435352d363637372d383839392d616162626363646465656666b0636f6f7264696e61746f7245706f636809a76f7574636f6d6584a6726573756c74a76368616e6e656ca773756363657373c3a46461746193010203a56572726f72c0"
+            "84a776657273696f6e02a9726571756573744964d92430303131323233332d343435352d363637372d383839392d616162626363646465656666b0636f6f7264696e61746f7245706f636809a76f7574636f6d6584a6726573756c74a76368616e6e656ca773756363657373c3a46461746193010203a56572726f72c0"
         );
     }
 
@@ -726,7 +804,7 @@ mod tests {
         assert!(Envelope::start(test_request(request_id.clone()), metadata(0, 7)).is_err());
         assert!(Envelope::start(test_request(request_id.clone()), metadata(1, 0)).is_err());
         assert!(Envelope::start(test_request(request_id.clone()), RequestMetadata::new([1; 16], 1_000, 31_001, 7),).is_err());
-        assert!(Envelope::query(request_id.clone(), metadata(1, 7), String::new(), String::new()).is_err());
+        assert!(Envelope::query(request_id.clone(), metadata(1, 7), String::new(), String::new(), None).is_err());
         assert!(Envelope::cancel(request_id.clone(), metadata(1, 7), String::new(), String::new()).is_ok());
 
         let mut noncanonical_request = test_request(request_id.to_uppercase());
@@ -759,6 +837,7 @@ mod tests {
             metadata(1, 7),
             "x".repeat(ENVELOPE_MAX_SIZE),
             "token".to_string(),
+            None,
         )
         .unwrap();
         let error = super::encode_envelope(&oversized).unwrap_err();

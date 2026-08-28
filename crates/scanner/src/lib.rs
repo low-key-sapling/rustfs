@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![recursion_limit = "256"]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 #![warn(
     // missing_docs,
@@ -23,8 +24,13 @@
 use bytes::Bytes;
 use http::HeaderMap;
 use rustfs_config::server_config::{Config as ServerConfig, get_global_server_config as config_get_global_server_config};
+use sha2::{Digest as _, Sha256};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::RwLock;
+use std::time::{Duration, Instant};
 use storage_api::owner::{
     ECSTORE_BUCKET_META_PREFIX, ECSTORE_RUSTFS_META_BUCKET, ECSTORE_STORAGE_FORMAT_FILE, ECSTORE_STORAGECLASS_RRS,
     ECSTORE_STORAGECLASS_STANDARD, ECSTORE_TRANSITION_COMPLETE, EcstoreBucketTargetSys, EcstoreBucketVersioningSys, EcstoreDisk,
@@ -32,13 +38,14 @@ use storage_api::owner::{
     EcstoreDiskResult, EcstoreErrorType, EcstoreEvaluator, EcstoreEvent, EcstoreLcEventSrc, EcstoreLifecycle,
     EcstoreListPathRawOptions, EcstoreNsScannerOpenRequest, EcstoreObjectOpts, EcstoreReplicationConfigurationExt,
     EcstoreReplicationScannerBridge, EcstoreResultType, EcstoreScanGuard, EcstoreSetDisks, EcstoreStorageError, EcstoreStore,
-    EcstoreTierConfig, EcstoreVersioningApi, HTTPPreconditions, HTTPRangeSpec, ObjectIO, ObjectOperations, ObjectToDelete,
+    EcstoreVersioningApi, HTTPPreconditions, HTTPRangeSpec, ObjectIO, ObjectOperations, ObjectToDelete,
     ScannerReplicationHealObject, ScannerReplicationHealResult, ScannerReplicationQueueAdmission, ecstore_apply_expiry_rule,
     ecstore_apply_transition_rule, ecstore_expiry_state_handle, ecstore_get_global_tier_config_mgr, ecstore_get_lifecycle_config,
-    ecstore_get_object_lock_config, ecstore_get_replication_config, ecstore_invalidate_data_usage_snapshot_cache,
-    ecstore_is_erasure, ecstore_is_erasure_sd, ecstore_is_reserved_or_invalid_bucket, ecstore_list_path_raw,
-    ecstore_object_opts_from_object_info, ecstore_path2_bucket_object, ecstore_path2_bucket_object_with_base_path,
-    ecstore_read_config, ecstore_replace_bucket_usage_memory_from_info, ecstore_resolve_object_store_handle, ecstore_save_config,
+    ecstore_get_object_lock_config, ecstore_get_replication_config, ecstore_invalidate_admin_data_usage_snapshot_cache,
+    ecstore_invalidate_data_usage_snapshot_cache, ecstore_is_erasure, ecstore_is_erasure_sd,
+    ecstore_is_reserved_or_invalid_bucket, ecstore_list_path_raw, ecstore_object_opts_from_object_info,
+    ecstore_path2_bucket_object, ecstore_path2_bucket_object_with_base_path, ecstore_read_config,
+    ecstore_replace_bucket_usage_memory_from_info, ecstore_resolve_object_store_handle, ecstore_save_config,
     scanner_replication_config_for_lifecycle_eval,
 };
 #[cfg(test)]
@@ -51,25 +58,32 @@ use tokio_util::sync::CancellationToken;
 
 pub mod data_usage_define;
 pub mod error;
+pub mod prefix_usage;
 mod remote_scanner;
 pub mod runtime_config;
 pub mod scanner;
 pub mod scanner_budget;
 pub mod scanner_folder;
+#[cfg(test)]
+mod scanner_heal_admission_baseline;
 pub mod scanner_io;
 pub mod sleeper;
 pub(crate) mod storage_api;
 
 pub use data_usage_define::*;
 pub use error::ScannerError;
+pub use prefix_usage::{BucketPrefixUsageResponse, bucket_prefix_usage, invalidate_prefix_usage_cache};
 pub use remote_scanner::{
     NS_SCANNER_MAX_REQUEST_BODY_SIZE, RemoteScannerAdmission, RemoteScannerRequest, admit_remote_scanner_request,
     claim_remote_scanner_request, decode_remote_scanner_request, preflight_remote_scanner_request,
     remote_scanner_request_matches_envelope, serve_remote_scanner_request, validate_remote_scanner_request_fence,
 };
 pub use runtime_config::{apply_scanner_runtime_config, scanner_runtime_config_status, validate_scanner_runtime_config};
-pub use rustfs_common::last_minute;
-pub use scanner::{ScannerCycleScheduleStatus, init_data_scanner, scanner_cycle_schedule_status, scanner_topology_digest};
+pub use rustfs_scanner_contracts::last_minute;
+pub use scanner::{
+    ScannerCycleRecoveryMarker, ScannerCycleRecoveryStatus, ScannerCycleScheduleStatus, init_data_scanner,
+    reset_scanner_cycle_recovery, scanner_cycle_recovery_status, scanner_cycle_schedule_status, scanner_topology_digest,
+};
 pub use scanner_io::{
     ScannerDirtyUsageAckError, ScannerDirtyUsageState, acknowledge_dirty_usage_generation, clear_dirty_usage_bucket,
     record_dirty_usage_bucket, record_scanner_maintenance_change, scanner_activity_epoch, scanner_dirty_usage_state,
@@ -78,14 +92,58 @@ pub use scanner_io::{
 pub use sleeper::{DynamicSleeper, SCANNER_IDLE_MODE, SCANNER_SLEEPER};
 use std::sync::atomic::{AtomicU64, Ordering};
 pub use storage_api::ScannerReplicationConfig as ReplicationConfig;
-pub use storage_api::scan::SCANNER_ACTIVITY_PROTOCOL_VERSION;
+pub use storage_api::scan::{SCANNER_ACTIVITY_PROTOCOL_VERSION, SCANNER_ACTIVITY_V6_PROTOCOL_VERSION};
 
 static SCANNER_ACTIVE_WORK_UNITS: AtomicU64 = AtomicU64::new(0);
+static SCANNER_RUNTIME_INSTANCES: AtomicU64 = AtomicU64::new(0);
 static SCANNER_FOREGROUND_READ_ACTIVITY: AtomicU64 = AtomicU64::new(0);
 static SCANNER_FOREGROUND_STREAM_READS: AtomicU64 = AtomicU64::new(0);
 
+/// Immutable tier registry captured at the beginning of a folder scan.
+/// Generation makes it possible to prove that a result was classified against
+/// one registry even when the process-wide TTL cache refreshes concurrently.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TierRegistrySnapshot {
+    pub(crate) generation: u64,
+    pub(crate) names: Arc<[String]>,
+    /// True when the last refresh attempt failed and `names` is therefore a
+    /// retained last-good snapshot rather than a newly read registry.
+    pub(crate) refresh_failed: bool,
+}
+
+impl TierRegistrySnapshot {
+    /// Apply a refresh only when the registry read succeeds. A failed refresh
+    /// retains the prior generation, preventing a transient config failure
+    /// from classifying the remainder of a scan against an empty registry.
+    pub(crate) fn refreshed(&self, names: Result<Arc<[String]>, ()>) -> Self {
+        match names {
+            Ok(names) => Self {
+                generation: self.generation.saturating_add(1),
+                names,
+                refresh_failed: false,
+            },
+            Err(()) => Self {
+                refresh_failed: true,
+                ..self.clone()
+            },
+        }
+    }
+
+    pub(crate) fn initial(names: Arc<[String]>) -> Self {
+        Self {
+            generation: 1,
+            names,
+            refresh_failed: false,
+        }
+    }
+}
+
 pub fn current_scanner_activity() -> u64 {
     SCANNER_ACTIVE_WORK_UNITS.load(Ordering::Relaxed)
+}
+
+pub fn scanner_runtime_initialized() -> bool {
+    SCANNER_RUNTIME_INSTANCES.load(Ordering::Relaxed) > 0
 }
 
 pub fn set_foreground_read_activity(active: usize) {
@@ -135,6 +193,26 @@ impl ScannerActivityGuard {
         SCANNER_ACTIVE_WORK_UNITS.fetch_add(1, Ordering::Relaxed);
         Self
     }
+}
+
+pub(crate) struct ScannerRuntimeGuard;
+
+impl ScannerRuntimeGuard {
+    pub(crate) fn new() -> Self {
+        SCANNER_RUNTIME_INSTANCES.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for ScannerRuntimeGuard {
+    fn drop(&mut self) {
+        let _ = SCANNER_RUNTIME_INSTANCES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_sub(1));
+    }
+}
+
+#[cfg(test)]
+fn reset_scanner_runtime_instances_for_test() {
+    SCANNER_RUNTIME_INSTANCES.store(0, Ordering::Relaxed);
 }
 
 impl Drop for ScannerActivityGuard {
@@ -334,8 +412,218 @@ pub(crate) fn resolve_scanner_server_config() -> Option<ServerConfig> {
     config_get_global_server_config()
 }
 
-pub(crate) async fn list_runtime_tiers() -> Vec<EcstoreTierConfig> {
-    ecstore_get_global_tier_config_mgr().read().await.list_tiers()
+/// How long the scanner caches the runtime tier-name list before re-reading
+/// the tier configuration manager.
+const TIER_NAME_CACHE_TTL: Duration = Duration::from_secs(30);
+const MAX_TIER_REGISTRY_NAME_BYTES: usize = 256;
+
+/// Process-wide TTL cache of runtime tier names.
+///
+/// The scan hot path only needs tier *names* to seed `SizeSummary::tier_stats`
+/// per object, but every `list_tiers()` call clones each full `TierConfig`
+/// (endpoints, credentials, prefixes) from the global manager. Caching just
+/// the names keeps the per-object cost at an `Arc` clone.
+///
+/// Staleness bounds: a newly added tier starts showing up in scans at most
+/// `TIER_NAME_CACHE_TTL` later; a removed tier can leave an all-zero
+/// `TierStats` seed behind for one cache generation, which merges harmlessly
+/// by key in per-object accounting and disappears on the next refresh.
+static TIER_NAME_CACHE: RwLock<Option<(Instant, TierRegistrySnapshot)>> = RwLock::new(None);
+static TIER_REGISTRY_GENERATION: AtomicU64 = AtomicU64::new(0);
+static TIER_CYCLE_SNAPSHOTS: LazyLock<RwLock<HashMap<(u64, u64), TierRegistrySnapshot>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+static TIER_ACTIVE_CYCLES: LazyLock<RwLock<HashMap<(u64, u64), usize>>> = LazyLock::new(|| RwLock::new(HashMap::new()));
+static TIER_NAME_REFRESH_LOCK: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// Return one immutable registry snapshot for a scanner unit of work.
+pub(crate) async fn runtime_tier_registry() -> TierRegistrySnapshot {
+    {
+        let cached = TIER_NAME_CACHE.read().unwrap_or_else(|err| err.into_inner()).clone();
+        if let Some((refreshed_at, snapshot)) = cached
+            && refreshed_at.elapsed() < TIER_NAME_CACHE_TTL
+        {
+            return snapshot;
+        }
+    }
+
+    // Serialize refreshes so a slower read of the old config cannot overwrite
+    // a newer snapshot published by a concurrent caller.
+    let _refresh_guard = TIER_NAME_REFRESH_LOCK.lock().await;
+    {
+        let cached = TIER_NAME_CACHE.read().unwrap_or_else(|err| err.into_inner()).clone();
+        if let Some((refreshed_at, snapshot)) = cached
+            && refreshed_at.elapsed() < TIER_NAME_CACHE_TTL
+        {
+            return snapshot;
+        }
+    }
+
+    let previous = TIER_NAME_CACHE
+        .read()
+        .unwrap_or_else(|err| err.into_inner())
+        .as_ref()
+        .map(|(_, snapshot)| snapshot.clone());
+    let names = ecstore_get_global_tier_config_mgr()
+        .read()
+        .await
+        .list_tiers()
+        .into_iter()
+        .map(|tier| tier.name)
+        .collect::<Vec<_>>();
+    let snapshot = match validate_tier_registry_names(names) {
+        Ok(names) => {
+            let generation = next_tier_registry_generation();
+            match previous {
+                Some(previous) => TierRegistrySnapshot {
+                    generation,
+                    ..previous.refreshed(Ok(names))
+                },
+                None => TierRegistrySnapshot {
+                    generation,
+                    ..TierRegistrySnapshot::initial(names)
+                },
+            }
+        }
+        Err(()) => match previous {
+            Some(previous) => previous.refreshed(Err(())),
+            None => TierRegistrySnapshot {
+                generation: next_tier_registry_generation(),
+                names: Arc::new([]),
+                refresh_failed: true,
+            },
+        },
+    };
+    *TIER_NAME_CACHE.write().unwrap_or_else(|err| err.into_inner()) = Some((Instant::now(), snapshot.clone()));
+    snapshot
+}
+
+fn next_tier_registry_generation() -> u64 {
+    TIER_REGISTRY_GENERATION
+        .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| Some(current.saturating_add(1)))
+        .unwrap_or(u64::MAX)
+}
+
+fn validate_tier_registry_names(mut names: Vec<String>) -> Result<Arc<[String]>, ()> {
+    if names.iter().any(|name| {
+        name.is_empty()
+            || name.len() > MAX_TIER_REGISTRY_NAME_BYTES
+            || name.bytes().any(|byte| byte.is_ascii_control())
+            || name == UNKNOWN_TIER
+            || name == storageclass::STANDARD
+            || name == storageclass::RRS
+    }) {
+        return Err(());
+    }
+    names.sort_unstable();
+    if names.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(());
+    }
+    Ok(names.into())
+}
+
+/// Tier names currently registered in the tier configuration, cached for
+/// `TIER_NAME_CACHE_TTL`.
+pub(crate) async fn runtime_tier_names() -> Arc<[String]> {
+    runtime_tier_registry().await.names
+}
+
+/// Return the immutable tier registry for one scanner cycle/leader pair.
+/// Different buckets and disks belonging to the same cycle share this entry,
+/// so a TTL refresh cannot split one published cycle across generations.
+pub(crate) async fn runtime_tier_registry_for_cycle(cycle: u64, leader_epoch: u64) -> TierRegistrySnapshot {
+    let key = (cycle, leader_epoch);
+    prune_inactive_tier_cycle_snapshots(cycle, leader_epoch);
+    {
+        let cached = TIER_CYCLE_SNAPSHOTS.read().unwrap_or_else(|err| err.into_inner());
+        if let Some(snapshot) = cached.get(&key) {
+            return snapshot.clone();
+        }
+    }
+
+    let mut snapshot = runtime_tier_registry().await;
+    // The registry generation describes the configuration snapshot, not the
+    // scan that consumed it. Keep it stable across cycles so a healthy cache
+    // can be reused; cycle and leader fencing are carried separately by the
+    // cache metadata and scan plan.
+    snapshot.generation = tier_registry_generation(&snapshot.names);
+    let mut cached = TIER_CYCLE_SNAPSHOTS.write().unwrap_or_else(|err| err.into_inner());
+    if let Some(existing) = cached.get(&key) {
+        return existing.clone();
+    }
+    cached.insert(key, snapshot.clone());
+    snapshot
+}
+
+fn prune_inactive_tier_cycle_snapshots(cycle: u64, leader_epoch: u64) {
+    let active = TIER_ACTIVE_CYCLES.read().unwrap_or_else(|err| err.into_inner());
+    let mut snapshots = TIER_CYCLE_SNAPSHOTS.write().unwrap_or_else(|err| err.into_inner());
+    snapshots.retain(|(entry_cycle, entry_epoch), _| {
+        active.contains_key(&(*entry_cycle, *entry_epoch))
+            || *entry_epoch > leader_epoch
+            || (*entry_epoch == leader_epoch && *entry_cycle >= cycle)
+    });
+}
+
+pub(crate) struct TierRegistryCycleGuard {
+    key: (u64, u64),
+}
+
+impl Drop for TierRegistryCycleGuard {
+    fn drop(&mut self) {
+        let mut active = TIER_ACTIVE_CYCLES.write().unwrap_or_else(|err| err.into_inner());
+        if let Some(count) = active.get_mut(&self.key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                active.remove(&self.key);
+            }
+        }
+    }
+}
+
+pub(crate) fn begin_tier_registry_cycle(cycle: u64, leader_epoch: u64) -> TierRegistryCycleGuard {
+    let mut active = TIER_ACTIVE_CYCLES.write().unwrap_or_else(|err| err.into_inner());
+    let count = active.entry((cycle, leader_epoch)).or_default();
+    *count = count.saturating_add(1);
+    TierRegistryCycleGuard {
+        key: (cycle, leader_epoch),
+    }
+}
+
+fn tier_registry_generation(names: &[String]) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"rustfs-tier-registry-v1");
+    for name in names {
+        hasher.update(u64::try_from(name.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(name.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut prefix = [0_u8; 8];
+    prefix.copy_from_slice(&digest[..8]);
+    u64::from_le_bytes(prefix)
+}
+
+/// Drop cycle snapshots only after the scanner has finished publishing a
+/// cycle. In-flight or retryable cycles must retain their original registry;
+/// TTL/capacity eviction could make a later bucket in the same cycle refresh
+/// to a different generation.
+pub(crate) fn complete_tier_registry_cycle(cycle: u64, leader_epoch: u64) {
+    let active = TIER_ACTIVE_CYCLES.read().unwrap_or_else(|err| err.into_inner());
+    let mut cached = TIER_CYCLE_SNAPSHOTS.write().unwrap_or_else(|err| err.into_inner());
+    cached.retain(|(entry_cycle, entry_epoch), _| {
+        active.contains_key(&(*entry_cycle, *entry_epoch))
+            || *entry_epoch > leader_epoch
+            || (*entry_epoch == leader_epoch && *entry_cycle > cycle)
+    });
+}
+
+/// Test-only cache reset; the production cache has no invalidation hook
+/// because the TTL is its only refresh path.
+#[cfg(test)]
+fn reset_tier_name_cache_for_test() {
+    *TIER_NAME_CACHE.write().unwrap_or_else(|err| err.into_inner()) = None;
+    TIER_ACTIVE_CYCLES.write().unwrap_or_else(|err| err.into_inner()).clear();
+    TIER_CYCLE_SNAPSHOTS.write().unwrap_or_else(|err| err.into_inner()).clear();
+    TIER_REGISTRY_GENERATION.store(0, Ordering::Relaxed);
 }
 
 pub(crate) async fn enqueue_runtime_free_version(oi: ScannerObjectInfo) {
@@ -348,10 +636,19 @@ pub(crate) async fn enqueue_runtime_newer_noncurrent(
     event: Event,
     src: &LcEventSrc,
 ) -> bool {
-    ecstore_expiry_state_handle()
-        .write()
-        .await
-        .enqueue_by_newer_noncurrent(bucket, to_delete_objs, event, src)
+    let Some(store) = ecstore_resolve_object_store_handle() else {
+        return false;
+    };
+    let Ok(bucket_incarnation_id) = store.bucket_incarnation_id(bucket).await else {
+        return false;
+    };
+    ecstore_expiry_state_handle().write().await.enqueue_by_newer_noncurrent(
+        bucket,
+        to_delete_objs,
+        event,
+        src,
+        bucket_incarnation_id,
+    )
 }
 
 pub(crate) async fn queue_replication_heal(
@@ -430,17 +727,94 @@ where
     .await
 }
 
-pub(crate) async fn save_config_shared_with_preconditions<S>(
+pub(crate) async fn save_config_with_publication_admission_for_epoch<S>(
+    api: Arc<S>,
+    file: &str,
+    data: Vec<u8>,
+    preconditions: HTTPPreconditions,
+    expected_epoch: u64,
+) -> EcstoreResult<ScannerObjectInfo>
+where
+    S: ScannerObjectIO + ScannerConfigObjectDelete,
+{
+    let Some(_admission) = scanner_publication_admission_for_epoch(api.clone(), expected_epoch).await else {
+        return Err(EcstoreError::other(SCANNER_PUBLICATION_EPOCH_CHANGED));
+    };
+    save_config_with_preconditions(api, file, data, preconditions).await
+}
+
+pub(crate) const SCANNER_PUBLICATION_EPOCH_CHANGED: &str = "scanner publication epoch changed before commit";
+
+pub(crate) fn scanner_publication_epoch_changed(error: &EcstoreError) -> bool {
+    matches!(
+        error,
+        EcstoreError::Io(io_error) if io_error.to_string() == SCANNER_PUBLICATION_EPOCH_CHANGED
+    )
+}
+
+pub(crate) async fn delete_config_with_publication_admission_for_epoch<S>(
+    api: Arc<S>,
+    bucket: &str,
+    object: &str,
+    opts: ScannerObjectOptions,
+    expected_epoch: u64,
+) -> EcstoreResult<ScannerObjectInfo>
+where
+    S: ScannerObjectIO + ScannerConfigObjectDelete,
+{
+    let Some(_admission) = scanner_publication_admission_for_epoch(api.clone(), expected_epoch).await else {
+        return Err(EcstoreError::other(SCANNER_PUBLICATION_EPOCH_CHANGED));
+    };
+    api.delete_config_object(bucket, object, opts).await
+}
+
+/// Capture the storage-owned publication epoch without retaining the read
+/// guard across a potentially slow metadata read. Callers must compare this
+/// token with a fresh admission immediately before their conditional write.
+pub(crate) async fn scanner_publication_epoch<S>(api: Arc<S>) -> Option<u64>
+where
+    S: ScannerConfigObjectDelete,
+{
+    let admission = api.scanner_data_usage_publication_admission().await?;
+    Some(admission.epoch())
+}
+
+/// Re-admit a publication only when the storage-owned movement epoch is still
+/// the one observed before the caller's metadata read. The returned guard
+/// remains held through the caller's short conditional commit.
+pub(crate) async fn scanner_publication_admission_for_epoch<S>(
+    api: Arc<S>,
+    expected_epoch: u64,
+) -> Option<ScannerDataUsagePublicationAdmission>
+where
+    S: ScannerConfigObjectDelete,
+{
+    let admission = api.scanner_data_usage_publication_admission().await?;
+    if admission.epoch() != expected_epoch {
+        return None;
+    }
+    Some(admission)
+}
+
+pub(crate) async fn save_config_shared_with_preconditions_and_lease_fence<S>(
     api: Arc<S>,
     file: &str,
     data: Bytes,
     sha256hex: Option<String>,
     preconditions: HTTPPreconditions,
+    scanner_publication_lease_fence: Option<&str>,
 ) -> EcstoreResult<ScannerObjectInfo>
 where
     S: ScannerObjectIO,
 {
     let mut reader = ScannerPutObjReader::from_prehashed_bytes(data, sha256hex)?;
+    let mut user_defined = HashMap::new();
+    if let Some(fence) = scanner_publication_lease_fence {
+        user_defined.insert(
+            storage_api::owner::SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY.to_string(),
+            fence.to_string(),
+        );
+    }
     api.put_object(
         RUSTFS_META_BUCKET,
         file,
@@ -448,6 +822,7 @@ where
         &ScannerObjectOptions {
             max_parity: true,
             http_preconditions: Some(preconditions),
+            user_defined,
             ..Default::default()
         },
     )
@@ -464,6 +839,10 @@ pub(crate) async fn replace_bucket_usage_memory_from_info(data_usage_info: &rust
 
 pub(crate) async fn invalidate_data_usage_snapshot_cache() {
     ecstore_invalidate_data_usage_snapshot_cache().await;
+}
+
+pub(crate) async fn invalidate_admin_data_usage_snapshot_cache() {
+    ecstore_invalidate_admin_data_usage_snapshot_cache().await;
 }
 
 pub trait ScannerObjectIO:
@@ -492,10 +871,163 @@ impl<T> ScannerObjectIO for T where
 {
 }
 
+#[async_trait::async_trait]
+pub trait ScannerConfigObjectDelete: Send + Sync + std::fmt::Debug + 'static {
+    async fn delete_config_object(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: ScannerObjectOptions,
+    ) -> EcstoreResult<ScannerObjectInfo>;
+
+    /// Acquire storage-owned admission for one short data-usage publication
+    /// commit. Implementations without a storage-owned movement owner fail
+    /// closed; test fixtures opt into the explicit unfenced helper.
+    async fn scanner_data_usage_publication_admission(&self) -> Option<ScannerDataUsagePublicationAdmission> {
+        None
+    }
+}
+
+pub struct ScannerDataUsagePublicationAdmission {
+    epoch: u64,
+    _read_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+}
+
+impl ScannerDataUsagePublicationAdmission {
+    #[cfg(test)]
+    pub(crate) fn unfenced() -> Self {
+        Self {
+            epoch: 0,
+            _read_guard: None,
+        }
+    }
+
+    fn fenced(read_guard: tokio::sync::OwnedRwLockReadGuard<()>, epoch: u64) -> Self {
+        Self {
+            epoch,
+            _read_guard: Some(read_guard),
+        }
+    }
+
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+}
+
+#[async_trait::async_trait]
+impl ScannerConfigObjectDelete for ECStore {
+    async fn delete_config_object(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: ScannerObjectOptions,
+    ) -> EcstoreResult<ScannerObjectInfo> {
+        ObjectOperations::delete_object(self, bucket, object, opts).await
+    }
+
+    async fn scanner_data_usage_publication_admission(&self) -> Option<ScannerDataUsagePublicationAdmission> {
+        let (read_guard, epoch) = self.scanner_data_usage_publication_admission_guard().await?;
+        Some(ScannerDataUsagePublicationAdmission::fenced(read_guard, epoch))
+    }
+}
+
+#[async_trait::async_trait]
+impl ScannerConfigObjectDelete for SetDisks {
+    async fn delete_config_object(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: ScannerObjectOptions,
+    ) -> EcstoreResult<ScannerObjectInfo> {
+        ObjectOperations::delete_object(self, bucket, object, opts).await
+    }
+
+    async fn scanner_data_usage_publication_admission(&self) -> Option<ScannerDataUsagePublicationAdmission> {
+        let (read_guard, epoch) = self.scanner_data_usage_publication_admission_guard().await?;
+        Some(ScannerDataUsagePublicationAdmission::fenced(read_guard, epoch))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[tokio::test]
+    #[serial]
+    async fn runtime_tier_names_serves_cached_arc_within_ttl() {
+        reset_tier_name_cache_for_test();
+        // The tier config manager is unconfigured in unit tests, so the
+        // first call populates the cache from an empty tier list...
+        let first = runtime_tier_names().await;
+        assert!(first.is_empty());
+        // ...and a second call within the TTL must return the cached Arc
+        // (pointer-equal) without re-reading the manager.
+        let second = runtime_tier_names().await;
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[tokio::test]
+    async fn tier_registry_cycle_snapshot_stays_fixed_while_active() {
+        reset_tier_name_cache_for_test();
+        let cycle = 9_000_001;
+        let leader_epoch = 9_000_002;
+        let guard = begin_tier_registry_cycle(cycle, leader_epoch);
+        let first = runtime_tier_registry_for_cycle(cycle, leader_epoch).await;
+
+        // Simulate a TTL refresh observing a different configuration while the
+        // original cycle is still scanning. The active cycle entry must win.
+        *TIER_NAME_CACHE.write().unwrap_or_else(|err| err.into_inner()) = Some((
+            Instant::now() - TIER_NAME_CACHE_TTL - Duration::from_secs(1),
+            TierRegistrySnapshot {
+                generation: u64::MAX,
+                names: Arc::from(["COLD".to_string()]),
+                refresh_failed: false,
+            },
+        ));
+        let second = runtime_tier_registry_for_cycle(cycle, leader_epoch).await;
+        assert_eq!(second.generation, first.generation);
+        assert_eq!(second.names, first.names);
+
+        drop(guard);
+        complete_tier_registry_cycle(cycle, leader_epoch);
+        reset_tier_name_cache_for_test();
+    }
+
+    #[tokio::test]
+    async fn tier_registry_generation_survives_new_cycle_with_same_names() {
+        reset_tier_name_cache_for_test();
+        let first_cycle = 9_000_011;
+        let second_cycle = first_cycle + 1;
+        let leader_epoch = 9_000_012;
+
+        let first_guard = begin_tier_registry_cycle(first_cycle, leader_epoch);
+        let first = runtime_tier_registry_for_cycle(first_cycle, leader_epoch).await;
+        drop(first_guard);
+        complete_tier_registry_cycle(first_cycle, leader_epoch);
+
+        let second_guard = begin_tier_registry_cycle(second_cycle, leader_epoch);
+        let second = runtime_tier_registry_for_cycle(second_cycle, leader_epoch).await;
+        assert_eq!(first.names, second.names);
+        assert_eq!(first.generation, second.generation);
+
+        drop(second_guard);
+        complete_tier_registry_cycle(second_cycle, leader_epoch);
+        reset_tier_name_cache_for_test();
+    }
+
+    #[test]
+    fn invalid_tier_registry_names_fail_closed_for_refresh() {
+        assert!(validate_tier_registry_names(vec!["COLD\n".to_string()]).is_err());
+        assert!(validate_tier_registry_names(vec![UNKNOWN_TIER.to_string()]).is_err());
+        assert!(validate_tier_registry_names(vec!["COLD".to_string(), "COLD".to_string()]).is_err());
+        assert_eq!(
+            validate_tier_registry_names(vec!["WARM".to_string(), "COLD".to_string()])
+                .expect("valid registry names")
+                .as_ref(),
+            ["COLD".to_string(), "WARM".to_string()]
+        );
+    }
 
     #[test]
     #[serial]
@@ -522,5 +1054,19 @@ mod tests {
 
         set_foreground_read_activity(0);
         assert_eq!(current_foreground_read_activity(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn scanner_runtime_guard_tracks_runtime_lifetime() {
+        reset_scanner_runtime_instances_for_test();
+        assert!(!scanner_runtime_initialized());
+
+        {
+            let _guard = ScannerRuntimeGuard::new();
+            assert!(scanner_runtime_initialized());
+        }
+
+        assert!(!scanner_runtime_initialized());
     }
 }

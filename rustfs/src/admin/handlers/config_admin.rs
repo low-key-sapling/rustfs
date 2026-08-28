@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::auth::validate_admin_request;
+use crate::admin::auth::authorize_admin_request;
 use crate::admin::handlers::supervise_admin_mutation;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{
@@ -30,11 +30,12 @@ use crate::admin::storage_api::config::{
     save_admin_server_config_snapshot,
 };
 use crate::admin::storage_api::contract::list::ListOperations as _;
-use crate::admin::utils::{encode_compatible_admin_payload, is_compat_admin_request, read_compatible_admin_body};
-use crate::auth::{check_key_valid, get_session_token};
+use crate::admin::utils::{
+    encode_compatible_admin_payload, extract_query_params, is_compat_admin_request, read_compatible_admin_body,
+};
 use crate::error::ApiError;
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
-use http::{HeaderMap, HeaderValue, Uri};
+use crate::server::ADMIN_PREFIX;
+use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::audit::{
@@ -82,7 +83,7 @@ use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::env;
 use std::mem::size_of;
 use time::OffsetDateTime;
@@ -665,41 +666,13 @@ pub fn register_config_route(r: &mut S3Router<AdminOperation>) -> std::io::Resul
     Ok(())
 }
 
-fn extract_query_params(uri: &Uri) -> HashMap<String, String> {
-    let mut params = HashMap::new();
-
-    if let Some(query) = uri.query() {
-        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-            params.insert(key.into_owned(), value.into_owned());
-        }
-    }
-
-    params
-}
-
 async fn validate_config_admin_request(req: &S3Request<Body>) -> S3Result<Credentials> {
-    let Some(input_cred) = req.credentials.as_ref() else {
+    // Pre-check keeps this endpoint's historical missing-credentials message;
+    // the shared gate reports "get cred failed".
+    if req.credentials.is_none() {
         return Err(s3_error!(InvalidRequest, "missing credentials"));
-    };
-
-    let (cred, owner) =
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-    let remote_addr = req
-        .extensions
-        .get::<Option<RemoteAddr>>()
-        .and_then(|opt| opt.map(|addr| addr.0));
-    validate_admin_request(
-        &req.headers,
-        &cred,
-        owner,
-        false,
-        vec![Action::AdminAction(AdminAction::ConfigUpdateAdminAction)],
-        remote_addr,
-    )
-    .await?;
-
-    Ok(cred)
+    }
+    authorize_admin_request(req, vec![Action::AdminAction(AdminAction::ConfigUpdateAdminAction)]).await
 }
 
 fn header_value(content_type: &str) -> S3Result<HeaderValue> {
@@ -2299,8 +2272,33 @@ impl Operation for SetConfigHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::Uri;
     use serial_test::serial;
     use temp_env::with_vars;
+
+    /// The config-admin gate historically reports "missing credentials" (not the
+    /// shared gate's "get cred failed"); the pre-check in
+    /// `validate_config_admin_request` must keep that message byte-identical.
+    #[tokio::test]
+    async fn config_admin_request_without_credentials_keeps_historical_message() {
+        let req = S3Request {
+            input: Body::from(String::new()),
+            method: Method::GET,
+            uri: Uri::from_static("/rustfs/admin/v3/config"),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        let err = validate_config_admin_request(&req)
+            .await
+            .expect_err("a request without credentials must be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("missing credentials"));
+    }
 
     #[test]
     fn config_preflight_covers_each_runtime_worker_family() {

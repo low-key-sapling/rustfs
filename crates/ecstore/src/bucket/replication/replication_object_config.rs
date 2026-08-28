@@ -18,6 +18,7 @@ use crate::bucket::metadata::BucketMetadata;
 use rustfs_utils::http::AMZ_BUCKET_REPLICATION_STATUS;
 use s3s::dto::{BucketVersioningStatus, ReplicationConfiguration, ReplicationRuleStatus, VersioningConfiguration};
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 use tracing::error;
 
 use super::replication_config_boundary::{
@@ -81,6 +82,15 @@ impl DeleteReplicationConfigSnapshot {
         self.metadata
             .as_ref()
             .and_then(|metadata| metadata.replication_config.as_ref())
+    }
+
+    pub(crate) fn force_delete_target_set(&self, prefix: &str) -> Option<(Vec<String>, OffsetDateTime)> {
+        self.metadata.as_ref().and_then(|metadata| {
+            metadata
+                .replication_config
+                .as_ref()
+                .map(|config| (config.filter_force_delete_target_arns(prefix), metadata.replication_config_updated_at))
+        })
     }
 
     pub(crate) fn has_active_rule(&self, object: &str) -> bool {
@@ -221,6 +231,10 @@ pub(crate) async fn load_delete_replication_config(
     delete_snapshot_from_metadata(ReplicationMetadataStore::delete_metadata(bucket).await?)
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity replication surface with no caller in this port (backlog#1823)"
+)]
 pub(crate) async fn load_delete_replication_config_in(
     ctx: &ReplicationInstanceContext,
     bucket: &str,
@@ -556,7 +570,7 @@ pub(crate) async fn must_replicate(bucket: &str, object: &str, mopts: MustReplic
         let mut sopts = opts.clone();
         sopts.target_arn = arn.clone();
 
-        let replicate = cfg.replicate(&sopts);
+        let replicate = cfg.replicate(&sopts) && mopts.metadata_target_is_eligible(&arn);
         let synchronous = if let Some(cli) = cli { cli.replicate_sync } else { false };
 
         dsc.set(ReplicateTargetDecision::new(arn, replicate, synchronous));

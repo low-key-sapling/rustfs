@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(dead_code)]
-
 //! Cluster usage metrics collector.
 //!
 //! Collects cluster-wide and per-bucket usage metrics including
@@ -38,6 +36,9 @@ pub struct ClusterUsageStats {
     pub delete_markers_count: u64,
     /// Total number of buckets in the usage snapshot
     pub buckets_count: u64,
+    /// Whether the selected admin usage snapshot completed without concurrent
+    /// namespace activity.
+    pub snapshot_converged: bool,
     /// Object size distribution by range
     pub object_size_distribution: Vec<(String, u64)>,
     /// Version count distribution by range
@@ -69,7 +70,7 @@ pub struct BucketUsageStats {
 ///
 /// Returns a vector of Prometheus metrics for cluster usage.
 pub fn collect_cluster_usage_metrics(stats: &ClusterUsageStats) -> Vec<PrometheusMetric> {
-    let mut metrics = Vec::with_capacity(6 + stats.object_size_distribution.len() + stats.versions_distribution.len());
+    let mut metrics = Vec::with_capacity(7 + stats.object_size_distribution.len() + stats.versions_distribution.len());
 
     metrics.push(PrometheusMetric::from_descriptor(
         &USAGE_SINCE_LAST_UPDATE_SECONDS_MD,
@@ -83,6 +84,10 @@ pub fn collect_cluster_usage_metrics(stats: &ClusterUsageStats) -> Vec<Prometheu
         stats.delete_markers_count as f64,
     ));
     metrics.push(PrometheusMetric::from_descriptor(&USAGE_BUCKETS_COUNT_MD, stats.buckets_count as f64));
+    metrics.push(PrometheusMetric::from_descriptor(
+        &USAGE_SNAPSHOT_CONVERGED_MD,
+        if stats.snapshot_converged { 1.0 } else { 0.0 },
+    ));
 
     // Object size distribution
     for (range, count) in &stats.object_size_distribution {
@@ -176,6 +181,7 @@ mod tests {
             versions_count: 15000,
             delete_markers_count: 500,
             buckets_count: 8,
+            snapshot_converged: false,
             object_size_distribution: vec![
                 ("0-1KB".to_string(), 5000),
                 ("1KB-1MB".to_string(), 3000),
@@ -188,8 +194,8 @@ mod tests {
         let metrics = collect_cluster_usage_metrics(&stats);
         report_metrics(&metrics);
 
-        // 6 base metrics + 4 size distribution + 3 version distribution = 13
-        assert_eq!(metrics.len(), 13);
+        // 7 base metrics + 4 size distribution + 3 version distribution = 14
+        assert_eq!(metrics.len(), 14);
 
         let total_bytes_name = USAGE_TOTAL_BYTES_MD.get_full_metric_name();
         let total_bytes = metrics.iter().find(|m| m.name == total_bytes_name);
@@ -198,6 +204,9 @@ mod tests {
         let stale_name = USAGE_SINCE_LAST_UPDATE_SECONDS_MD.get_full_metric_name();
         let stale = metrics.iter().find(|m| m.name == stale_name && m.value == 45.0);
         assert!(stale.is_some());
+
+        let converged_name = USAGE_SNAPSHOT_CONVERGED_MD.get_full_metric_name();
+        assert!(metrics.iter().any(|m| m.name == converged_name && m.value == 0.0));
     }
 
     #[test]

@@ -10,14 +10,39 @@ and rollback steps.
 | Area | Current owner | Size | Split status |
 |---|---|---:|---|
 | Bucket lifecycle | `crates/lifecycle/` + `crates/ecstore/src/bucket/lifecycle/` | core contracts + ECStore runtime | Core contract extracted |
-| Bucket replication | `crates/ecstore/src/bucket/replication/` | 8,730 lines | Proposal only |
+| Bucket replication | `crates/ecstore/src/bucket/replication/` | 15,619 lines | Contracts extracted; runtime move pending |
 | Set disks | `crates/ecstore/src/set_disk/` | state carrier plus operation modules | Keep in ECStore |
 | Public ECStore facade | `crates/ecstore/src/api/mod.rs` | broad compatibility surface | Shrink only through guarded PRs |
+| Embedded S3 client | `crates/s3-client/` (`rustfs-s3-client`) | ~8.4K lines | Extracted (rustfs/backlog#1842) |
+
+Measured 2026-08-12: the whole crate is 265 files / ~288K lines (roughly half
+is inline `#[cfg(test)]` code). The largest single files are `disk/local.rs`
+(21,063 lines), `bucket/lifecycle/bucket_lifecycle_ops.rs` (11,961 lines), and
+`set_disk/mod.rs` (11,151 lines). Reproduce with:
+
+```bash
+find crates/ecstore/src -name '*.rs' | xargs wc -l | sort -rn | head
+find crates/ecstore/src/bucket/replication -name '*.rs' | xargs wc -l | tail -1
+```
+
+No split step has landed since the contract-extraction PRs of 2026-07-04,
+while the `bucket/replication` runtime grew from 8,730 to 15,619 lines (+79%)
+through feature work (e.g. SSE-C ciphertext passthrough replication #5898,
+delete-marker purge retry/replay #5864). To keep the gap from widening: in
+domains that already have a contract crate, new replication runtime logic that
+does not need ECStore runtime state must land in `rustfs-replication`, not in
+`crates/ecstore/src/bucket/replication/`.
 
 The file split inside `set_disk/` is already operation-oriented: read, write,
 list, multipart, lock, heal, and replication code live in separate modules.
 The remaining large surface is the shared `SetDisks` state and cross-cutting
 contracts, not only file layout.
+
+## Completed: S3 Client Extraction (rustfs/backlog#1842)
+
+`crates/ecstore/src/client/` was a ~8.4K-line hand-written S3 HTTP client the engine uses to *consume* remote S3-compatible endpoints (ILM tier warm backends, transition targets). It was a legitimate engine capability misfiled inside the engine: it pulled `s3s`/`hyper` wire types into ecstore against ARCHITECTURE.md invariant 4, which distinguishes serving the S3 wire protocol (forbidden in ecstore) from consuming it (allowed, but in a dedicated crate).
+
+The extraction landed as: pure move of the 21 client modules to `crates/s3-client` (`rustfs-s3-client`) with a temporary re-export shim, then direct `rustfs_s3_client::` imports and shim deletion. The two server-side modules historically misfiled under `client/` stayed in ecstore and moved to their real homes: `object_api_utils.rs` under `object_api/`, `object_handlers_common.rs` under `bucket/lifecycle/` (behind the `replication_sink` boundary). The remaining serving-side `s3s` references in ecstore are ratcheted shrink-only by the `S3S_ECSTORE_FILES_BASELINE` counter in `scripts/check_s3s_footprint.sh`; per-module conversions to storage-level types (first: `bucket/object_lock/`) lower the baseline in the same change.
 
 ## Non-Negotiable Rules
 
@@ -116,6 +141,14 @@ Focused verification for the first code-bearing lifecycle PR:
 `rustfs-replication` now owns the resync status contracts and persisted resync
 status wire format. The remaining `bucket/replication` worker runtime is not
 ready for a full standalone crate yet.
+
+The completion criteria and milestone sequence for this candidate (when the
+split counts as done, the target end state, and the order of the remaining
+moves) live in the module inventory:
+`crates/ecstore/src/bucket/replication/README.md`, sections "Completion
+Criteria" and "Milestones". The originally proposed first code-bearing step
+(event sink / runtime contracts) has landed; remaining work starts from moving
+resyncer pure decision logic.
 
 Current coupling:
 

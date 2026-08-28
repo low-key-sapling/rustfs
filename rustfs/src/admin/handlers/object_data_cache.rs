@@ -21,23 +21,19 @@
 //! that bucket, and with `bucket`+`object` it flushes that one identity — the
 //! only remediation for a poisoned entry short of a node restart.
 
-use crate::admin::auth::validate_admin_request;
+use crate::admin::auth::authorize_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::current_object_data_cache;
+use crate::admin::utils::json_response;
 use crate::app::object_data_cache::ObjectDataCacheAdapter;
-use crate::auth::{check_key_valid, get_session_token};
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
-use http::{HeaderMap, HeaderValue};
+use crate::server::ADMIN_PREFIX;
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_object_data_cache::{ObjectDataCacheIdentity, ObjectDataCacheInvalidationReason, ObjectDataCacheInvalidationResult};
 use rustfs_policy::policy::action::{Action, AdminAction};
-use s3s::header::CONTENT_TYPE;
-use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
 use std::sync::Arc;
-
-const JSON_CONTENT_TYPE: &str = "application/json";
 
 #[derive(Debug, Serialize)]
 struct ObjectDataCacheStatsResponse {
@@ -76,25 +72,14 @@ pub fn register_object_data_cache_route(r: &mut S3Router<AdminOperation>) -> std
     Ok(())
 }
 
+/// The pre-check keeps these endpoints' historical missing-credentials message;
+/// the shared gate reports "get cred failed".
 async fn authorize(req: &S3Request<Body>, action: AdminAction) -> S3Result<()> {
-    let Some(input_cred) = req.credentials.as_ref() else {
+    if req.credentials.is_none() {
         return Err(s3_error!(InvalidRequest, "missing credentials"));
-    };
-    let (cred, owner) =
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-    let remote_addr = req
-        .extensions
-        .get::<Option<RemoteAddr>>()
-        .and_then(|opt| opt.map(|addr| addr.0));
-    validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(action)], remote_addr).await
-}
-
-fn json_response<T: Serialize>(body: &T) -> S3Result<S3Response<(StatusCode, Body)>> {
-    let data = serde_json::to_vec(body)
-        .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to encode response: {err}")))?;
-    let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static(JSON_CONTENT_TYPE));
-    Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
+    }
+    authorize_admin_request(req, vec![Action::AdminAction(action)]).await?;
+    Ok(())
 }
 
 fn query_value(req: &S3Request<Body>, key: &str) -> Option<String> {
@@ -150,7 +135,7 @@ impl Operation for ObjectDataCacheStatsHandler {
             },
         };
 
-        json_response(&response)
+        json_response(StatusCode::OK, &response)
     }
 }
 
@@ -185,19 +170,24 @@ impl Operation for ObjectDataCacheFlushHandler {
         };
 
         let (outcome, removed_keys) = invalidation_outcome(&result);
-        json_response(&ObjectDataCacheFlushResponse {
-            scope,
-            bucket,
-            object,
-            outcome,
-            removed_keys,
-        })
+        json_response(
+            StatusCode::OK,
+            &ObjectDataCacheFlushResponse {
+                scope,
+                bucket,
+                object,
+                outcome,
+                removed_keys,
+            },
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::HeaderMap;
+    use s3s::S3ErrorCode;
 
     #[test]
     fn flush_outcome_maps_removed_and_noop() {
@@ -206,6 +196,30 @@ mod tests {
             ("removed", 3)
         );
         assert_eq!(invalidation_outcome(&ObjectDataCacheInvalidationResult::NoOp), ("noop", 0));
+    }
+
+    /// These endpoints authorize through the shared admin gate, which reports
+    /// "get cred failed" for a credential-less request. The pre-check keeps the
+    /// message they have always returned (rustfs/backlog#1829).
+    #[tokio::test]
+    async fn authorize_keeps_its_missing_credentials_message() {
+        let req = S3Request {
+            input: Body::from(String::new()),
+            method: Method::GET,
+            uri: "/rustfs/admin/v3/object-data-cache/stats".parse().expect("uri should parse"),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        let err = authorize(&req, AdminAction::ServerInfoAdminAction)
+            .await
+            .expect_err("a request without credentials must be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("missing credentials"));
     }
 
     #[test]

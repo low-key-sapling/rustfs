@@ -19,25 +19,22 @@
 //! complex workflows.
 
 use super::common::{
-    EncryptionType, LocalKMSTestEnvironment, MultipartTestConfig, create_sse_c_config, sse_customer_key_md5_base64,
-    test_all_multipart_encryption_types, test_kms_key_management, test_multipart_upload_with_config, test_sse_c_encryption,
-    test_sse_kms_encryption, test_sse_s3_encryption,
+    EncryptionType, LocalKMSTestEnvironment, MultipartTestConfig, SSE_C_KEY_MISMATCH_MESSAGE, assert_s3_error,
+    create_sse_c_config, sse_customer_key_md5_base64, test_all_multipart_encryption_types, test_kms_key_management,
+    test_multipart_upload_with_config, test_sse_c_encryption, test_sse_kms_encryption, test_sse_s3_encryption,
 };
 use crate::common::{TEST_BUCKET, init_logging};
-use serial_test::serial;
-use tokio::time::{Duration, sleep};
 use tracing::info;
 
 /// Comprehensive test: Full KMS workflow with all encryption types
 #[tokio::test]
-#[serial]
 async fn test_comprehensive_kms_full_workflow() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🏁 Start the KMS full-featured synthesis test");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    sleep(Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -99,14 +96,13 @@ async fn test_mixed_encryption_workload(
 
 /// Comprehensive stress test: Large dataset with multiple encryption types
 #[tokio::test]
-#[serial]
 async fn test_comprehensive_stress_test() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("💪 Start the KMS stress test");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    sleep(Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -134,14 +130,13 @@ async fn test_comprehensive_stress_test() -> Result<(), Box<dyn std::error::Erro
 
 /// Test encryption key isolation and security
 #[tokio::test]
-#[serial]
 async fn test_comprehensive_key_isolation() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🔐 Begin the comprehensive test of encryption key isolation");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    sleep(Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -182,7 +177,7 @@ async fn test_comprehensive_key_isolation() -> Result<(), Box<dyn std::error::Er
     // Verify that files cannot be read with wrong keys
     info!("🔒 Verify key isolation");
     let wrong_key = "11111111111111111111111111111111";
-    let wrong_key_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, wrong_key);
+    let wrong_key_b64 = base64_simd::STANDARD.encode_to_string(wrong_key);
     let wrong_key_md5 = sse_customer_key_md5_base64(wrong_key);
 
     // Try to read file encrypted with key1 using wrong key
@@ -196,7 +191,13 @@ async fn test_comprehensive_key_isolation() -> Result<(), Box<dyn std::error::Er
         .send()
         .await;
 
-    assert!(wrong_read_result.is_err(), "The encrypted file should not be readable with the wrong key");
+    assert_s3_error(
+        wrong_read_result,
+        400,
+        "InvalidRequest",
+        SSE_C_KEY_MISMATCH_MESSAGE,
+        "multipart SSE-C object GET with a wrong key must be rejected",
+    );
     info!("✅ Confirm that key isolation is working correctly");
 
     kms_env.base_env.delete_test_bucket(TEST_BUCKET).await?;
@@ -206,14 +207,13 @@ async fn test_comprehensive_key_isolation() -> Result<(), Box<dyn std::error::Er
 
 /// Test concurrent encryption operations
 #[tokio::test]
-#[serial]
 async fn test_comprehensive_concurrent_operations() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("⚡ Started comprehensive testing of concurrent encryption operations");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    sleep(Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -252,14 +252,13 @@ async fn test_comprehensive_concurrent_operations() -> Result<(), Box<dyn std::e
 
 /// Test encryption/decryption performance with different file sizes
 #[tokio::test]
-#[serial]
 async fn test_comprehensive_performance_benchmark() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("📊 Start KMS performance benchmarking");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    sleep(Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;

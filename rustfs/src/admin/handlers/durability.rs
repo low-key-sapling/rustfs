@@ -28,6 +28,7 @@ use crate::admin::storage_api::bucket::metadata::BUCKET_DURABILITY_CONFIG;
 use crate::admin::storage_api::bucket::metadata_sys;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::ADMIN_PREFIX;
+use crate::server::RemoteAddr;
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
@@ -126,13 +127,14 @@ async fn authenticate_admin(req: &S3Request<Body>) -> S3Result<()> {
 
     let (cred, owner) = check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
 
+    let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
     validate_admin_request(
         &req.headers,
         &cred,
         owner,
         false,
         vec![Action::AdminAction(AdminAction::ConfigUpdateAdminAction)],
-        None,
+        remote_addr,
     )
     .await?;
 
@@ -160,6 +162,9 @@ impl Operation for SetBucketDurabilityHandler {
         authenticate_admin(&req).await?;
 
         let bucket = bucket_from_params(&params)?;
+        let expected_incarnation_id = metadata_sys::capture_bucket_metadata_incarnation(&bucket)
+            .await
+            .map_err(|e| s3_error!(InternalError, "failed to capture bucket incarnation: {}", e))?;
 
         let body = req
             .input
@@ -175,7 +180,7 @@ impl Operation for SetBucketDurabilityHandler {
 
         // System buckets are rejected by the metadata layer (and pinned to
         // strict by the disk layer regardless).
-        metadata_sys::update(&bucket, BUCKET_DURABILITY_CONFIG, json)
+        metadata_sys::update_if_incarnation(&bucket, BUCKET_DURABILITY_CONFIG, json, expected_incarnation_id)
             .await
             .map_err(|e| s3_error!(InternalError, "failed to set bucket durability: {}", e))?;
 
@@ -218,8 +223,11 @@ impl Operation for DeleteBucketDurabilityHandler {
         authenticate_admin(&req).await?;
 
         let bucket = bucket_from_params(&params)?;
+        let expected_incarnation_id = metadata_sys::capture_bucket_metadata_incarnation(&bucket)
+            .await
+            .map_err(|e| s3_error!(InternalError, "failed to capture bucket incarnation: {}", e))?;
 
-        metadata_sys::delete(&bucket, BUCKET_DURABILITY_CONFIG)
+        metadata_sys::delete_if_incarnation(&bucket, BUCKET_DURABILITY_CONFIG, expected_incarnation_id)
             .await
             .map_err(|e| s3_error!(InternalError, "failed to clear bucket durability: {}", e))?;
 

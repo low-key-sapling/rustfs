@@ -18,17 +18,17 @@ use tokio_util::sync::CancellationToken;
 use super::replication_error_boundary::Error;
 use super::replication_filemeta_boundary::{replication_state_from_filemeta, version_purge_status_from_filemeta};
 pub(crate) type ReplicationObjectStore = crate::store::ECStore;
-pub(crate) use crate::client::api_get_options::{AdvancedGetOptions, StatObjectOptions};
 pub(crate) use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 pub(crate) use crate::storage_api_contracts::list::{
     ListOperations, StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions,
 };
 pub(crate) use crate::storage_api_contracts::namespace::NamespaceLocking as StorageNamespaceLocking;
 pub(crate) use crate::storage_api_contracts::object::{
-    DeletedObject, EcstoreObjectOperations, ObjectIO, ObjectOperations, ObjectToDelete,
+    DeletedObject, EcstoreObjectOperations, HTTPPreconditions, ObjectIO, ObjectOperations, ObjectToDelete,
 };
 pub(crate) use crate::storage_api_contracts::range::HTTPRangeSpec;
 pub(crate) use rustfs_replication::{DeletedObject as ReplicationDeletedObject, ObjectToDelete as ReplicationObjectToDelete};
+pub(crate) use rustfs_s3_client::api_get_options::{AdvancedGetOptions, StatObjectOptions};
 
 type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
 type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
@@ -105,6 +105,9 @@ pub(crate) fn deleted_object_for_replication(delete_object: DeletedObject) -> Re
         replication_state: delete_object.replication_state.as_ref().map(replication_state_from_filemeta),
         found: delete_object.found,
         force_delete: delete_object.force_delete,
+        force_delete_id: delete_object.force_delete_id,
+        force_delete_target_arns: delete_object.force_delete_target_arns,
+        force_delete_generation: delete_object.force_delete_generation,
     }
 }
 

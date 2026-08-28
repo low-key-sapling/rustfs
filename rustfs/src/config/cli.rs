@@ -16,7 +16,7 @@
 //!
 //! This module contains the command-line interface definitions including:
 //! - `Cli`: Main CLI parser
-//! - `Commands`: Subcommands (Server, Info, Tls)
+//! - `Commands`: Top-level server and diagnostic subcommands
 //! - `ServerOpts`: Server subcommand options
 //! - `InfoOpts`: Info subcommand options
 //! - `TlsOpts`: TLS diagnostic subcommand options
@@ -50,7 +50,7 @@ pub(super) const LONG_VERSION: &str = concat!(
 );
 
 /// Known subcommands. When the first arg matches one of these, it is treated as a subcommand.
-pub const KNOWN_SUBCOMMANDS: &[&str] = &["server", "info", "tls", "diagnose"];
+pub const KNOWN_SUBCOMMANDS: &[&str] = &["server", "info", "tls", "diagnose", "inspect", "connect"];
 
 /// Preprocess argv for legacy compatibility: `zffs <volume>` and `zffs --address ...` are
 /// treated as `zffs server <volume>` and `zffs server --address ...` respectively.
@@ -110,6 +110,84 @@ pub enum Commands {
     Tls(TlsOpts),
     /// Analyze ZfFS log files and report probable failure causes
     Diagnose(DiagnoseOpts),
+    /// Offline, read-only inspection of on-disk data (no server required)
+    Inspect(InspectOpts),
+    /// Configure outbound RustFS Connect integration
+    Connect(ConnectOpts),
+}
+
+/// RustFS Connect subcommand options
+#[derive(Args, Clone)]
+pub struct ConnectOpts {
+    #[command(subcommand)]
+    pub command: ConnectCommands,
+}
+
+/// Allow-listed RustFS Connect operations
+#[derive(Subcommand, Clone)]
+pub enum ConnectCommands {
+    /// Exchange a protected one-time token for a durable device credential (Unix only)
+    Register(ConnectRegisterOpts),
+}
+
+/// `connect register` options
+#[derive(Args, Clone)]
+pub struct ConnectRegisterOpts {
+    /// Connect agent API HTTPS base URL
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub endpoint: String,
+
+    /// PEM root CA file used only for this Connect endpoint
+    #[arg(long = "ca-file")]
+    pub ca_file: PathBuf,
+
+    /// Explicit directory shared with the Connect heartbeat runtime
+    #[arg(long = "state-dir")]
+    pub state_dir: PathBuf,
+
+    /// Owner-only regular token file; omit to read the token from stdin
+    #[arg(long = "token-file")]
+    pub token_file: Option<PathBuf>,
+}
+
+/// Offline inspection subcommand options
+#[derive(Args, Clone)]
+pub struct InspectOpts {
+    #[command(subcommand)]
+    pub command: InspectCommands,
+}
+
+/// Offline inspection subcommands
+#[derive(Subcommand, Clone)]
+pub enum InspectCommands {
+    /// Export a bucket's persisted configuration bytes straight from drive roots
+    /// (works even when the config XML no longer parses)
+    BucketMeta(InspectBucketMetaOpts),
+}
+
+/// `inspect bucket-meta` options
+#[derive(Args, Clone)]
+#[command(
+    after_help = "IMPORTANT: Mount every source drive read-only for forensic use. Read-only application calls cannot prevent filesystem atime updates or path replacement races on writable mounts."
+)]
+pub struct InspectBucketMetaOpts {
+    /// Drive root path(s). Repeat for multi-drive nodes: erasure-coded metadata
+    /// needs enough drives for write quorum. Source media must be mounted
+    /// read-only for strict forensic use.
+    #[arg(long = "path", required = true, value_parser = NonEmptyStringValueParser::new())]
+    pub paths: Vec<String>,
+
+    /// Bucket whose metadata to inspect
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub bucket: String,
+
+    /// Write the raw `.metadata.bin` blob and each stored config's exact bytes to --out
+    #[arg(long)]
+    pub raw: bool,
+
+    /// New output directory for --raw (default: ./bucket-meta-<bucket>)
+    #[arg(long, requires = "raw")]
+    pub out: Option<std::path::PathBuf>,
 }
 
 /// Diagnose report output format
@@ -218,6 +296,11 @@ pub struct TlsInspectOpts {
 
 /// Server subcommand options
 #[derive(Args, Clone)]
+#[command(after_help = "Allocator reclaim environment:
+  RUSTFS_ALLOCATOR_RECLAIM_ENABLED=true|false  Enable allocator page reclaim after idle samples (default: true)
+  RUSTFS_ALLOCATOR_RECLAIM_INTERVAL_SECS=30    Sampling interval in seconds
+  RUSTFS_ALLOCATOR_RECLAIM_FORCE=true|false    Request forceful collection when supported
+  RUSTFS_ALLOCATOR_RECLAIM_IDLE_INTERVALS=3    Consecutive idle samples required before reclaim")]
 pub struct ServerOpts {
     /// Load server settings from a versioned TOML configuration file.
     #[arg(long, value_name = "FILE")]
@@ -312,7 +395,7 @@ pub struct ServerOpts {
     #[arg(long, default_value_t = false, env = "RUSTFS_KMS_ENABLE")]
     pub kms_enable: bool,
 
-    /// KMS backend type: local, vault or vault-kv2 (plain Vault KV v2 storage), vault-transit, static, aws
+    /// KMS backend type: local (development/testing only), vault or vault-kv2 (plain Vault KV v2 storage), vault-transit, static (development/testing only), aws
     #[arg(long, default_value_t = rustfs_config::DEFAULT_KMS_BACKEND.to_string(), env = "RUSTFS_KMS_BACKEND")]
     pub kms_backend: String,
 
@@ -366,6 +449,10 @@ pub enum CommandResult {
     Tls(TlsOpts),
     /// Diagnose command with options
     Diagnose(DiagnoseOpts),
+    /// Inspect command with options
+    Inspect(InspectOpts),
+    /// One-time Connect registration command
+    ConnectRegister(ConnectRegisterOpts),
 }
 
 /// Create default ServerOpts from environment variables
@@ -406,7 +493,10 @@ pub fn default_server_opts() -> ServerOpts {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, LONG_VERSION, SHORT_VERSION, UPSTREAM_VERSION, preprocess_args_for_legacy};
+    use super::{
+        Cli, Commands, ConnectCommands, InspectCommands, LONG_VERSION, SHORT_VERSION, UPSTREAM_VERSION,
+        preprocess_args_for_legacy,
+    };
     use clap::Parser;
     use clap::error::ErrorKind;
 
@@ -438,5 +528,131 @@ mod tests {
         assert!(output.starts_with(&format!("zffs {SHORT_VERSION}\n")));
         assert!(output.contains(&format!("RustFS base  : {UPSTREAM_VERSION}")));
         assert_eq!(LONG_VERSION.lines().next(), Some(SHORT_VERSION));
+    }
+
+    #[test]
+    fn inspect_bucket_meta_parses_repeated_drive_paths() {
+        let cli = Cli::try_parse_from([
+            "rustfs",
+            "inspect",
+            "bucket-meta",
+            "--path",
+            "/data/drive-1",
+            "--path",
+            "/data/drive-2",
+            "--bucket",
+            "example-bucket",
+            "--raw",
+            "--out",
+            "/tmp/export",
+        ])
+        .expect("inspect arguments should parse");
+
+        let Some(Commands::Inspect(inspect)) = cli.command else {
+            panic!("inspect command expected");
+        };
+        let InspectCommands::BucketMeta(opts) = inspect.command;
+        assert_eq!(opts.paths, ["/data/drive-1", "/data/drive-2"]);
+        assert_eq!(opts.bucket, "example-bucket");
+        assert!(opts.raw);
+        assert_eq!(opts.out.as_deref(), Some(std::path::Path::new("/tmp/export")));
+    }
+
+    #[test]
+    fn inspect_bucket_meta_rejects_out_without_raw() {
+        let err = match Cli::try_parse_from([
+            "rustfs",
+            "inspect",
+            "bucket-meta",
+            "--path",
+            "/data/drive-1",
+            "--bucket",
+            "example-bucket",
+            "--out",
+            "/tmp/export",
+        ]) {
+            Ok(_) => panic!("--out without --raw must be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn connect_register_accepts_only_paths_and_endpoint_configuration() {
+        let cli = Cli::try_parse_from([
+            "rustfs",
+            "connect",
+            "register",
+            "--endpoint",
+            "https://connect.example/agent/",
+            "--ca-file",
+            "/etc/rustfs/connect-ca.pem",
+            "--state-dir",
+            "/var/lib/rustfs/connect",
+        ])
+        .expect("connect register arguments should parse");
+
+        let Some(Commands::Connect(connect)) = cli.command else {
+            panic!("connect command expected");
+        };
+        let ConnectCommands::Register(register) = connect.command;
+        assert_eq!(register.endpoint, "https://connect.example/agent/");
+        assert_eq!(register.ca_file, std::path::Path::new("/etc/rustfs/connect-ca.pem"));
+        assert_eq!(register.state_dir, std::path::Path::new("/var/lib/rustfs/connect"));
+        assert!(register.token_file.is_none());
+    }
+
+    #[test]
+    fn connect_register_has_no_token_value_or_environment_option() {
+        for forbidden in ["--token", "--registration-token", "--token-env"] {
+            let result = Cli::try_parse_from([
+                "rustfs",
+                "connect",
+                "register",
+                "--endpoint",
+                "https://connect.example/agent/",
+                "--ca-file",
+                "/etc/rustfs/connect-ca.pem",
+                "--state-dir",
+                "/var/lib/rustfs/connect",
+                forbidden,
+                "secret",
+            ]);
+            let Err(error) = result else {
+                panic!("secret-bearing command-line options must be rejected");
+            };
+            assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+        }
+    }
+
+    #[test]
+    fn connect_register_help_states_the_unix_only_security_scope() {
+        let result = Cli::try_parse_from(["rustfs", "connect", "register", "--help"]);
+        let Err(help) = result else {
+            panic!("help exits without running registration");
+        };
+
+        assert_eq!(help.kind(), ErrorKind::DisplayHelp);
+        assert!(help.to_string().contains("Unix only"));
+    }
+
+    #[test]
+    fn server_help_lists_allocator_reclaim_environment() {
+        let result = Cli::try_parse_from(["rustfs", "server", "--help"]);
+        let Err(help) = result else {
+            panic!("help exits without parsing server options");
+        };
+
+        assert_eq!(help.kind(), ErrorKind::DisplayHelp);
+        let help = help.to_string();
+        for env in [
+            "RUSTFS_ALLOCATOR_RECLAIM_ENABLED",
+            "RUSTFS_ALLOCATOR_RECLAIM_INTERVAL_SECS",
+            "RUSTFS_ALLOCATOR_RECLAIM_FORCE",
+            "RUSTFS_ALLOCATOR_RECLAIM_IDLE_INTERVALS",
+        ] {
+            assert!(help.contains(env), "server help should mention {env}");
+        }
     }
 }

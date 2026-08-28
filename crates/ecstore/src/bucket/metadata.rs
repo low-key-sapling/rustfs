@@ -13,12 +13,12 @@
 // limitations under the License.
 
 use super::msgp_decode::{read_msgp_ext8_time, skip_msgp_value, write_msgp_time};
-use super::object_lock::ObjectLockApi;
+use super::object_lock::{ObjectLockApi, ObjectLockStatusExt};
 use super::versioning::VersioningApi;
 use super::{quota::BucketQuota, target::BucketTargets};
 use crate::bucket::replication::invalid_replication_config_status_field;
 use crate::bucket::utils::deserialize;
-use crate::config::com::{read_config, save_config};
+use crate::config::com::{read_config, read_config_preserve_empty, save_config};
 use crate::disk::BUCKET_META_PREFIX;
 use crate::error::{Error, Result};
 use crate::runtime::sources as runtime_sources;
@@ -37,6 +37,27 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 use time::{Date, OffsetDateTime, PrimitiveDateTime, Time as CivilTime, UtcOffset};
 use tracing::error;
+use uuid::Uuid;
+
+// The serving-layer DTO impls for the storage-level Object Lock traits live
+// here because this module owns the persisted `ObjectLockConfiguration`
+// during the s3s ratchet migration (rustfs/backlog#1842).
+impl ObjectLockApi for ObjectLockConfiguration {
+    fn enabled(&self) -> bool {
+        self.object_lock_enabled
+            .as_ref()
+            .is_some_and(|v| v.as_str() == s3s::dto::ObjectLockEnabled::ENABLED)
+    }
+}
+
+impl ObjectLockStatusExt for s3s::dto::ObjectLockLegalHoldStatus {
+    fn valid(&self) -> bool {
+        matches!(
+            self.as_str(),
+            s3s::dto::ObjectLockLegalHoldStatus::ON | s3s::dto::ObjectLockLegalHoldStatus::OFF
+        )
+    }
+}
 
 fn read_msgp_str<R: Read>(rd: &mut R) -> Result<String> {
     let len = rmp::decode::read_str_len(rd)? as usize;
@@ -226,6 +247,7 @@ fn write_bin_field<W: Write>(wr: &mut W, key: &str, val: &[u8]) -> Result<()> {
 }
 
 pub const BUCKET_METADATA_FILE: &str = ".metadata.bin";
+pub const BUCKET_INCARNATION_FILE: &str = ".bucket-incarnation";
 pub const BUCKET_METADATA_FORMAT: u16 = 1;
 pub const BUCKET_METADATA_VERSION: u16 = 1;
 
@@ -277,6 +299,8 @@ pub struct BucketMetadata {
     pub name: String,
     pub created: OffsetDateTime,
     pub lock_enabled: bool, // While marked as unused, it may need to be retained
+    pub bucket_incarnation_id: Uuid,
+    pub(crate) bucket_incarnation_sidecar: bool,
     pub policy_config_json: Vec<u8>,
     pub notification_config_xml: Vec<u8>,
     pub lifecycle_config_xml: Vec<u8>,
@@ -347,6 +371,8 @@ impl Default for BucketMetadata {
             name: Default::default(),
             created: OffsetDateTime::UNIX_EPOCH,
             lock_enabled: Default::default(),
+            bucket_incarnation_id: Uuid::nil(),
+            bucket_incarnation_sidecar: false,
             policy_config_json: Default::default(),
             notification_config_xml: Default::default(),
             lifecycle_config_xml: Default::default(),
@@ -414,8 +440,18 @@ impl BucketMetadata {
     pub fn new(name: &str) -> Self {
         BucketMetadata {
             name: name.to_string(),
+            bucket_incarnation_id: Uuid::new_v4(),
             ..Default::default()
         }
+    }
+
+    /// Metadata for a physically new user bucket. Existing or fabricated legacy
+    /// metadata must use [`Self::new`] so upgrades do not rewrite their
+    /// durability posture.
+    pub fn new_with_default_durability(name: &str) -> Self {
+        let mut metadata = Self::new(name);
+        metadata.durability_config_json = super::durability::new_bucket_durability_config_json();
+        metadata
     }
 
     pub fn save_file_path(&self) -> String {
@@ -479,6 +515,11 @@ impl BucketMetadata {
                 "Name" => self.name = read_msgp_str(rd)?,
                 "Created" => self.created = read_msgp_time_value(rd)?,
                 "LockEnabled" => self.lock_enabled = read_msgp_bool(rd)?,
+                "BucketIncarnationID" => {
+                    let bytes = read_msgp_bin(rd)?;
+                    self.bucket_incarnation_id =
+                        Uuid::from_slice(&bytes).map_err(|err| Error::other(format!("invalid BucketIncarnationID: {err}")))?;
+                }
                 "PolicyConfigJSON" | "PolicyConfigJson" => self.policy_config_json = read_msgp_bin(rd)?,
                 "NotificationConfigXML" | "NotificationConfigXml" => self.notification_config_xml = read_msgp_bin(rd)?,
                 "LifecycleConfigXML" | "LifecycleConfigXml" => self.lifecycle_config_xml = read_msgp_bin(rd)?,
@@ -535,8 +576,8 @@ impl BucketMetadata {
 
     /// Encode to msgp bytes. Field order follows MinIO BucketMetadata for compatibility.
     pub fn encode_to<W: Write>(&self, wr: &mut W) -> Result<()> {
-        // Map size: MinIO fields (25) + RustFS extensions (18)
-        let map_len: u32 = 43;
+        // Map size: MinIO fields (25) + RustFS extensions (19)
+        let map_len: u32 = 44;
         rmp::encode::write_map_len(wr, map_len)?;
 
         // MinIO field order (same as Go struct)
@@ -548,6 +589,8 @@ impl BucketMetadata {
 
         rmp::encode::write_str(wr, "LockEnabled")?;
         rmp::encode::write_bool(wr, self.lock_enabled)?;
+
+        write_bin_field(wr, "BucketIncarnationID", self.bucket_incarnation_id.as_bytes())?;
 
         write_bin_field(wr, "PolicyConfigJSON", &self.policy_config_json)?;
         write_bin_field(wr, "NotificationConfigXML", &self.notification_config_xml)?;
@@ -748,6 +791,10 @@ impl BucketMetadata {
                 self.quota_config_updated_at = updated;
             }
             OBJECT_LOCK_CONFIG => {
+                self.object_lock_config = None;
+                if !data.is_empty() {
+                    self.lock_enabled = true;
+                }
                 self.object_lock_config_xml = data;
                 self.object_lock_config_updated_at = updated;
             }
@@ -1115,6 +1162,29 @@ impl BucketMetadata {
     }
 }
 
+pub(crate) async fn load_bucket_incarnation(api: Arc<ECStore>, bucket: &str) -> Result<Option<Uuid>> {
+    let path = format!("{BUCKET_META_PREFIX}/{bucket}/{BUCKET_INCARNATION_FILE}");
+    let data = match read_config_preserve_empty(api, &path).await {
+        Ok(data) => data,
+        Err(Error::ConfigNotFound) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let incarnation =
+        Uuid::from_slice(&data).map_err(|err| Error::other(format!("persisted bucket incarnation is invalid: {err}")))?;
+    if incarnation.is_nil() {
+        return Err(Error::other("persisted bucket incarnation is nil"));
+    }
+    Ok(Some(incarnation))
+}
+
+pub(crate) async fn save_bucket_incarnation(api: Arc<ECStore>, bucket: &str, incarnation: Uuid) -> Result<()> {
+    if incarnation.is_nil() {
+        return Err(Error::other("cannot persist a nil bucket incarnation"));
+    }
+    let path = format!("{BUCKET_META_PREFIX}/{bucket}/{BUCKET_INCARNATION_FILE}");
+    save_config(api, &path, incarnation.as_bytes().to_vec()).await
+}
+
 pub async fn load_bucket_metadata(api: Arc<ECStore>, bucket: &str) -> Result<BucketMetadata> {
     load_bucket_metadata_parse(api, bucket, true).await
 }
@@ -1141,6 +1211,23 @@ pub(crate) async fn load_bucket_metadata_parse_with_presence(
             (BucketMetadata::new(bucket), false)
         }
     };
+
+    let incarnation = load_bucket_incarnation(api, bucket).await?;
+    if persisted {
+        if let Some(incarnation) = incarnation {
+            if !bm.bucket_incarnation_id.is_nil() && bm.bucket_incarnation_id != incarnation {
+                return Err(Error::other("bucket incarnation sidecar does not match bucket metadata"));
+            }
+            bm.bucket_incarnation_id = incarnation;
+            bm.bucket_incarnation_sidecar = true;
+        } else if !bm.bucket_incarnation_id.is_nil() {
+            return Err(Error::other(format!(
+                "bucket incarnation sidecar is missing for new-format metadata: {bucket}"
+            )));
+        }
+    } else if incarnation.is_some() {
+        return Err(Error::other("bucket incarnation sidecar exists without bucket metadata"));
+    }
 
     bm.default_timestamps();
 
@@ -1209,6 +1296,10 @@ mod test {
         // Same 4-byte format|version header (1|1) and msgpack layout as MinIO.
         BucketMetadata::check_header(&blob).expect("valid .metadata.bin header");
         let mut bm = BucketMetadata::unmarshal(&blob[4..]).expect("unmarshal MinIO bucket metadata");
+        assert!(
+            bm.bucket_incarnation_id.is_nil(),
+            "legacy MinIO metadata has no RustFS bucket incarnation field"
+        );
 
         // Raw config fields survive the msgpack decode (PascalCase MinIO field names).
         assert_eq!(bm.name, "interop");
@@ -1240,7 +1331,7 @@ mod test {
         assert!(bm.object_locking(), "object lock active via parsed config");
     }
 
-    /// backlog#580: KNOWN GAP (weisd 2026-03-06 "inline_data 前缀不同"). RustFS's
+    /// backlog#580: KNOWN GAP (flagged 2026-03-06: "inline_data 前缀不同"). RustFS's
     /// inline-data extraction does not yet recover the object body from a
     /// MinIO-written bucket-metadata object: `into_fileinfo(read_data=true).data`
     /// returns bytes that are not the `.metadata.bin` blob (no `format|version`
@@ -1248,7 +1339,7 @@ mod test {
     /// inline-data framing is handled on the read path.
     /// backlog#580: prove RustFS reads a MinIO-written **inlined** bucket-metadata
     /// object end-to-end. MinIO stores inline data as `[bitrot hash][object body]`
-    /// (the "`inline_data` 前缀不同" that weisd flagged on 2026-03-06 is that
+    /// (the "`inline_data` 前缀不同" gap flagged on 2026-03-06 is that
     /// bitrot prefix, not a format incompatibility). Running the raw inline shard
     /// through RustFS's `BitrotReader` with the default `HighwayHash256S` must
     /// verify the checksum and yield the exact `.metadata.bin` blob.
@@ -1291,6 +1382,79 @@ mod test {
         let new = BucketMetadata::unmarshal(&buf).unwrap();
 
         assert_eq!(bm.name, new.name);
+        assert!(!bm.bucket_incarnation_id.is_nil());
+        assert_eq!(bm.bucket_incarnation_id, new.bucket_incarnation_id);
+    }
+
+    #[test]
+    fn bucket_incarnation_msgpack_rejects_invalid_binary_length() {
+        let mut fixture = Vec::new();
+        rmp::encode::write_map_len(&mut fixture, 1).unwrap();
+        rmp::encode::write_str(&mut fixture, "BucketIncarnationID").unwrap();
+        rmp::encode::write_bin(&mut fixture, &[0_u8; 15]).unwrap();
+
+        let err = BucketMetadata::unmarshal(&fixture).expect_err("non-UUID incarnation bytes must fail closed");
+        assert!(err.to_string().contains("invalid BucketIncarnationID"));
+    }
+
+    #[test]
+    fn same_name_bucket_metadata_gets_a_new_incarnation() {
+        let old = BucketMetadata::new("recreated");
+        let new = BucketMetadata::new("recreated");
+
+        assert!(!old.bucket_incarnation_id.is_nil());
+        assert!(!new.bucket_incarnation_id.is_nil());
+        assert_ne!(old.bucket_incarnation_id, new.bucket_incarnation_id);
+    }
+
+    #[test]
+    fn regular_bucket_metadata_constructor_does_not_seed_durability() {
+        temp_env::with_var_unset(crate::bucket::durability::ENV_NEW_BUCKET_DURABILITY_MODE, || {
+            let metadata = BucketMetadata::new("legacy-or-fabricated");
+            assert!(metadata.durability_config_json.is_empty());
+            assert!(metadata.durability_config().is_none());
+        });
+    }
+
+    #[test]
+    fn new_bucket_metadata_constructor_seeds_default_durability() {
+        temp_env::with_var_unset(crate::bucket::durability::ENV_NEW_BUCKET_DURABILITY_MODE, || {
+            let metadata = BucketMetadata::new_with_default_durability("new-user-bucket");
+            assert_eq!(
+                metadata.durability_config().and_then(|cfg| cfg.normalized_mode()).as_deref(),
+                Some(crate::bucket::durability::BUCKET_DURABILITY_MODE_RELAXED)
+            );
+
+            let encoded = metadata.marshal_msg().expect("marshal metadata");
+            let decoded = BucketMetadata::unmarshal(&encoded).expect("unmarshal metadata");
+            assert_eq!(decoded.durability_config_json, metadata.durability_config_json);
+            assert_eq!(
+                decoded.durability_config().and_then(|cfg| cfg.normalized_mode()).as_deref(),
+                Some(crate::bucket::durability::BUCKET_DURABILITY_MODE_RELAXED)
+            );
+        });
+    }
+
+    #[test]
+    fn new_bucket_metadata_constructor_can_inherit_global_durability() {
+        temp_env::with_var(crate::bucket::durability::ENV_NEW_BUCKET_DURABILITY_MODE, Some("inherit"), || {
+            let metadata = BucketMetadata::new_with_default_durability("strict-fleet-new-bucket");
+            assert!(metadata.durability_config_json.is_empty());
+            assert!(metadata.durability_config().is_none());
+        });
+    }
+
+    #[test]
+    fn site_replication_config_updates_cannot_replace_bucket_incarnation() {
+        let mut metadata = BucketMetadata::new("site-replication-update");
+        let incarnation = metadata.bucket_incarnation_id;
+
+        metadata
+            .update_config(BUCKET_POLICY_CONFIG, br#"{"Version":"2012-10-17","Statement":[]}"#.to_vec())
+            .unwrap();
+        metadata.update_config(OBJECT_LOCK_CONFIG, Vec::new()).unwrap();
+
+        assert_eq!(metadata.bucket_incarnation_id, incarnation);
     }
 
     #[test]

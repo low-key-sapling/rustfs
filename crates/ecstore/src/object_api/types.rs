@@ -20,44 +20,330 @@ use crate::storage_api_contracts::{
     },
 };
 
-#[derive(Clone, Default)]
-pub struct DeleteLockFence {
+#[derive(Clone)]
+pub struct NamespaceLockFence {
     signals: Arc<Vec<Arc<rustfs_lock::distributed_lock::LockLostSignal>>>,
     #[cfg(test)]
-    forced_lost: bool,
+    forced_lost: Arc<Vec<Arc<std::sync::atomic::AtomicBool>>>,
 }
 
-impl Debug for DeleteLockFence {
+impl Debug for NamespaceLockFence {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DeleteLockFence")
+        f.debug_struct("NamespaceLockFence")
             .field("signal_count", &self.signals.len())
             .finish()
     }
 }
 
-impl DeleteLockFence {
-    pub(crate) fn new(signals: Vec<Arc<rustfs_lock::distributed_lock::LockLostSignal>>) -> Self {
+impl NamespaceLockFence {
+    fn new() -> Self {
         Self {
-            signals: Arc::new(signals),
+            signals: Arc::default(),
             #[cfg(test)]
-            forced_lost: false,
+            forced_lost: Arc::new(vec![Arc::new(std::sync::atomic::AtomicBool::new(false))]),
         }
     }
 
     pub(crate) fn is_lock_lost(&self) -> bool {
         #[cfg(test)]
-        if self.forced_lost {
+        if self
+            .forced_lost
+            .iter()
+            .any(|lost| lost.load(std::sync::atomic::Ordering::Acquire))
+        {
             return true;
         }
         self.signals.iter().any(|signal| signal.is_lost())
     }
 
+    pub(crate) fn add_signal(&mut self, signal: Arc<rustfs_lock::distributed_lock::LockLostSignal>) {
+        Arc::make_mut(&mut self.signals).push(signal);
+    }
+
+    fn extend(&mut self, other: &Self) {
+        if !Arc::ptr_eq(&self.signals, &other.signals) {
+            Arc::make_mut(&mut self.signals).extend(other.signals.iter().cloned());
+        }
+        #[cfg(test)]
+        if !Arc::ptr_eq(&self.forced_lost, &other.forced_lost) {
+            Arc::make_mut(&mut self.forced_lost).extend(other.forced_lost.iter().cloned());
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn lost_for_test() -> Self {
-        Self {
+        let fence = Self::new();
+        fence.forced_lost[0].store(true, std::sync::atomic::Ordering::Release);
+        fence
+    }
+
+    #[cfg(test)]
+    pub(crate) fn loss_handle_for_test() -> (Self, Arc<std::sync::atomic::AtomicBool>) {
+        let fence = Self::new();
+        (fence.clone(), Arc::clone(&fence.forced_lost[0]))
+    }
+}
+
+#[cfg(test)]
+static NAMESPACE_LOCK_SIGNAL_TEST_FENCES: std::sync::OnceLock<std::sync::Mutex<Vec<(usize, NamespaceLockFence)>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct NamespaceLockSignalTestFence {
+    signal_key: usize,
+}
+
+#[cfg(test)]
+impl NamespaceLockSignalTestFence {
+    pub(crate) fn install_with_loss_handle(
+        signal: &Arc<rustfs_lock::distributed_lock::LockLostSignal>,
+        loss_handle: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        let fence = NamespaceLockFence {
             signals: Arc::default(),
-            forced_lost: true,
+            forced_lost: Arc::new(vec![loss_handle]),
+        };
+        let signal_key = Arc::as_ptr(signal) as usize;
+        let mut fences = NAMESPACE_LOCK_SIGNAL_TEST_FENCES
+            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+            .lock()
+            .expect("namespace lock signal test fence should not be poisoned");
+        assert!(
+            !fences.iter().any(|(key, _)| *key == signal_key),
+            "namespace lock signal test fence must be unique"
+        );
+        fences.push((signal_key, fence));
+        Self { signal_key }
+    }
+}
+
+#[cfg(test)]
+impl Drop for NamespaceLockSignalTestFence {
+    fn drop(&mut self) {
+        let mut fences = NAMESPACE_LOCK_SIGNAL_TEST_FENCES
+            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+            .lock()
+            .expect("namespace lock signal test fence should not be poisoned");
+        fences.retain(|(key, _)| *key != self.signal_key);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn namespace_lock_signal_test_fence_is_lost(signal: &Arc<rustfs_lock::distributed_lock::LockLostSignal>) -> bool {
+    NAMESPACE_LOCK_SIGNAL_TEST_FENCES
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .expect("namespace lock signal test fence should not be poisoned")
+        .iter()
+        .find(|(key, _)| *key == Arc::as_ptr(signal) as usize)
+        .is_some_and(|(_, fence)| fence.is_lock_lost())
+}
+
+#[derive(Debug)]
+pub struct ObjectLockConfigSnapshot {
+    store_id: Option<Uuid>,
+    bucket: Option<String>,
+    bucket_incarnation_id: Option<Uuid>,
+    config_revision: Option<OffsetDateTime>,
+    state: crate::bucket::metadata_sys::ObjectLockConfigState,
+    lifecycle_fence: NamespaceLockFence,
+    _lifecycle_guard: Option<rustfs_lock::NamespaceLockGuard>,
+    metadata_transaction_guard: Option<rustfs_lock::NamespaceLockGuard>,
+}
+
+impl ObjectLockConfigSnapshot {
+    pub(crate) fn new(state: crate::bucket::metadata_sys::ObjectLockConfigState) -> Self {
+        Self {
+            store_id: None,
+            bucket: None,
+            bucket_incarnation_id: None,
+            config_revision: None,
+            state,
+            lifecycle_fence: NamespaceLockFence::new(),
+            _lifecycle_guard: None,
+            metadata_transaction_guard: None,
         }
+    }
+
+    pub(crate) fn for_store_bucket(
+        store_id: Uuid,
+        bucket: &str,
+        bucket_incarnation_id: Uuid,
+        config_revision: OffsetDateTime,
+        state: crate::bucket::metadata_sys::ObjectLockConfigState,
+    ) -> Self {
+        Self {
+            store_id: Some(store_id),
+            bucket: Some(bucket.to_string()),
+            bucket_incarnation_id: Some(bucket_incarnation_id),
+            config_revision: Some(config_revision),
+            state,
+            lifecycle_fence: NamespaceLockFence::new(),
+            _lifecycle_guard: None,
+            metadata_transaction_guard: None,
+        }
+    }
+
+    pub(crate) fn for_guarded_store_bucket(
+        store_id: Uuid,
+        bucket: &str,
+        bucket_incarnation_id: Uuid,
+        config_revision: OffsetDateTime,
+        state: crate::bucket::metadata_sys::ObjectLockConfigState,
+        lifecycle_guard: rustfs_lock::NamespaceLockGuard,
+        metadata_transaction_guard: rustfs_lock::NamespaceLockGuard,
+    ) -> Self {
+        let mut lifecycle_fence = NamespaceLockFence::new();
+        if let Some(signal) = lifecycle_guard.lock_lost_signal() {
+            lifecycle_fence.add_signal(signal);
+        }
+        Self {
+            store_id: Some(store_id),
+            bucket: Some(bucket.to_string()),
+            bucket_incarnation_id: Some(bucket_incarnation_id),
+            config_revision: Some(config_revision),
+            state,
+            lifecycle_fence,
+            _lifecycle_guard: Some(lifecycle_guard),
+            metadata_transaction_guard: Some(metadata_transaction_guard),
+        }
+    }
+
+    pub(crate) fn for_store_bucket_under_lifecycle_fence(
+        store_id: Uuid,
+        bucket: &str,
+        bucket_incarnation_id: Uuid,
+        config_revision: OffsetDateTime,
+        state: crate::bucket::metadata_sys::ObjectLockConfigState,
+        lifecycle_fence: NamespaceLockFence,
+        metadata_transaction_guard: rustfs_lock::NamespaceLockGuard,
+    ) -> Self {
+        Self {
+            store_id: Some(store_id),
+            bucket: Some(bucket.to_string()),
+            bucket_incarnation_id: Some(bucket_incarnation_id),
+            config_revision: Some(config_revision),
+            state,
+            lifecycle_fence,
+            _lifecycle_guard: None,
+            metadata_transaction_guard: Some(metadata_transaction_guard),
+        }
+    }
+
+    #[allow(dead_code, reason = "snapshot-scope predicate asserted by this file's tests (backlog#1823)")]
+    pub(crate) fn is_for_store_bucket(
+        &self,
+        store_id: Uuid,
+        bucket: &str,
+        bucket_incarnation_id: Uuid,
+        config_revision: OffsetDateTime,
+    ) -> bool {
+        self.store_id == Some(store_id)
+            && self.bucket.as_deref() == Some(bucket)
+            && self.bucket_incarnation_id == Some(bucket_incarnation_id)
+            && self.config_revision == Some(config_revision)
+    }
+
+    pub fn state(&self) -> &crate::bucket::metadata_sys::ObjectLockConfigState {
+        &self.state
+    }
+
+    pub(crate) fn is_valid_for_destructive_put(&self, store_id: Uuid, bucket: &str, bucket_incarnation_id: Uuid) -> bool {
+        self.store_id == Some(store_id)
+            && self.bucket.as_deref() == Some(bucket)
+            && self.bucket_incarnation_id == Some(bucket_incarnation_id)
+            && self.config_revision.is_some()
+            && !self.lifecycle_fence.is_lock_lost()
+            && self
+                .metadata_transaction_guard
+                .as_ref()
+                .is_some_and(|guard| !guard.is_lock_lost())
+    }
+
+    pub(crate) fn add_lock_fences(&self, opts: &mut ObjectOptions) {
+        opts.bucket_lifecycle_lock_fence
+            .get_or_insert_with(NamespaceLockFence::new)
+            .extend(&self.lifecycle_fence);
+        if let Some(guard) = self.metadata_transaction_guard.as_ref() {
+            opts.add_namespace_lock_guard(guard);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuotaAdmission {
+    current_usage: u64,
+    quota_limit: u64,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LifecycleDeleteAllRequest {
+    pub(crate) version_id: Option<Uuid>,
+    pub(crate) delete_marker: bool,
+    pub(crate) action: rustfs_scanner_contracts::metrics::IlmAction,
+    pub(crate) rule_id: String,
+    pub(crate) phase: LifecycleDeleteAllPhase,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleDeleteAllPhase {
+    Preflight,
+    History,
+    FinalPreflight,
+    Trigger,
+}
+
+#[doc(hidden)]
+#[derive(Default)]
+pub struct LifecycleDeleteAllJournalState {
+    prepared: HashMap<String, crate::bucket::lifecycle::tier_sweeper::Jentry>,
+    mutation_started: bool,
+}
+
+impl Debug for LifecycleDeleteAllJournalState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LifecycleDeleteAllJournalState")
+            .field("prepared_count", &self.prepared.len())
+            .field("mutation_started", &self.mutation_started)
+            .finish()
+    }
+}
+
+impl LifecycleDeleteAllJournalState {
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        self.prepared.contains_key(name)
+    }
+
+    pub(crate) fn insert(&mut self, name: String, entry: crate::bucket::lifecycle::tier_sweeper::Jentry) {
+        self.prepared.insert(name, entry);
+    }
+
+    pub(crate) fn prepared_entries(&self) -> Vec<crate::bucket::lifecycle::tier_sweeper::Jentry> {
+        self.prepared.values().cloned().collect()
+    }
+
+    pub(crate) fn mark_mutation_started(&mut self) {
+        self.mutation_started = true;
+    }
+
+    pub(crate) fn mutation_started(&self) -> bool {
+        self.mutation_started
+    }
+}
+
+impl QuotaAdmission {
+    pub(crate) fn current_usage(self) -> u64 {
+        self.current_usage
+    }
+
+    pub(crate) fn quota_limit(self) -> u64 {
+        self.quota_limit
+    }
+
+    pub(crate) fn remaining(self) -> u64 {
+        self.quota_limit - self.current_usage
     }
 }
 
@@ -71,8 +357,15 @@ pub struct ObjectOptions {
     pub delete_prefix: bool,
     pub delete_prefix_object: bool,
     pub version_id: Option<String>,
+    /// Lifecycle-only staged purge request checked under the object write lock.
+    #[doc(hidden)]
+    pub lifecycle_delete_all: Option<LifecycleDeleteAllRequest>,
+    #[doc(hidden)]
+    pub lifecycle_delete_all_journal: Option<Arc<parking_lot::Mutex<LifecycleDeleteAllJournalState>>>,
     /// RustFS-only compare-and-set condition checked under the object write lock.
     pub expected_current_version_id: Option<String>,
+    /// Persisted bucket incarnation observed before authorization.
+    pub expected_bucket_incarnation_id: Option<Uuid>,
     pub no_lock: bool,
     /// True when an upper layer already holds the object read lock before
     /// forwarding a no_lock read to the set layer.
@@ -86,8 +379,16 @@ pub struct ObjectOptions {
     pub skip_rebalancing: bool,
     pub skip_free_version: bool,
 
+    /// Cooperative cancellation for an owned PutObject before authoritative
+    /// rename begins. Storage ignores it after entering the durable commit.
+    #[doc(hidden)]
+    pub put_object_cancellation: Option<tokio_util::sync::CancellationToken>,
+
     pub data_movement: bool,
     pub raw_data_movement_read: bool,
+    /// Materialize the data-movement per-part checksum sidecar for APIs that
+    /// return part checksums. Ordinary object reads leave it encoded.
+    pub include_part_checksums: bool,
     pub src_pool_idx: usize,
     pub user_defined: HashMap<String, String>,
     pub preserve_etag: Option<String>,
@@ -96,8 +397,36 @@ pub struct ObjectOptions {
 
     pub delete_replication: Option<ReplicationState>,
     pub delete_replication_config_snapshot: Option<Arc<DeleteReplicationConfigSnapshot>>,
-    pub delete_lock_fence: Option<DeleteLockFence>,
+    pub namespace_lock_fence: Option<NamespaceLockFence>,
+    /// Proves an upper layer holds the bucket lifecycle sentinel. A separate
+    /// fence avoids recursively acquiring the read lock behind a queued writer.
+    pub bucket_lifecycle_lock_fence: Option<NamespaceLockFence>,
     pub replication_request: bool,
+    /// True when the inbound request carried the
+    /// `{x-rustfs-,x-minio-}source-proxy-request` header family with the
+    /// value "true": the request was already proxied by a replication peer,
+    /// so this server must not proxy a local miss onward (anti-loop,
+    /// MinIO-compatible). The header only disables proxying — it grants no
+    /// capability — so no authorization gate is required to honor it.
+    pub proxy_request: bool,
+    /// True when the `source-proxy-request` header family was present at
+    /// all, regardless of value (MinIO's `ProxyHeaderSet`). A replication
+    /// peer sends `source-proxy-request: false` on its worker convergence
+    /// HEADs precisely so the receiver answers locally instead of proxying
+    /// back — otherwise a proxied 404->200 echo makes the worker believe the
+    /// object already converged and it never replicates it.
+    pub proxy_header_set: bool,
+    /// Source-cluster LWW timestamps carried by an authorized replication
+    /// request; None when the source never modified the category. Only the
+    /// replication-authorized options builders may set these.
+    pub replication_tagging_timestamp: Option<OffsetDateTime>,
+    pub replication_retention_timestamp: Option<OffsetDateTime>,
+    pub replication_legalhold_timestamp: Option<OffsetDateTime>,
+    /// Authorized SSE-C replication passthrough: the body is already
+    /// ciphertext, so the write path must not encrypt or compress it and
+    /// stores the restored encryption metadata verbatim. Only the
+    /// replication-authorized options builders may set this.
+    pub preserve_ciphertext: bool,
     pub delete_marker: bool,
     pub synthetic_version_id: bool,
 
@@ -108,16 +437,114 @@ pub struct ObjectOptions {
     pub eval_metadata: Option<HashMap<String, String>>,
     pub object_lock_retention: Option<ObjectLockRetentionOptions>,
     pub object_lock_delete: Option<crate::storage_api_contracts::object::ObjectLockDeleteOptions>,
+    /// Authoritative bucket Object Lock snapshot installed inside `ECStore`
+    /// before a destructive commit reaches the set layer.
+    pub object_lock_config_snapshot: Option<Arc<ObjectLockConfigSnapshot>>,
 
     pub want_checksum: Option<Checksum>,
     pub skip_verify_bitrot: bool,
     pub capacity_scope_token: Option<Uuid>,
+    /// Server-derived bucket-quota snapshot for commit-boundary admission.
+    pub quota_admission: Option<QuotaAdmission>,
     /// Storage-owned journal writer used by the atomic delete path. This is
     /// populated only by the `ECStore` wrapper that holds the namespace locks.
     pub tier_delete_journal_api: Option<Arc<crate::store::ECStore>>,
 }
 
+/// Transient scanner-only carrier for target-side publication lease tokens.
+/// SetDisks consumes and removes this key before constructing durable
+/// FileInfo metadata; it must never appear in an S3-visible object.
+pub const SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY: &str = "x-rustfs-internal-scanner-publication-lease-fence-v1";
+
 impl ObjectOptions {
+    /// Create a new ObjectOptions with modified no_lock field.
+    pub fn with_no_lock(&self, no_lock: bool) -> Self {
+        let mut opts = self.clone();
+        opts.no_lock = no_lock;
+        opts
+    }
+
+    /// Create commit options from base options (optimized clone).
+    pub fn as_commit_opts(&self) -> Self {
+        let mut opts = self.clone();
+        opts.no_lock = true;
+        opts.metadata_cache_safe = false;
+        opts.include_part_checksums = true;
+        opts
+    }
+
+    /// Create read options with include_part_checksums enabled.
+    pub fn as_read_opts(&self) -> Self {
+        let mut opts = self.clone();
+        opts.include_part_checksums = true;
+        opts
+    }
+
+    pub fn set_quota_admission(&mut self, current_usage: u64, quota_limit: u64) -> bool {
+        self.quota_admission = (current_usage <= quota_limit).then_some(QuotaAdmission {
+            current_usage,
+            quota_limit,
+        });
+        self.quota_admission.is_some()
+    }
+
+    pub(crate) fn overwrites_existing_version(&self) -> bool {
+        self.version_id.is_some() || !self.versioned || self.version_suspended
+    }
+
+    pub(crate) fn add_namespace_lock_lost_signal(&mut self, signal: Arc<rustfs_lock::distributed_lock::LockLostSignal>) {
+        #[cfg(test)]
+        let test_fence = NAMESPACE_LOCK_SIGNAL_TEST_FENCES
+            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+            .lock()
+            .expect("namespace lock signal test fence should not be poisoned")
+            .iter()
+            .find(|(key, _)| *key == Arc::as_ptr(&signal) as usize)
+            .map(|(_, fence)| fence.clone());
+        self.namespace_lock_fence
+            .get_or_insert_with(NamespaceLockFence::new)
+            .add_signal(signal);
+        #[cfg(test)]
+        if let Some(test_fence) = test_fence {
+            self.namespace_lock_fence
+                .get_or_insert_with(NamespaceLockFence::new)
+                .extend(&test_fence);
+        }
+    }
+
+    pub(crate) fn ensure_namespace_lock_fence(&mut self) {
+        self.namespace_lock_fence.get_or_insert_with(NamespaceLockFence::new);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn add_namespace_lock_fence_for_test(&mut self, fence: &NamespaceLockFence) {
+        self.namespace_lock_fence
+            .get_or_insert_with(NamespaceLockFence::new)
+            .extend(fence);
+    }
+
+    pub(crate) fn ensure_lifecycle_delete_all_journal(&mut self) {
+        self.lifecycle_delete_all_journal
+            .get_or_insert_with(|| Arc::new(parking_lot::Mutex::new(LifecycleDeleteAllJournalState::default())));
+    }
+
+    pub(crate) fn lifecycle_delete_all_journal(&self) -> Option<&Arc<parking_lot::Mutex<LifecycleDeleteAllJournalState>>> {
+        self.lifecycle_delete_all_journal.as_ref()
+    }
+
+    pub fn add_namespace_lock_guard(&mut self, guard: &rustfs_lock::NamespaceLockGuard) {
+        if let Some(signal) = guard.lock_lost_signal() {
+            self.add_namespace_lock_lost_signal(signal);
+        }
+    }
+
+    pub fn add_bucket_lifecycle_lock_guard(&mut self, guard: &rustfs_lock::NamespaceLockGuard) {
+        let fence = self.bucket_lifecycle_lock_fence.get_or_insert_with(NamespaceLockFence::new);
+        if let Some(signal) = guard.lock_lost_signal() {
+            fence.add_signal(signal);
+        }
+    }
+
     pub fn set_delete_replication_state(&mut self, dsc: ReplicateDecision) {
         let mut rs = ReplicationState {
             replicate_decision_str: dsc.to_string(),
@@ -325,12 +752,18 @@ impl ObjectInfo {
             .any(|key| rustfs_utils::http::is_object_encryption_marker(key))
     }
 
-    /// Maximum inline size for non-versioned objects (128 KiB).
-    /// Matches `DEFAULT_INLINE_BLOCK` in `storageclass.rs`.
+    /// Historical non-versioned inline size reference.
+    ///
+    /// Inline admission is layout-specific now; callers must not use this
+    /// constant to decide whether an object is eligible for the fast path.
+    #[deprecated(note = "inline eligibility is layout-specific; use persisted metadata and the read-path policy")]
     pub const INLINE_MAX_SIZE: i64 = 128 * 1024;
 
-    /// Maximum inline size for versioned objects (16 KiB).
-    /// Matches `DEFAULT_INLINE_BLOCK / 8` in `storageclass.rs`.
+    /// Historical versioned inline size reference.
+    ///
+    /// Inline admission is layout-specific now; callers must not use this
+    /// constant to decide whether an object is eligible for the fast path.
+    #[deprecated(note = "inline eligibility is layout-specific; use persisted metadata and the read-path policy")]
     pub const INLINE_MAX_SIZE_VERSIONED: i64 = 16 * 1024;
 
     /// Returns `true` when this object qualifies for the inline data fast path.
@@ -338,10 +771,12 @@ impl ObjectInfo {
     /// The inline fast path decodes erasure-coded data entirely in memory,
     /// bypassing disk I/O, duplex pipes, and the disk-read semaphore.
     ///
-    /// The `inlined` flag is the primary signal — PUT sets it through the
-    /// captured storage-class snapshot's `Config::should_inline`, which applies
-    /// the correct version-aware threshold (128 KiB non-versioned, 16 KiB versioned).
-    /// The size check below is a safety net using the same thresholds.
+    /// The persisted `inlined` flag is the canonical size-policy decision. PUT
+    /// sets it through the captured storage-class snapshot's effective policy,
+    /// which is layout- and version-aware. Reapplying a fixed object-size limit
+    /// here would disagree with that policy for wider EC layouts and explicit
+    /// inline configurations. The direct-memory reader retains its own bounded
+    /// 128 KiB allocation gate at the call site.
     ///
     /// Additional conditions:
     /// - Single part
@@ -352,14 +787,8 @@ impl ObjectInfo {
         if !self.inlined {
             return false;
         }
-        // Apply the same version-aware threshold as PUT (storageclass.rs).
-        let max_size = if self.version_id.is_some() {
-            Self::INLINE_MAX_SIZE_VERSIONED
-        } else {
-            Self::INLINE_MAX_SIZE
-        };
         self.parts.len() == 1
-            && self.size <= max_size
+            && self.size >= 0
             && !self.is_encrypted()
             && !self.is_compressed()
             && self.transitioned_object.tier.is_empty()
@@ -374,6 +803,9 @@ impl ObjectInfo {
     }
 
     pub fn get_actual_size(&self) -> std::io::Result<i64> {
+        if self.actual_size < -1 || (self.actual_size == -1 && !self.is_compressed()) {
+            return Err(std::io::Error::other("invalid negative actual size"));
+        }
         if self.actual_size > 0 {
             return Ok(self.actual_size);
         }
@@ -385,10 +817,25 @@ impl ObjectInfo {
                 let size = size_str.parse::<i64>().map_err(|e| std::io::Error::other(e.to_string()))?;
                 return Ok(size);
             }
-            let mut actual_size = 0;
-            self.parts.iter().for_each(|part| {
-                actual_size += part.actual_size;
-            });
+            if self.actual_size == -1 && self.parts.is_empty() {
+                return Ok(-1);
+            }
+            let mut actual_size = 0_i64;
+            let mut unknown = false;
+            for part in self.parts.iter() {
+                match part.actual_size {
+                    -1 => unknown = true,
+                    size if size >= 0 => {
+                        actual_size = actual_size
+                            .checked_add(size)
+                            .ok_or_else(|| std::io::Error::other("compressed actual size overflow"))?;
+                    }
+                    _ => return Err(std::io::Error::other("invalid negative compressed part size")),
+                }
+            }
+            if unknown {
+                return Ok(-1);
+            }
             if actual_size == 0 && actual_size != self.size {
                 return Err(std::io::Error::other(format!("invalid decompressed size {} {}", actual_size, self.size)));
             }
@@ -403,14 +850,35 @@ impl ObjectInfo {
         Ok(self.size)
     }
 
-    pub fn from_file_info(fi: &FileInfo, bucket: &str, object: &str, versioned: bool) -> ObjectInfo {
-        let name = decode_dir_object(object);
+    /// Returns a non-negative size for client and replication boundaries.
+    ///
+    /// Compressed legacy metadata can retain the internal `-1` unknown-size
+    /// sentinel. Those boundaries cannot emit a negative length, so they use
+    /// the persisted physical size while quota accounting keeps the sentinel
+    /// distinction in [`crate::data_usage::quota_object_size`].
+    pub fn get_actual_size_or_physical(&self) -> i64 {
+        self.get_actual_size()
+            .map(|size| if size >= 0 { size } else { self.size.max(0) })
+            .unwrap_or_else(|_| self.size.max(0))
+    }
 
+    pub fn from_file_info(fi: &FileInfo, bucket: &str, object: &str, versioned: bool) -> ObjectInfo {
         let mut version_id = fi.version_id;
 
         if versioned && version_id.is_none() {
             version_id = Some(Uuid::nil())
         }
+
+        Self::from_file_info_with_version_id(fi, bucket, object, version_id)
+    }
+
+    pub(crate) fn from_file_info_with_version_id(
+        fi: &FileInfo,
+        bucket: &str,
+        object: &str,
+        version_id: Option<Uuid>,
+    ) -> ObjectInfo {
+        let name = decode_dir_object(object);
 
         // etag
         let (content_type, content_encoding, etag) = {
@@ -565,8 +1033,17 @@ impl ObjectInfo {
         delimiter: Option<String>,
         after_version_marker: Option<VersionMarker>,
     ) -> Vec<ObjectInfo> {
-        Self::from_meta_cache_entries_sorted_versions_with_purge(entries, bucket, prefix, delimiter, after_version_marker, false)
-            .await
+        Self::from_meta_cache_entries_sorted_versions_with_purge(
+            entries,
+            bucket,
+            prefix,
+            delimiter,
+            after_version_marker,
+            false,
+            false,
+        )
+        .await
+        .0
     }
 
     pub(crate) async fn from_meta_cache_entries_sorted_versions_for_lifecycle(
@@ -576,8 +1053,40 @@ impl ObjectInfo {
         delimiter: Option<String>,
         after_version_marker: Option<VersionMarker>,
     ) -> Vec<ObjectInfo> {
-        Self::from_meta_cache_entries_sorted_versions_with_purge(entries, bucket, prefix, delimiter, after_version_marker, true)
-            .await
+        Self::from_meta_cache_entries_sorted_versions_with_purge(
+            entries,
+            bucket,
+            prefix,
+            delimiter,
+            after_version_marker,
+            true,
+            false,
+        )
+        .await
+        .0
+    }
+
+    pub(crate) async fn from_meta_cache_entries_sorted_versions_for_recursive_delete(
+        entries: &MetaCacheEntriesSorted,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<String>,
+        after_version_marker: Option<VersionMarker>,
+    ) -> Result<Vec<ObjectInfo>> {
+        let (objects, error) = Self::from_meta_cache_entries_sorted_versions_with_purge(
+            entries,
+            bucket,
+            prefix,
+            delimiter,
+            after_version_marker,
+            true,
+            true,
+        )
+        .await;
+        match error {
+            Some(error) => Err(error),
+            None => Ok(objects),
+        }
     }
 
     async fn from_meta_cache_entries_sorted_versions_with_purge(
@@ -587,7 +1096,8 @@ impl ObjectInfo {
         delimiter: Option<String>,
         after_version_marker: Option<VersionMarker>,
         include_version_purge: bool,
-    ) -> Vec<ObjectInfo> {
+        fail_on_decode_error: bool,
+    ) -> (Vec<ObjectInfo>, Option<Error>) {
         let vcfg = get_versioning_config(bucket).await.ok();
         let mut objects = Vec::with_capacity(entries.entries().len());
         let mut prev_prefix = "";
@@ -623,6 +1133,9 @@ impl ObjectInfo {
                 let file_infos = match entry.file_info_versions(bucket) {
                     Ok(res) => res,
                     Err(err) => {
+                        if fail_on_decode_error {
+                            return (objects, Some(err.into()));
+                        }
                         warn!("file_info_versions err {:?}", err);
                         continue;
                     }
@@ -674,7 +1187,7 @@ impl ObjectInfo {
             }
         }
 
-        objects
+        (objects, None)
     }
 
     pub async fn from_meta_cache_entries_sorted_infos(
@@ -722,7 +1235,7 @@ impl ObjectInfo {
                     }
                 };
 
-                // TODO:VersionPurgeStatus
+                // TODO(backlog): handle VersionPurgeStatus in object listing
                 let versioned = vcfg.clone().map(|v| v.0.versioned(&entry.name)).unwrap_or_default();
                 objects.push(ObjectInfo::from_file_info(&fi, bucket, &entry.name, versioned));
 
@@ -762,6 +1275,10 @@ impl ObjectInfo {
     }
 
     pub fn replication_state(&self) -> ReplicationState {
+        // Derived from the durable internal keys, not from the wire form: the
+        // state's positional encoding skips this map.
+        let (target_delete_marker_version_ids, target_delete_marker_version_ids_corrupt) =
+            rustfs_utils::http::target_delete_marker_versions(&self.user_defined);
         ReplicationState {
             replication_status_internal: self.replication_status_internal.clone(),
             version_purge_status_internal: self.version_purge_status_internal.clone(),
@@ -779,6 +1296,8 @@ impl ObjectInfo {
                     .map(|arn| (arn, v.clone()))
                 })
                 .collect(),
+            target_delete_marker_version_ids,
+            target_delete_marker_version_ids_corrupt,
             ..Default::default()
         }
     }
@@ -805,7 +1324,10 @@ impl ObjectInfo {
         if let Some(data) = &self.checksum {
             if self.is_encrypted() {
                 // Object-level encrypted checksum bytes require SSE decrypt material,
-                // so do not expose them as plaintext checksum headers here.
+                // so do not expose them as plaintext checksum headers here. The
+                // `false` multipart flag feeds the response-path COMPOSITE
+                // fallback; callers that need accurate multipart routing must
+                // consult `is_multipart()` instead of this value.
                 return Ok((HashMap::new(), false));
             }
 
@@ -830,6 +1352,25 @@ fn versions_after_marker(file_infos: &rustfs_filemeta::FileInfoVersions, marker:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn object_lock_config_snapshot_is_bound_to_store_bucket_and_incarnation() {
+        let store_id = Uuid::new_v4();
+        let incarnation_id = Uuid::new_v4();
+        let snapshot = ObjectLockConfigSnapshot::for_store_bucket(
+            store_id,
+            "source-bucket",
+            incarnation_id,
+            OffsetDateTime::UNIX_EPOCH,
+            crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+        );
+
+        assert!(snapshot.is_for_store_bucket(store_id, "source-bucket", incarnation_id, OffsetDateTime::UNIX_EPOCH));
+        assert!(!snapshot.is_for_store_bucket(Uuid::new_v4(), "source-bucket", incarnation_id, OffsetDateTime::UNIX_EPOCH));
+        assert!(!snapshot.is_for_store_bucket(store_id, "other-bucket", incarnation_id, OffsetDateTime::UNIX_EPOCH));
+        assert!(!snapshot.is_for_store_bucket(store_id, "source-bucket", Uuid::new_v4(), OffsetDateTime::UNIX_EPOCH));
+        assert!(!snapshot.is_for_store_bucket(store_id, "source-bucket", incarnation_id, OffsetDateTime::now_utc()));
+    }
     use rustfs_filemeta::{FileInfo, FileMeta, MetaCacheEntry, TRANSITION_COMPLETE};
 
     fn inline_fast_path_object(size: i64, versioned: bool) -> ObjectInfo {
@@ -843,14 +1384,14 @@ mod tests {
     }
 
     #[test]
-    fn inline_fast_path_eligibility_preserves_exact_versioned_boundaries() {
+    fn inline_fast_path_eligibility_follows_persisted_marker() {
         for (case, size, versioned, expected) in [
             ("unversioned below", 128 * 1024 - 1, false, true),
             ("unversioned exact", 128 * 1024, false, true),
-            ("unversioned above", 128 * 1024 + 1, false, false),
+            ("unversioned above", 128 * 1024 + 1, false, true),
             ("versioned below", 16 * 1024 - 1, true, true),
             ("versioned exact", 16 * 1024, true, true),
-            ("versioned above", 16 * 1024 + 1, true, false),
+            ("versioned above", 16 * 1024 + 1, true, true),
         ] {
             assert_eq!(
                 inline_fast_path_object(size, versioned).is_inline_fast_path_eligible(),
@@ -861,8 +1402,28 @@ mod tests {
     }
 
     #[test]
+    fn inline_fast_path_marker_allows_ec8_and_ec12_layout_specific_256kib_objects() {
+        for data_blocks in [8, 12] {
+            let object = ObjectInfo {
+                size: 256 * 1024,
+                data_blocks,
+                parity_blocks: 4,
+                inlined: true,
+                version_id: Some(Uuid::from_u128(1)),
+                parts: Arc::new(vec![ObjectPartInfo::default()]),
+                ..Default::default()
+            };
+
+            assert!(
+                object.is_inline_fast_path_eligible(),
+                "the persisted inline marker must be authoritative for EC{data_blocks}+4"
+            );
+        }
+    }
+
+    #[test]
     fn inline_fast_path_eligibility_rejects_incompatible_object_shapes() {
-        let mut object = inline_fast_path_object(ObjectInfo::INLINE_MAX_SIZE, false);
+        let mut object = inline_fast_path_object(128 * 1024, false);
 
         object.inlined = false;
         assert!(!object.is_inline_fast_path_eligible(), "non-inline objects must fall back");
@@ -945,10 +1506,11 @@ mod tests {
     #[test]
     fn object_info_replication_helpers_parse_target_status_and_reset_headers() {
         let reset_key = rustfs_utils::http::internal_key_rustfs("replication-reset-arn:target-a");
+        let user_defined = HashMap::from([(reset_key, "reset-id".to_string())]);
         let object = ObjectInfo {
             replication_status_internal: Some("arn:target-a=COMPLETED;arn:target-b=FAILED;".to_string()),
             version_purge_status_internal: Some("arn:target-a=PENDING;".to_string()),
-            user_defined: Arc::new(HashMap::from([(reset_key, "reset-id".to_string())])),
+            user_defined: Arc::new(user_defined),
             ..Default::default()
         };
 
@@ -1252,6 +1814,18 @@ mod tests {
     }
 
     #[test]
+    fn from_file_info_with_version_id_keeps_normalized_absent_version() {
+        let fi = FileInfo {
+            version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+
+        let info = ObjectInfo::from_file_info_with_version_id(&fi, "bucket", "object", None);
+
+        assert_eq!(info.version_id, None, "a normalized absent version must not be rewritten to nil");
+    }
+
+    #[test]
     fn from_file_info_reports_effective_storage_class_for_legacy_metadata() {
         for legacy_label in [
             storageclass::STANDARD_IA,
@@ -1457,6 +2031,34 @@ mod tests {
     }
 
     #[test]
+    fn decrypt_checksums_keeps_encrypted_multipart_flag_false_for_response_paths() {
+        let checksum = rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::CRC32, b"encrypted-object")
+            .expect("test checksum should be valid");
+        let info = ObjectInfo {
+            checksum: Some(checksum.to_bytes(&[])),
+            // Multipart ETag shape: md5-of-md5s with a part-count suffix.
+            etag: Some("0123456789abcdef0123456789abcdef-3".to_string()),
+            user_defined: Arc::new(HashMap::from([(
+                rustfs_utils::http::headers::AMZ_SERVER_SIDE_ENCRYPTION.to_string(),
+                "AES256".to_string(),
+            )])),
+            ..Default::default()
+        };
+
+        let (checksums, is_multipart) = info
+            .decrypt_checksums(0, &HeaderMap::new())
+            .expect("encrypted checksum should fail closed");
+
+        // The response path infers COMPOSITE from is_multipart=true when the
+        // checksum type is unreadable, so encrypted objects must keep the
+        // flag false here even when the object itself is multipart. Callers
+        // that need routing (replication) consult is_multipart() directly.
+        assert!(checksums.is_empty());
+        assert!(!is_multipart);
+        assert!(info.is_multipart());
+    }
+
+    #[test]
     fn decrypt_checksums_keeps_encrypted_part_checksum_metadata() {
         let checksum = rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::CRC32, b"encrypted-object")
             .expect("test checksum should be valid");
@@ -1543,5 +2145,14 @@ mod tests {
         assert!(default_cloned.user_defined.is_empty());
         assert!(default_cloned.user_tags.is_empty());
         assert!(default_cloned.parts.is_empty());
+    }
+
+    #[test]
+    fn object_options_default_does_not_allocate_lifecycle_delete_all_journal() {
+        let mut opts = ObjectOptions::default();
+
+        assert!(opts.lifecycle_delete_all_journal().is_none());
+        opts.ensure_lifecycle_delete_all_journal();
+        assert!(opts.lifecycle_delete_all_journal().is_some());
     }
 }

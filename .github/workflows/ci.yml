@@ -59,7 +59,7 @@ on:
   merge_group:
     types: [ checks_requested ]
   schedule:
-    - cron: "0 0 * * 0" # Weekly on Sunday at midnight UTC
+    - cron: "11 0 * * 0" # Weekly on Sunday 00:11 UTC
   workflow_dispatch:
 
 permissions:
@@ -118,7 +118,9 @@ jobs:
           persist-credentials: false
 
       - name: Install ripgrep
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
+        uses: taiki-e/install-action@bffeee26d4db9be238a4ea78d8826604ebcb594d # v2
+        with:
+          tool: ripgrep@15.2.0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -137,6 +139,12 @@ jobs:
       - name: Check architecture migration rules
         run: ./scripts/check_architecture_migration_rules.sh
 
+      - name: Check logging guardrails
+        run: ./scripts/check_logging_guardrails.sh
+
+      - name: Check error other(format!) ratchet
+        run: ./scripts/check_error_other_format_ratchet.sh
+
       - name: Check tokio io-uring feature guard
         run: ./scripts/check_no_tokio_io_uring.sh
 
@@ -145,6 +153,21 @@ jobs:
 
       - name: Check body-cache whitelist guard
         run: ./scripts/check_body_cache_whitelist.sh
+
+      - name: Check s3s footprint ratchet
+        run: ./scripts/check_s3s_footprint.sh
+
+      - name: Check cryptographic capability wording
+        run: ./scripts/check_fips_wording.sh
+
+      - name: Check no embedded secret material
+        run: ./scripts/check_embedded_secrets.sh
+
+      - name: Check test wiring
+        run: |
+          python3 ./scripts/check_test_wiring.py --self-test
+          python3 ./scripts/check_scheduled_validation_freshness.py --self-test
+          python3 ./scripts/check_test_wiring.py
 
       - name: Check no planning docs committed
         run: ./scripts/check_no_planning_docs.sh
@@ -161,22 +184,14 @@ jobs:
     needs: [ quick-checks ]
     runs-on: sm-standard-4
     timeout-minutes: 90
-    # Both lines are required. Job-level `permissions` replaces the workflow
-    # block rather than merging with it, so declaring only `actions: write`
-    # would drop `contents: read` and break this job's checkout and the
-    # repo-token the setup action hands to setup-protoc.
-    permissions:
-      contents: read
-      actions: write
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
-          # This job's token can cancel runs and delete Actions caches. Checkout
-          # otherwise writes it into .git/config, where a PR's own build.rs or
-          # proc-macro could read it back out.
+          # Checkout otherwise writes the token into .git/config, where a PR's
+          # own build.rs or proc-macro could read it back out.
           persist-credentials: false
 
       - name: Setup Rust environment
@@ -191,6 +206,9 @@ jobs:
           cache-shared-key: ci-dev
           cache-save-if: 'false'
           install-build-packaging-tools: 'false'
+
+      - name: Protect Connect test home
+        run: chmod go-w "$(realpath "$HOME")"
 
       - name: Prepare test evidence
         run: |
@@ -290,6 +308,9 @@ jobs:
           } > artifacts/test-and-lint/doctest-diagnostics.txt
           exit "${status}"
 
+      - name: Check offline enrollment E2E root boundary
+        run: ./scripts/check_offline_enrollment_e2e.sh
+
       - name: Upload test reports and diagnostics
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
@@ -324,41 +345,36 @@ jobs:
       - name: Run rebalance/decommission migration proofs
         run: ./scripts/check_migration_gate_count.sh
 
-      # Early stop. Once this job has failed the PR cannot merge, so the sibling
-      # lanes are burning runners on a result nobody can act on: on run
-      # 30674613104 three lanes had already failed while Test and Lint and the
-      # rio-v2 variant kept going past 70 minutes.
-      #
-      # Only this job may cancel. The lanes that are NOT required checks
-      # (protocols, ILM, e2e, s3-tests) must never hold that power: a flake in
-      # one of them would turn the required "Test and Lint" into `cancelled`,
-      # which blocks the merge. Today a maintainer can merge with sftp red, and
-      # that has to stay true.
-      #
-      # These steps run last so the `if: always()` artifact upload above still
-      # captures logs and diagnostics before the run goes away.
+      # Record the reason before this job completes as FAILURE. A separate
+      # dependent job cancels sibling lanes only after GitHub has preserved this
+      # required check's failure verdict.
       - name: Annotate early-stop reason
-        if: failure() && github.event_name == 'pull_request'
-        run: |
-          {
-            echo "## CI early-stop"
-            echo "Job \`${GITHUB_JOB}\` (Test and Lint) failed; cancelling run ${GITHUB_RUN_ID} to free runners."
-            echo "Sibling jobs showing **cancelled** were stopped by this job, not by their own failure."
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      # curl rather than `gh`: every existing `gh` call in this repo runs on
-      # ubuntu-latest, and the sm-standard-* images are custom and trimmed (they
-      # ship no C toolchain, see the e2e job below), so `gh` is not known to
-      # exist here.
-      #
-      # Fork PRs are excluded explicitly instead of relying on the error path:
-      # their GITHUB_TOKEN is forced read-only and job-level permissions cannot
-      # raise it, so the call would always 403. Skipping keeps their logs clean.
-      - name: Cancel run on failure (same-repo PR only)
         if: >-
           failure() && github.event_name == 'pull_request'
           && github.event.pull_request.head.repo.full_name == github.repository
-        continue-on-error: true
+        run: |
+          {
+            echo "## CI early-stop"
+            echo "Job \`${GITHUB_JOB}\` (Test and Lint) failed; a follow-up job will cancel sibling lanes to free runners."
+            echo "Sibling jobs showing **cancelled** were stopped by the early-stop follow-up, not by their own failure."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Preserve the required Test and Lint FAILURE verdict before stopping sibling
+  # lanes. Cancelling from inside test-and-lint changed its own conclusion to
+  # CANCELLED and hid the actionable failure in the PR checks UI.
+  cancel-after-test-and-lint-failure:
+    name: Cancel siblings after Test and Lint failure
+    if: >-
+      failure() && needs.test-and-lint.result == 'failure'
+      && github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+    needs: [ test-and-lint ]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Cancel remaining jobs
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -366,7 +382,7 @@ jobs:
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/cancel" || true
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/cancel"
 
   # Dedicated serial lane for the ILM / lifecycle integration tests. These tests
   # drive the object layer through process-global singletons (the GLOBAL_ENV
@@ -383,7 +399,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
     needs: [ quick-checks ]
     runs-on: sm-standard-4
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
@@ -413,17 +429,45 @@ jobs:
       #   - test_noncurrent_{expiry,transition}_still_works_after_immediate_compensation_transition:
       #     noncurrent transition/expiry after an immediate compensation transition.
       - name: Run ignored ILM integration tests serially
+        env:
+          # Match the measured Test and Lint link budget. The default exposed
+          # all 14 pod CPUs and a cold cache spent the full 80m compiling
+          # without starting one ILM test (main run 32982910990).
+          CARGO_BUILD_JOBS: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '3' || '2' }}
         run: |
-          cargo nextest run -j1 --run-ignored ignored-only \
+          mkdir -p artifacts/ilm-integration
+          set +e
+          NEXTEST_HIDE_PROGRESS_BAR=1 timeout --verbose --signal=TERM --kill-after=30s 80m \
+            cargo nextest run -j1 --run-ignored ignored-only \
             -p rustfs-scanner -p rustfs \
-            -E '(binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))) and not (test(test_noncurrent_expiry_still_works_after_immediate_compensation_transition) or test(test_noncurrent_transition_still_works_after_immediate_compensation_transition))'
+            -E '(binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))) and not (test(test_noncurrent_expiry_still_works_after_immediate_compensation_transition) or test(test_noncurrent_transition_still_works_after_immediate_compensation_transition))' \
+            --status-level all --final-status-level all \
+            2>&1 | tee artifacts/ilm-integration/nextest.log
+          status=${PIPESTATUS[0]}
+          {
+            echo "exit_status=${status}"
+            echo "finished_at=$(date --utc --iso-8601=seconds)"
+            echo
+            echo "Remaining test-related processes:"
+            pgrep -af 'cargo|nextest|target/.*/deps/' || true
+          } > artifacts/ilm-integration/diagnostics.txt
+          exit "${status}"
+
+      - name: Upload ILM test diagnostics
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ilm-integration-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            artifacts/ilm-integration
+            target/nextest/ci/junit.xml
 
   test-and-lint-rio-v2:
     name: Test and Lint (rio-v2)
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
     needs: [ quick-checks ]
     runs-on: sm-standard-4
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
@@ -440,20 +484,89 @@ jobs:
           cache-save-if: 'false'
           install-build-packaging-tools: 'false'
 
+      - name: Protect Connect test home
+        run: chmod go-w "$(realpath "$HOME")"
+
       - name: Run rio-v2 clippy lints
         run: cargo clippy -p rustfs -p rustfs-ecstore --all-targets --features rio-v2 -- -D warnings
 
       - name: Run rio-v2 feature tests
+        env:
+          # Match the main nextest lane's #5394 link-I/O guard. A cold feature
+          # cache otherwise fans out enough rust-lld processes to exhaust this
+          # job's 90-minute budget before any test starts.
+          CARGO_BUILD_JOBS: "2"
         run: |
-          cargo nextest run -p rustfs -p rustfs-ecstore --features rio-v2
+          # --profile ci so the quarantine list (and its junit flaky markers)
+          # covers this leg too; the default profile is the local no-retry
+          # profile and silently ignored quarantined flakes here (rustfs#6703).
+          cargo nextest run --profile ci -p rustfs -p rustfs-ecstore --features rio-v2
           cargo test -p rustfs --doc --features rio-v2
+
+  connect-short-credential-boundary:
+    name: Connect Short Credential Boundary
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    needs: [ quick-checks ]
+    runs-on: sm-standard-4
+    timeout-minutes: 60
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-dev
+          cache-save-if: 'false'
+          install-build-packaging-tools: 'false'
+          install-test-tools: 'false'
+
+      - name: Run short credential behavior tests
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          cargo test -p rustfs --test connect_registration \
+            --features connect-e2e-short-credentials \
+            registration_enforces_build_profile_credential_lifetime -- --exact
+          cargo test -p rustfs --test connect_registration \
+            --features connect-e2e-short-credentials \
+            rotation_waits_for_threshold_and_stops_on_revocation -- --exact
+
+      - name: Reject short credentials in release builds
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          log="$(mktemp)"
+          set +e
+          CARGO_TERM_COLOR=never cargo check -p rustfs --release \
+            --features connect-e2e-short-credentials >"$log" 2>&1
+          status=$?
+          set -e
+          cat "$log"
+          expected='error: connect-e2e-short-credentials is restricted to debug builds'
+          summary="error: could not compile \`rustfs\` (lib) due to 1 previous error"
+          expected_count="$(grep -Fxc "$expected" "$log" || true)"
+          summary_count="$(grep -Fc "$summary" "$log" || true)"
+          error_count="$(grep -Ec '^error(:|\[)' "$log" || true)"
+          if [ "$status" -ne 101 ] || [ "$expected_count" -ne 1 ] \
+            || [ "$summary_count" -ne 1 ] || [ "$error_count" -ne 2 ]; then
+            echo "release feature gate did not fail solely at the expected compile_error" >&2
+            rm -f "$log"
+            exit 1
+          fi
+          rm -f "$log"
 
   test-and-lint-protocols:
     name: "Test and Lint (${{ matrix.features.name }})"
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
     needs: [ quick-checks ]
     runs-on: sm-standard-4
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       # On a PR, one failing protocol leg is enough to know the PR is not ready,
       # so stop the sibling leg instead of paying another ~40 minutes for it.
@@ -484,13 +597,23 @@ jobs:
           cache-save-if: 'false'
           install-build-packaging-tools: 'false'
 
+      - name: Protect Connect test home
+        run: chmod go-w "$(realpath "$HOME")"
+
       - name: Run clippy with ${{ matrix.features.name }}
         run: |
           cargo clippy -p rustfs -p rustfs-protocols --all-targets ${{ matrix.features.flags }} -- -D warnings
 
       - name: Run tests with ${{ matrix.features.name }}
+        env:
+          # Keep feature-test linking under the same bounded concurrency as the
+          # main nextest lane; Clippy is metadata-only and needs no such limit.
+          CARGO_BUILD_JOBS: "2"
         run: |
-          cargo nextest run -p rustfs -p rustfs-protocols ${{ matrix.features.flags }}
+          # --profile ci so the quarantine list (and its junit flaky markers)
+          # covers this leg too; the default profile is the local no-retry
+          # profile and silently ignored quarantined flakes here (rustfs#6703).
+          cargo nextest run --profile ci -p rustfs -p rustfs-protocols ${{ matrix.features.flags }}
 
   build-rustfs-debug-binary:
     name: Build RustFS Debug Binary
@@ -527,7 +650,12 @@ jobs:
 
   build-rustfs-debug-binary-rio-v2:
     name: Build RustFS Debug Binary (rio-v2)
-    if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    # Dormant rio-v2 variant (rustfs/backlog#1835): the feature ships in no
+    # default build, so this full-suite lane runs only on the weekly schedule
+    # and manual dispatch. Per-PR cfg-seam coverage stays with
+    # test-and-lint-rio-v2. Lifecycle and the promote-or-delete condition:
+    # docs/architecture/minio-file-format-compat.md ("rio-v2 variant lifecycle").
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     needs: [ quick-checks ]
     runs-on: sm-standard-4
     timeout-minutes: 30
@@ -656,6 +784,19 @@ jobs:
           cache-save-if: 'false'
           install-build-packaging-tools: 'false'
 
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install awscurl
+        run: |
+          python3 -m pip install --user --upgrade pip "awscurl==0.44"
+          echo "AWSCURL_PATH=$HOME/.local/bin/awscurl" >> "$GITHUB_ENV"
+
+      - name: Verify awscurl
+        run: test -x "$AWSCURL_PATH"
+
       # Download after the cache restore so the freshly built binary from the
       # build job always wins over anything restored into target/debug.
       - name: Download debug binary
@@ -667,9 +808,9 @@ jobs:
       - name: Make binary executable
         run: chmod +x ./target/debug/zffs
 
-      # Build the e2e test graph once. The archive is reused by the security
-      # count-floor check and the smoke run below, avoiding a second compile of
-      # the same e2e_test target on cold runners (backlog#1645).
+      # Build the e2e test graph once. The archive is reused by the smoke
+      # selection guard, security exact-count check, and run below, avoiding a
+      # second compile of the same e2e_test target on cold runners (backlog#1645).
       - name: Archive e2e smoke test binaries
         env:
           NEXTEST_ARCHIVE: ${{ runner.temp }}/rustfs-e2e-smoke.tar.zst
@@ -677,6 +818,7 @@ jobs:
         run: |
           cargo nextest archive --profile e2e-smoke -p e2e_test --archive-file "${NEXTEST_ARCHIVE}"
           cargo nextest list --profile e2e-smoke --archive-file "${NEXTEST_ARCHIVE}" --message-format json > "${NEXTEST_LISTING}"
+          python3 ./scripts/check_test_wiring.py --check-profile e2e-smoke "${NEXTEST_LISTING}"
           ./scripts/check_security_smoke_count.sh check "${NEXTEST_LISTING}"
 
       # PR smoke subset of the in-repo e2e suite (backlog#1149 ci-4). The
@@ -741,7 +883,7 @@ jobs:
     # suites — KMS, object_lock, multipart_auth, quota, checksum, encryption,
     # security-boundary, ... — via the e2e-full nextest profile. Too heavy for
     # every PR, so it is gated to main pushes, the merge queue, and manual
-    # dispatch. protocols / the 6 cluster suites / replication / #[ignore] are
+    # dispatch. protocols / the 7 cluster suites / replication / #[ignore] are
     # owned by other lanes (see .config/nextest.toml profile.e2e-full).
     if: >-
       github.event_name == 'workflow_dispatch' ||
@@ -764,6 +906,46 @@ jobs:
           cache-save-if: 'false'
           install-build-packaging-tools: 'false'
 
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install awscurl
+        run: |
+          python3 -m pip install --user --upgrade pip "awscurl==0.44"
+          echo "AWSCURL_PATH=$HOME/.local/bin/awscurl" >> "$GITHUB_ENV"
+
+      - name: Verify awscurl
+        run: test -x "$AWSCURL_PATH"
+
+      - name: Install mc
+        env:
+          MC_VERSION: RELEASE.2025-08-13T08-35-41Z
+          MC_SHA256: 01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891
+        run: |
+          MC_BINARY="mc.linux-amd64.${MC_VERSION}"
+          curl -fsSLo "$RUNNER_TEMP/mc" "https://github.com/minio/mc/releases/download/${MC_VERSION}/${MC_BINARY}"
+          echo "${MC_SHA256}  $RUNNER_TEMP/mc" | sha256sum --check --status
+          chmod +x "$RUNNER_TEMP/mc"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Verify mc
+        run: mc --version
+
+      - name: Install Vault
+        run: |
+          VAULT_VERSION="1.17.6"
+          VAULT_ARCHIVE="vault_${VAULT_VERSION}_linux_amd64.zip"
+          curl -fsSLo "$RUNNER_TEMP/$VAULT_ARCHIVE" "https://releases.hashicorp.com/vault/${VAULT_VERSION}/${VAULT_ARCHIVE}"
+          echo "0cddc1fbbb88583b5ba5b845f9f8fae47c6fb39a6d48cd543c6ba6fd3ac1a669  $RUNNER_TEMP/$VAULT_ARCHIVE" | sha256sum --check --status
+          unzip -q "$RUNNER_TEMP/$VAULT_ARCHIVE" -d "$RUNNER_TEMP/vault-bin"
+          echo "RUSTFS_TEST_VAULT_BIN=$RUNNER_TEMP/vault-bin/vault" >> "$GITHUB_ENV"
+
+      - name: Verify Vault
+        run: |
+          "$RUSTFS_TEST_VAULT_BIN" version
+
       # Download after the cache restore so the freshly built binary from the
       # build job always wins over anything restored into target/debug.
       - name: Download debug binary
@@ -774,6 +956,13 @@ jobs:
 
       - name: Make binary executable
         run: chmod +x ./target/debug/zffs
+
+      - name: Verify e2e full membership
+        env:
+          NEXTEST_LISTING: ${{ runner.temp }}/rustfs-e2e-full-list.json
+        run: |
+          cargo nextest list --profile e2e-full -p e2e_test --message-format json > "${NEXTEST_LISTING}"
+          python3 ./scripts/check_test_wiring.py --check-profile e2e-full "${NEXTEST_LISTING}"
 
       # Full single-node e2e lane (backlog#1149 ci-5). The e2e-full
       # default-filter in .config/nextest.toml is the single wiring mechanism —
@@ -787,11 +976,16 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: e2e-full-junit-${{ github.run_number }}
-          path: target/nextest/e2e-full/junit.xml
+          path: |
+            target/nextest/e2e-full/junit.xml
+            ${{ runner.temp }}/rustfs-e2e-full-list.json
           retention-days: 7
 
   e2e-tests-rio-v2:
     name: End-to-End Tests (rio-v2)
+    # Inherits the schedule/dispatch-only gate through needs: on every other
+    # event build-rustfs-debug-binary-rio-v2 is skipped, so this job skips
+    # with it (see the dormant-variant comment on that job).
     needs: [ build-rustfs-debug-binary-rio-v2 ]
     runs-on: sm-standard-2
     timeout-minutes: 30
@@ -971,3 +1165,37 @@ jobs:
           path: artifacts/s3tests-single/**
           if-no-files-found: ignore
           retention-days: 3
+
+  alert-on-failure:
+    name: Alert on scheduled failure
+    needs:
+      - typos
+      - quick-checks
+      - test-and-lint
+      - test-ilm-integration-serial
+      - test-and-lint-rio-v2
+      - test-and-lint-protocols
+      - build-rustfs-debug-binary
+      - build-rustfs-debug-binary-rio-v2
+      - uring-integration
+      - e2e-tests
+      - e2e-full
+      - e2e-tests-rio-v2
+      - s3-implemented-tests
+      - s3-lifecycle-behavior-tests
+    if: >-
+      always() && github.event_name == 'schedule' &&
+      (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Open or update failure-tracking issue
+        uses: ./.github/actions/schedule-failure-issue
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}

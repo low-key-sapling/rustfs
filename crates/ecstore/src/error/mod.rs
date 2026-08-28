@@ -13,13 +13,12 @@
 // limitations under the License.
 
 // #730: error taxonomy still exposes compatibility variants while callers move to contracts.
-#![allow(dead_code)]
 
 use crate::bucket::error::BucketMetadataError;
 use crate::disk::error::DiskError;
 use crate::storage_api_contracts::{error::StorageErrorCode, range::HTTPRangeError};
 use rustfs_utils::path::decode_dir_object;
-use s3s::{S3Error, S3ErrorCode};
+use s3s::S3ErrorCode;
 
 pub type Error = StorageError;
 pub type Result<T> = core::result::Result<T, Error>;
@@ -120,6 +119,8 @@ pub enum StorageError {
     BucketExists(String),
     #[error("Bucket not empty: {0}")]
     BucketNotEmpty(String),
+    #[error("Bucket not empty: {bucket} ({details})")]
+    BucketNotEmptyWithDetails { bucket: String, details: String },
     #[error("Bucket name invalid: {0}")]
     BucketNameInvalid(String),
 
@@ -156,6 +157,8 @@ pub enum StorageError {
     InvalidPartNumber(usize),
     #[error("Your proposed upload is smaller than the minimum allowed size. Part {0} size {1} is less than minimum {2}")]
     EntityTooSmall(usize, i64, i64),
+    #[error("multipart upload size {0} exceeds the configured limit {1}")]
+    EntityTooLarge(u64, u64),
 
     // ── Erasure / Quorum ─────────────────────────────────────────────
     #[error("erasure read quorum")]
@@ -204,6 +207,8 @@ pub enum StorageError {
         required: usize,
         achieved: usize,
     },
+    #[error("Bucket quota exceeded. Current usage: {current} bytes, limit: {limit} bytes")]
+    QuotaExceeded { current: u64, limit: u64 },
 
     // ── Generic ──────────────────────────────────────────────────────
     #[error("Unexpected error")]
@@ -218,6 +223,21 @@ pub enum StorageError {
     Io(#[source] std::io::Error),
     #[error("Lock error: {0}")]
     Lock(#[from] rustfs_lock::LockError),
+
+    /// Internode RPC client acquisition failed. Mirrors
+    /// `DiskError::RemoteClientUnavailable`: the detail is diagnostic only and
+    /// excluded from equality/hashing so same-cause failures bucket together
+    /// during quorum aggregation (backlog#1845).
+    #[error("remote rpc client unavailable: {0}")]
+    RemoteClientUnavailable(String),
+
+    /// A peer answered a control-plane RPC but its storage/IAM layer is not
+    /// initialized yet. Typed form of the legacy "errServerNotInitialized"
+    /// error_info string (backlog#1845); the wire carries it as
+    /// `ControlPlaneErrorCode::ControlPlaneErrorNotInitialized` alongside the
+    /// legacy string for rolling-upgrade compatibility.
+    #[error("remote peer not initialized")]
+    RemoteNotInitialized,
 }
 
 impl From<crate::erasure::coding::ErasureConstructionError> for StorageError {
@@ -312,13 +332,25 @@ impl From<DiskError> for StorageError {
             DiskError::SourceStalled => StorageError::SourceStalled,
             DiskError::Timeout => StorageError::Timeout,
             DiskError::InvalidPath => StorageError::InvalidPath,
+            DiskError::RemoteClientUnavailable(detail) => StorageError::RemoteClientUnavailable(detail),
         }
     }
 }
 
-impl From<StorageError> for DiskError {
-    fn from(val: StorageError) -> Self {
-        match val {
+impl StorageError {
+    /// Narrow a store-layer error to the disk-layer vocabulary.
+    ///
+    /// This used to be a blanket `impl From<StorageError> for DiskError`, which
+    /// let `?` silently push store-only errors across the disk boundary into
+    /// `DiskError::other`, fragmenting `reduce_errs` quorum buckets
+    /// (backlog#1845). Narrowing is now a named, fallible operation: variants
+    /// with a disk-layer identity map across (including two documented lossy
+    /// collapses kept for compatibility — `SlowDown` → `TooManyOpenFiles` and
+    /// `StorageFull` → `DiskFull`, pinned by conversion_roundtrip_tests), and
+    /// everything else comes back as `Err(self)` so the caller decides what
+    /// crossing the boundary means for it.
+    pub fn narrow_to_disk(self) -> core::result::Result<DiskError, StorageError> {
+        Ok(match self {
             StorageError::Io(io_error) => io_error.into(),
             StorageError::Unexpected => DiskError::Unexpected,
             StorageError::FileNotFound => DiskError::FileNotFound,
@@ -356,8 +388,34 @@ impl From<StorageError> for DiskError {
             StorageError::VolumeNotFound => DiskError::VolumeNotFound,
             StorageError::VolumeExists => DiskError::VolumeExists,
             StorageError::FileNameTooLong => DiskError::FileNameTooLong,
-            _ => DiskError::other(val),
-        }
+            StorageError::FaultyRemoteDisk => DiskError::FaultyRemoteDisk,
+            StorageError::DiskAccessDenied => DiskError::DiskAccessDenied,
+            StorageError::DriveIsRoot => DiskError::DriveIsRoot,
+            StorageError::IsNotRegular => DiskError::IsNotRegular,
+            StorageError::VolumeNotEmpty => DiskError::VolumeNotEmpty,
+            StorageError::VolumeAccessDenied => DiskError::VolumeAccessDenied,
+            StorageError::FileAccessDenied => DiskError::FileAccessDenied,
+            StorageError::RemoteClientUnavailable(detail) => DiskError::RemoteClientUnavailable(detail),
+            val => return Err(val),
+        })
+    }
+
+    /// Same contract as [`StorageError::narrow_to_disk`], for the
+    /// `rustfs_filemeta::Error` vocabulary (formerly a blanket `From` impl
+    /// with an `other()` catch-all). No production path currently narrows in
+    /// this direction; the named form keeps future callers deliberate.
+    pub fn narrow_to_filemeta(self) -> core::result::Result<rustfs_filemeta::Error, StorageError> {
+        Ok(match self {
+            StorageError::Unexpected => rustfs_filemeta::Error::Unexpected,
+            StorageError::FileNotFound => rustfs_filemeta::Error::FileNotFound,
+            StorageError::FileVersionNotFound => rustfs_filemeta::Error::FileVersionNotFound,
+            StorageError::FileCorrupt => rustfs_filemeta::Error::FileCorrupt,
+            StorageError::DoneForNow => rustfs_filemeta::Error::DoneForNow,
+            StorageError::MethodNotAllowed => rustfs_filemeta::Error::MethodNotAllowed,
+            StorageError::VolumeNotFound => rustfs_filemeta::Error::VolumeNotFound,
+            StorageError::Io(io_error) => io_error.into(),
+            val => return Err(val),
+        })
     }
 }
 
@@ -410,22 +468,6 @@ impl From<rustfs_filemeta::Error> for StorageError {
             rustfs_filemeta::Error::Unexpected => StorageError::Unexpected,
             rustfs_filemeta::Error::Io(io_error) => io_error.into(),
             _ => StorageError::Io(std::io::Error::other(e)),
-        }
-    }
-}
-
-impl From<StorageError> for rustfs_filemeta::Error {
-    fn from(val: StorageError) -> Self {
-        match val {
-            StorageError::Unexpected => rustfs_filemeta::Error::Unexpected,
-            StorageError::FileNotFound => rustfs_filemeta::Error::FileNotFound,
-            StorageError::FileVersionNotFound => rustfs_filemeta::Error::FileVersionNotFound,
-            StorageError::FileCorrupt => rustfs_filemeta::Error::FileCorrupt,
-            StorageError::DoneForNow => rustfs_filemeta::Error::DoneForNow,
-            StorageError::MethodNotAllowed => rustfs_filemeta::Error::MethodNotAllowed,
-            StorageError::VolumeNotFound => rustfs_filemeta::Error::VolumeNotFound,
-            StorageError::Io(io_error) => io_error.into(),
-            _ => rustfs_filemeta::Error::other(val),
         }
     }
 }
@@ -485,6 +527,10 @@ impl Clone for StorageError {
             StorageError::MethodNotAllowed => StorageError::MethodNotAllowed,
             StorageError::BucketNotFound(a) => StorageError::BucketNotFound(a.clone()),
             StorageError::BucketNotEmpty(a) => StorageError::BucketNotEmpty(a.clone()),
+            StorageError::BucketNotEmptyWithDetails { bucket, details } => StorageError::BucketNotEmptyWithDetails {
+                bucket: bucket.clone(),
+                details: details.clone(),
+            },
             StorageError::BucketNameInvalid(a) => StorageError::BucketNameInvalid(a.clone()),
             StorageError::ObjectNameInvalid(a, b) => StorageError::ObjectNameInvalid(a.clone(), b.clone()),
             StorageError::BucketExists(a) => StorageError::BucketExists(a.clone()),
@@ -510,6 +556,7 @@ impl Clone for StorageError {
             StorageError::DecommissionNotStarted => StorageError::DecommissionNotStarted,
             StorageError::InvalidPart(a, b, c) => StorageError::InvalidPart(*a, b.clone(), c.clone()),
             StorageError::EntityTooSmall(a, b, c) => StorageError::EntityTooSmall(*a, *b, *c),
+            StorageError::EntityTooLarge(a, b) => StorageError::EntityTooLarge(*a, *b),
             StorageError::DoneForNow => StorageError::DoneForNow,
             StorageError::DecommissionAlreadyRunning => StorageError::DecommissionAlreadyRunning,
             StorageError::RebalanceAlreadyRunning => StorageError::RebalanceAlreadyRunning,
@@ -540,6 +587,12 @@ impl Clone for StorageError {
                 required: *required,
                 achieved: *achieved,
             },
+            StorageError::QuotaExceeded { current, limit } => StorageError::QuotaExceeded {
+                current: *current,
+                limit: *limit,
+            },
+            StorageError::RemoteClientUnavailable(detail) => StorageError::RemoteClientUnavailable(detail.clone()),
+            StorageError::RemoteNotInitialized => StorageError::RemoteNotInitialized,
         }
     }
 }
@@ -588,7 +641,7 @@ impl StorageError {
             StorageError::InvalidArgument(_, _, _) => StorageErrorCode::InvalidArgument,
             StorageError::MethodNotAllowed => StorageErrorCode::MethodNotAllowed,
             StorageError::BucketNotFound(_) => StorageErrorCode::BucketNotFound,
-            StorageError::BucketNotEmpty(_) => StorageErrorCode::BucketNotEmpty,
+            StorageError::BucketNotEmpty(_) | StorageError::BucketNotEmptyWithDetails { .. } => StorageErrorCode::BucketNotEmpty,
             StorageError::BucketNameInvalid(_) => StorageErrorCode::BucketNameInvalid,
             StorageError::ObjectNameInvalid(_, _) => StorageErrorCode::ObjectNameInvalid,
             StorageError::BucketExists(_) => StorageErrorCode::BucketExists,
@@ -623,10 +676,14 @@ impl StorageError {
             StorageError::InsufficientWriteQuorum(_, _) => StorageErrorCode::InsufficientWriteQuorum,
             StorageError::PreconditionFailed => StorageErrorCode::PreconditionFailed,
             StorageError::EntityTooSmall(_, _, _) => StorageErrorCode::EntityTooSmall,
+            StorageError::EntityTooLarge(_, _) => StorageErrorCode::EntityTooLarge,
             StorageError::InvalidRangeSpec(_) => StorageErrorCode::InvalidRangeSpec,
             StorageError::NotModified => StorageErrorCode::NotModified,
             StorageError::InvalidPartNumber(_) => StorageErrorCode::InvalidPartNumber,
             StorageError::NamespaceLockQuorumUnavailable { .. } => StorageErrorCode::NamespaceLockQuorumUnavailable,
+            StorageError::QuotaExceeded { .. } => StorageErrorCode::QuotaExceeded,
+            StorageError::RemoteClientUnavailable(_) => StorageErrorCode::RemoteClientUnavailable,
+            StorageError::RemoteNotInitialized => StorageErrorCode::RemoteNotInitialized,
         }
     }
 
@@ -742,6 +799,7 @@ impl StorageError {
             StorageErrorCode::EntityTooSmall => {
                 Some(StorageError::EntityTooSmall(Default::default(), Default::default(), Default::default()))
             }
+            StorageErrorCode::EntityTooLarge => Some(StorageError::EntityTooLarge(Default::default(), Default::default())),
             StorageErrorCode::InvalidRangeSpec => Some(StorageError::InvalidRangeSpec(Default::default())),
             StorageErrorCode::NotModified => Some(StorageError::NotModified),
             StorageErrorCode::InvalidPartNumber => Some(StorageError::InvalidPartNumber(Default::default())),
@@ -752,6 +810,12 @@ impl StorageError {
                 required: Default::default(),
                 achieved: Default::default(),
             }),
+            StorageErrorCode::QuotaExceeded => Some(StorageError::QuotaExceeded {
+                current: Default::default(),
+                limit: Default::default(),
+            }),
+            StorageErrorCode::RemoteClientUnavailable => Some(StorageError::RemoteClientUnavailable(Default::default())),
+            StorageErrorCode::RemoteNotInitialized => Some(StorageError::RemoteNotInitialized),
         }
     }
 }
@@ -884,6 +948,7 @@ pub fn is_err_decommission_running(err: &Error) -> bool {
     matches!(err, &StorageError::DecommissionAlreadyRunning)
 }
 
+#[allow(dead_code, reason = "predicate asserted by this file's tests (backlog#1823)")]
 pub fn is_err_rebalance_running(err: &Error) -> bool {
     matches!(err, &StorageError::RebalanceAlreadyRunning)
 }
@@ -892,12 +957,15 @@ pub fn is_err_operation_canceled(err: &Error) -> bool {
     matches!(err, &StorageError::OperationCanceled)
 }
 
+#[allow(dead_code, reason = "predicate asserted by this file's tests (backlog#1823)")]
 pub fn is_err_not_initialized(err: &Error) -> bool {
-    err.to_string().contains("errServerNotInitialized") || err.to_string().contains("ServerNotInitialized")
-}
-
-pub fn is_err_io(err: &Error) -> bool {
-    matches!(err, &StorageError::Io(_))
+    // Typed-first: peers at or above the ControlPlaneErrorCode change decode to
+    // the typed variant. The substring form only matches legacy peers' string
+    // responses.
+    // RUSTFS_COMPAT_TODO(not-initialized-error-code-v1): substring fallback for peers that predate the typed wire code. Remove after the minimum supported RustFS peer version always sends error_code.
+    matches!(err, StorageError::RemoteNotInitialized)
+        || err.to_string().contains("errServerNotInitialized")
+        || err.to_string().contains("ServerNotInitialized")
 }
 
 /// Strict "not found" predicate that only matches genuine object/version/volume
@@ -1060,21 +1128,6 @@ pub struct GenericError {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ObjectApiError {
-    #[error("Operation timed out")]
-    OperationTimedOut,
-
-    #[error("etag of the object has changed")]
-    InvalidETag,
-
-    #[error("BackendDown")]
-    BackendDown(String),
-
-    #[error("Unsupported headers in Metadata")]
-    UnsupportedMetadata,
-
-    #[error("Method not allowed: {}/{}", .0.bucket, .0.object)]
-    MethodNotAllowed(GenericError),
-
     #[error("The operation is not valid for the current state of the object {}/{}({})", .0.bucket, .0.object, .0.version_id)]
     InvalidObjectState(GenericError),
 }
@@ -1091,95 +1144,8 @@ pub struct ErrorResponse {
     pub host_id: String,
 }
 
-pub fn error_resp_to_object_err(err: ErrorResponse, params: Vec<&str>) -> std::io::Error {
-    let mut bucket = "";
-    let mut object = "";
-    let mut version_id = "";
-    if !params.is_empty() {
-        bucket = params[0];
-    }
-    if params.len() >= 2 {
-        object = params[1];
-    }
-    if params.len() >= 3 {
-        version_id = params[2];
-    }
-
-    if is_network_or_host_down(&err.to_string(), false) {
-        return std::io::Error::other(ObjectApiError::BackendDown(format!("{err}")));
-    }
-
-    let err_ = std::io::Error::other(err.to_string());
-    let r_err = err;
-    let err;
-    let bucket = bucket.to_string();
-    let object = object.to_string();
-    let version_id = version_id.to_string();
-
-    match r_err.code {
-        S3ErrorCode::BucketNotEmpty => {
-            err = std::io::Error::other(StorageError::BucketNotEmpty("".to_string()).to_string());
-        }
-        S3ErrorCode::InvalidBucketName => {
-            err = std::io::Error::other(StorageError::BucketNameInvalid(bucket));
-        }
-        S3ErrorCode::InvalidPart => {
-            err = std::io::Error::other(StorageError::InvalidPart(0, bucket, object /* , version_id */));
-        }
-        S3ErrorCode::NoSuchBucket => {
-            err = std::io::Error::other(StorageError::BucketNotFound(bucket));
-        }
-        S3ErrorCode::NoSuchKey => {
-            if !object.is_empty() {
-                err = std::io::Error::other(StorageError::ObjectNotFound(bucket, object));
-            } else {
-                err = std::io::Error::other(StorageError::BucketNotFound(bucket));
-            }
-        }
-        S3ErrorCode::NoSuchVersion => {
-            if !object.is_empty() {
-                err = std::io::Error::other(StorageError::ObjectNotFound(bucket, object)); //, version_id);
-            } else {
-                err = std::io::Error::other(StorageError::BucketNotFound(bucket));
-            }
-        }
-        S3ErrorCode::AccessDenied => {
-            err = std::io::Error::other(StorageError::PrefixAccessDenied(bucket, object));
-        }
-        S3ErrorCode::NoSuchUpload => {
-            err = std::io::Error::other(StorageError::InvalidUploadID(bucket, object, version_id));
-        }
-        _ => {
-            err = err_;
-        }
-    }
-
-    err
-}
-
-pub fn storage_to_object_err(err: Error, params: Vec<&str>) -> S3Error {
-    let storage_err = &err;
-    let mut bucket: String = "".to_string();
-    let mut object: String = "".to_string();
-    if !params.is_empty() {
-        bucket = params[0].to_string();
-    }
-    if params.len() >= 2 {
-        object = decode_dir_object(params[1]);
-    }
-    match storage_err {
-        StorageError::MethodNotAllowed => S3Error::with_message(
-            S3ErrorCode::MethodNotAllowed,
-            ObjectApiError::MethodNotAllowed(GenericError {
-                bucket,
-                object,
-                ..Default::default()
-            })
-            .to_string(),
-        ),
-        _ => s3s::S3Error::with_message(S3ErrorCode::Custom("err".into()), err.to_string()),
-    }
-}
+#[cfg(test)]
+mod conversion_roundtrip_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1204,6 +1170,14 @@ mod tests {
             .source()
             .expect("construction error must expose the encoder error");
         assert!(encoder_source.is::<reed_solomon_erasure::Error>());
+    }
+
+    // The lifecycle transition worker relies on this arm alone to suppress the
+    // closed-connection noise (`bucket_lifecycle_ops.rs`); dropping it here would
+    // silently turn shutdown races back into `error!` log spam.
+    #[test]
+    fn is_network_or_host_down_covers_closed_network_connection() {
+        assert!(is_network_or_host_down("transition failed: use of closed network connection", false));
     }
 
     // Regression for #952 (ECA-11): an all-`DiskNotFound` slice (every drive in
@@ -1301,6 +1275,7 @@ mod tests {
             .to_u32(),
             0x42
         );
+        assert_eq!(StorageError::QuotaExceeded { current: 1, limit: 2 }.to_u32(), 0x53);
     }
 
     #[test]
@@ -1318,6 +1293,10 @@ mod tests {
         assert!(matches!(
             StorageError::from_u32(0x42),
             Some(StorageError::NamespaceLockQuorumUnavailable { .. })
+        ));
+        assert!(matches!(
+            StorageError::from_u32(0x53),
+            Some(StorageError::QuotaExceeded { current: 0, limit: 0 })
         ));
 
         // Test invalid code returns None
@@ -1476,6 +1455,51 @@ mod tests {
         }
     }
 
+    // Every DiskError variant must survive DiskError -> StorageError -> DiskError
+    // unchanged. A variant that degrades to `DiskError::Io` on the way back loses
+    // its identity for quorum aggregation (`reduce_errs` classifies by variant
+    // equality), so ignore-list entries such as FaultyRemoteDisk and
+    // DiskAccessDenied would silently stop matching.
+    #[test]
+    fn test_disk_error_storage_error_round_trip_identity_all_variants() {
+        // DiskError codes are contiguous from 0x01, so enumerating via from_u32
+        // covers every variant and picks up newly appended ones automatically.
+        let all_variants: Vec<DiskError> = (1u32..).map_while(DiskError::from_u32).collect();
+        assert!(
+            all_variants.len() >= 42,
+            "DiskError variant enumeration shrank: got {}, expected at least 42",
+            all_variants.len()
+        );
+
+        for original in all_variants {
+            let storage_error: StorageError = original.clone().into();
+            let round_tripped: DiskError = storage_error
+                .narrow_to_disk()
+                .expect("every disk-representable StorageError must narrow back");
+
+            assert_eq!(
+                std::mem::discriminant(&original),
+                std::mem::discriminant(&round_tripped),
+                "round trip changed variant: {original:?} -> {round_tripped:?}"
+            );
+            assert_eq!(original, round_tripped, "round trip not identical for {original:?}");
+        }
+
+        // Io is the only payload-carrying variant: a representative kind and
+        // message must both survive the round trip.
+        let io_original = DiskError::Io(IoError::new(ErrorKind::PermissionDenied, "denied"));
+        let storage_error: StorageError = io_original.clone().into();
+        let io_round_tripped: DiskError = storage_error.narrow_to_disk().expect("Io narrows through the bridge");
+        assert_eq!(io_original, io_round_tripped);
+        match io_round_tripped {
+            DiskError::Io(inner) => {
+                assert_eq!(inner.kind(), ErrorKind::PermissionDenied);
+                assert_eq!(inner.to_string(), "denied");
+            }
+            other => panic!("expected DiskError::Io, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_storage_error_from_io_error() {
         // Test direct IO error conversion
@@ -1549,6 +1573,7 @@ mod tests {
             StorageError::DecommissionAlreadyRunning,
             StorageError::RebalanceAlreadyRunning,
             StorageError::OperationCanceled,
+            StorageError::QuotaExceeded { current: 1, limit: 2 },
         ];
 
         for original_error in test_errors {
@@ -1712,8 +1737,13 @@ mod tests {
             assert_eq!(converted_storage_error, expected_storage_error);
 
             // Test reverse conversion
-            let converted_back: rustfs_filemeta::Error = converted_storage_error.into();
-            assert_eq!(converted_back, expected_storage_error.into());
+            let converted_back: rustfs_filemeta::Error = converted_storage_error
+                .narrow_to_filemeta()
+                .expect("matched variants must narrow to filemeta");
+            let expected_back: rustfs_filemeta::Error = expected_storage_error
+                .narrow_to_filemeta()
+                .expect("matched variants must narrow to filemeta");
+            assert_eq!(converted_back, expected_back);
         }
     }
 

@@ -12,7 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::bucket::metadata_sys::get_versioning_config;
+/// Narrow a store error into the filemeta vocabulary for `MetaCacheEntriesSortedResult.err`.
+/// Faithful port of the retired blanket `From<StorageError> for rustfs_filemeta::Error`:
+/// unmatched variants fold into the io-backed `other()`, whose boxed identity the io bridge
+/// recovers on the way back (see conversion_roundtrip_tests).
+fn to_filemeta_err(err: Error) -> rustfs_filemeta::Error {
+    err.narrow_to_filemeta().unwrap_or_else(rustfs_filemeta::Error::other)
+}
+
+use crate::bucket::metadata_sys::{get_versioning_config, has_authoritative_never_versioned_state};
 use crate::bucket::utils::check_list_objs_args;
 use crate::bucket::versioning::VersioningApi;
 use crate::cache_value::metacache_set::{FallbackClaimTracker, ListPathRawOptions, list_path_raw_with_claim_tracker};
@@ -34,7 +42,7 @@ use crate::storage_api_contracts::{
 };
 use crate::store::ECStore;
 use crate::store::utils::is_reserved_or_invalid_bucket;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use base64_simd::STANDARD as BASE64_STANDARD;
 use bytes::Bytes;
 use futures::future::join_all;
 use rand::seq::SliceRandom;
@@ -261,6 +269,9 @@ pub struct ListPathOptions {
     // InclDeleted will keep all entries where latest version is a delete marker.
     pub incl_deleted: bool,
 
+    // Authoritative bucket metadata proves that delete markers cannot exist.
+    pub skip_hidden_prefix_check: bool,
+
     // Scan recursively.
     // If false only main directory will be scanned.
     // Should always be true if Separator is n SlashSeparator.
@@ -293,6 +304,16 @@ pub struct ListPathOptions {
     pub walkdir_stall_timeout: Option<Duration>,
 }
 
+async fn can_skip_hidden_prefix_check(options: &ListPathOptions) -> bool {
+    if options.recursive || options.incl_deleted || options.versioned {
+        return false;
+    }
+
+    has_authoritative_never_versioned_state(&options.bucket)
+        .await
+        .unwrap_or(false)
+}
+
 const MARKER_TAG_VERSION: &str = "v2";
 const LEGACY_MARKER_TAG_VERSIONS: &[&str] = &["v1", MARKER_TAG_VERSION];
 const LIST_CACHE_MARKER_PREFIX: &str = "[rustfs_cache:";
@@ -309,9 +330,17 @@ const ENV_API_LIST_OBJECTS_INDEX_PROVIDER: &str = "RUSTFS_LIST_OBJECTS_INDEX_PRO
 const ENV_API_LIST_OBJECTS_INDEX_PROVIDER_PATH: &str = "RUSTFS_LIST_OBJECTS_INDEX_PROVIDER_PATH";
 const ENV_API_LIST_OBJECTS_INDEX_PROVIDER_GENERATION: &str = "RUSTFS_LIST_OBJECTS_INDEX_PROVIDER_GENERATION";
 const ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH: &str = "RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH";
+// The chaos machinery below is compiled only for tests and the opt-in
+// `list-chaos` feature (backlog#1832): a production binary without the
+// feature carries no chaos symbols, so the two env vars cannot silently
+// rewrite a bucket's namespace-journal state.
+#[cfg(any(test, feature = "list-chaos"))]
 const ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED: &str = "RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED";
+#[cfg(any(test, feature = "list-chaos"))]
 const ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_BUCKET: &str = "RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_BUCKET";
+#[cfg(any(test, feature = "list-chaos"))]
 const ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_SEQUENCE: &str = "RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_SEQUENCE";
+#[cfg(any(test, feature = "list-chaos"))]
 const ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS: &str = "RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS";
 const ENV_API_LIST_OBJECTS_METADATA_FAST_ENABLED: &str = "RUSTFS_LIST_OBJECTS_METADATA_FAST_ENABLED";
 const ENV_API_LIST_OBJECTS_METADATA_FAST_STALENESS_MS: &str = "RUSTFS_LIST_OBJECTS_METADATA_FAST_STALENESS_MS";
@@ -552,7 +581,9 @@ static LIST_OBJECTS_MUTATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static SCANNER_NAMESPACE_MUTATION_GENERATION: AtomicU64 = AtomicU64::new(0);
 static LIST_OBJECTS_BUCKET_MUTATION_SEQUENCE: OnceCell<RwLock<HashMap<String, u64>>> = OnceCell::const_new();
 static LIST_OBJECTS_NAMESPACE_JOURNAL_DEGRADED_BUCKETS: OnceCell<RwLock<HashSet<String>>> = OnceCell::const_new();
+#[cfg(any(test, feature = "list-chaos"))]
 static LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_CONFIG: OnceCell<Option<NamespaceMutationJournalChaosConfig>> = OnceCell::const_new();
+#[cfg(any(test, feature = "list-chaos"))]
 static LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_APPLIED: OnceCell<RwLock<HashSet<String>>> = OnceCell::const_new();
 
 async fn persistent_key_only_index_cache() -> &'static RwLock<Option<PersistentKeyOnlyIndexCache>> {
@@ -579,6 +610,7 @@ async fn list_objects_namespace_journal_degraded_buckets() -> &'static RwLock<Ha
         .await
 }
 
+#[cfg(any(test, feature = "list-chaos"))]
 async fn list_objects_namespace_journal_chaos_config() -> Option<&'static NamespaceMutationJournalChaosConfig> {
     LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_CONFIG
         .get_or_init(|| async { namespace_mutation_journal_chaos_config_from_env() })
@@ -586,6 +618,7 @@ async fn list_objects_namespace_journal_chaos_config() -> Option<&'static Namesp
         .as_ref()
 }
 
+#[cfg(any(test, feature = "list-chaos"))]
 async fn list_objects_namespace_journal_chaos_applied() -> &'static RwLock<HashSet<String>> {
     LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_APPLIED
         .get_or_init(|| async { RwLock::new(HashSet::new()) })
@@ -629,7 +662,7 @@ pub(crate) fn observe_scanner_namespace_mutations(bucket: &str, delta: u64) {
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| Some(current.saturating_add(delta)));
 }
 
-pub(super) async fn observe_list_objects_mutation(store: &ECStore, bucket: &str) -> u64 {
+pub(crate) async fn observe_list_objects_mutation(store: &ECStore, bucket: &str) -> u64 {
     observe_list_objects_mutations(store, bucket, 1).await.unwrap_or_default()
 }
 
@@ -681,6 +714,7 @@ enum NamespaceMutationJournalStatus {
 }
 
 impl NamespaceMutationJournalStatus {
+    #[cfg(any(test, feature = "list-chaos"))]
     fn from_env_value(value: &str) -> Option<Self> {
         if value.eq_ignore_ascii_case(LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_HEALTHY) {
             Some(Self::Healthy)
@@ -691,6 +725,7 @@ impl NamespaceMutationJournalStatus {
         }
     }
 
+    #[cfg(any(test, feature = "list-chaos"))]
     fn env_value(self) -> &'static str {
         match self {
             Self::Healthy => LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_HEALTHY,
@@ -712,6 +747,7 @@ struct NamespaceMutationJournalSnapshot {
     degraded: bool,
 }
 
+#[cfg(any(test, feature = "list-chaos"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NamespaceMutationJournalChaosConfig {
     bucket: String,
@@ -795,30 +831,35 @@ fn list_objects_namespace_journal_root_from_env() -> Option<PathBuf> {
         .filter(|path| !path.as_os_str().is_empty())
 }
 
+#[cfg(any(test, feature = "list-chaos"))]
 fn namespace_mutation_journal_chaos_enabled_from_env() -> bool {
     std::env::var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED)
         .ok()
         .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("on") || value.eq_ignore_ascii_case("true"))
 }
 
+#[cfg(any(test, feature = "list-chaos"))]
 fn namespace_mutation_journal_chaos_bucket_from_env() -> Option<String> {
     std::env::var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_BUCKET)
         .ok()
         .filter(|bucket| !bucket.is_empty())
 }
 
+#[cfg(any(test, feature = "list-chaos"))]
 fn namespace_mutation_journal_chaos_sequence_from_env() -> Option<u64> {
     std::env::var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_SEQUENCE)
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
 }
 
+#[cfg(any(test, feature = "list-chaos"))]
 fn namespace_mutation_journal_chaos_status_from_env() -> Option<NamespaceMutationJournalStatus> {
     std::env::var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS)
         .ok()
         .and_then(|value| NamespaceMutationJournalStatus::from_env_value(&value))
 }
 
+#[cfg(any(test, feature = "list-chaos"))]
 fn namespace_mutation_journal_chaos_config_from_env() -> Option<NamespaceMutationJournalChaosConfig> {
     if !namespace_mutation_journal_chaos_enabled_from_env() {
         return None;
@@ -846,6 +887,7 @@ fn namespace_mutation_journal_chaos_config_from_env() -> Option<NamespaceMutatio
     })
 }
 
+#[cfg(any(test, feature = "list-chaos"))]
 fn namespace_mutation_journal_chaos_applied_key(bucket: &str, status: NamespaceMutationJournalStatus) -> String {
     let mut key = String::with_capacity(bucket.len() + 1 + status.env_value().len());
     key.push_str(bucket);
@@ -854,6 +896,13 @@ fn namespace_mutation_journal_chaos_applied_key(bucket: &str, status: NamespaceM
     key
 }
 
+/// Production no-op twin of the chaos injector: without `list-chaos` the
+/// injection point compiles to nothing (backlog#1832).
+#[cfg(not(any(test, feature = "list-chaos")))]
+#[inline]
+async fn maybe_apply_system_namespace_mutation_journal_chaos(_store: &ECStore, _bucket: &str, _default_sequence: u64) {}
+
+#[cfg(any(test, feature = "list-chaos"))]
 async fn maybe_apply_system_namespace_mutation_journal_chaos(store: &ECStore, bucket: &str, default_sequence: u64) {
     let Some(config) = list_objects_namespace_journal_chaos_config().await else {
         return;
@@ -1349,11 +1398,11 @@ async fn persist_observed_list_objects_mutation(store: Option<&ECStore>, bucket:
 }
 
 fn encode_persistent_list_metadata_string(value: &str) -> String {
-    BASE64_STANDARD.encode(value.as_bytes())
+    BASE64_STANDARD.encode_to_string(value.as_bytes())
 }
 
 fn decode_persistent_list_metadata_string(value: &str) -> Option<String> {
-    let bytes = BASE64_STANDARD.decode(value).ok()?;
+    let bytes = BASE64_STANDARD.decode_to_vec(value).ok()?;
     String::from_utf8(bytes).ok()
 }
 
@@ -2061,9 +2110,18 @@ fn build_list_versions_next_marker(
     cache_id: Option<&str>,
 ) -> (Option<String>, Option<String>) {
     if let Some(last) = objects.last() {
+        // A null version carries the synthesized `Some(Uuid::nil())` identity
+        // here; advertise it as the literal `null` marker so a resumed listing
+        // parses it back to `VersionMarker::Null` instead of a nil UUID that
+        // `find_version_index` can never match (issue #6745).
         (
             Some(append_list_cache_id_to_marker(last.name.clone(), cache_id)),
-            Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string())),
+            Some(
+                last.version_id
+                    .filter(|v| !v.is_nil())
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "null".to_string()),
+            ),
         )
     } else if let Some(last_prefix) = prefixes.last() {
         (Some(append_list_cache_id_to_marker(last_prefix.clone(), cache_id)), None)
@@ -2495,6 +2553,7 @@ struct ListingSupplementOptions {
     path: String,
     recursive: bool,
     incl_deleted: bool,
+    skip_hidden_prefix_check: bool,
     filter_prefix: Option<String>,
     forward_to: Option<String>,
     per_disk_limit: i32,
@@ -2627,6 +2686,7 @@ async fn read_fallback_listing_disk(
                 base_dir: options.path,
                 recursive: options.recursive,
                 incl_deleted: options.incl_deleted,
+                skip_hidden_prefix_check: options.skip_hidden_prefix_check,
                 report_notfound: false,
                 filter_prefix: options.filter_prefix,
                 forward_to: options.forward_to,
@@ -3119,7 +3179,7 @@ impl ECStore {
                 .list_path(&page_opts)
                 .await
                 .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                    err: Some(err.into()),
+                    err: Some(to_filemeta_err(err)),
                     ..Default::default()
                 });
             let reached_end = match list_result.err.take() {
@@ -3482,7 +3542,7 @@ impl ECStore {
                         .list_path(&provider_opts)
                         .await
                         .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                            err: Some(err.into()),
+                            err: Some(to_filemeta_err(err)),
                             ..Default::default()
                         });
 
@@ -3716,7 +3776,7 @@ impl ECStore {
         }
 
         // Optimization: use get for single object lookup with exact prefix
-        if !opts.prefix.is_empty() && max_keys == 1 && opts.marker.is_none() {
+        if !opts.prefix.is_empty() && max_keys == 1 && opts.marker.is_none() && !incl_deleted {
             match self
                 .get_object_info(
                     &opts.bucket,
@@ -3728,17 +3788,16 @@ impl ECStore {
                 )
                 .await
             {
-                Ok(res) => {
+                Ok(res) if !res.delete_marker => {
                     return Ok(ListObjectsInfo {
                         objects: vec![res],
                         ..Default::default()
                     });
                 }
-                Err(err) => {
-                    if is_err_bucket_not_found(&err) {
-                        return Err(err);
-                    }
+                Err(err) if is_err_bucket_not_found(&err) => {
+                    return Err(err);
                 }
+                _ => {}
             };
         };
 
@@ -3746,7 +3805,7 @@ impl ECStore {
             .list_path(&opts)
             .await
             .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                err: Some(err.into()),
+                err: Some(to_filemeta_err(err)),
                 ..Default::default()
             });
         let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
@@ -3818,7 +3877,7 @@ impl ECStore {
         .await
     }
 
-    pub(crate) async fn inner_list_object_versions_for_lifecycle(
+    pub(crate) async fn list_object_versions_for_lifecycle(
         self: Arc<Self>,
         bucket: &str,
         prefix: &str,
@@ -3886,7 +3945,7 @@ impl ECStore {
             .list_path(&opts)
             .await
             .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                err: Some(err.into()),
+                err: Some(to_filemeta_err(err)),
                 ..Default::default()
             });
         let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
@@ -3983,6 +4042,8 @@ impl ECStore {
             o.recursive = true
         }
 
+        o.skip_hidden_prefix_check = can_skip_hidden_prefix_check(&o).await;
+
         o.parse_marker();
 
         if o.base_dir.is_empty() {
@@ -4065,7 +4126,7 @@ impl ECStore {
                 match res{
                     Ok(err) => {
                         log_list_path_worker_error("store", "worker_error", &log_context, err.as_ref());
-                        MetaCacheEntriesSortedResult{ entries: None, err: Some(err.as_ref().clone().into()) }
+                        MetaCacheEntriesSortedResult{ entries: None, err: Some(to_filemeta_err(err.as_ref().clone())) }
                     },
                     Err(err) => {
                         log_list_path_worker_error("store", "error_channel_closed", &log_context, &err);
@@ -4085,7 +4146,7 @@ impl ECStore {
 
         if let Ok(err) = err_rx.try_recv() {
             log_list_path_worker_error("store", "trailing_worker_error", &log_context, err.as_ref());
-            result.err = Some(err.as_ref().clone().into());
+            result.err = Some(to_filemeta_err(err.as_ref().clone()));
         }
 
         if result.err.is_some() {
@@ -4106,7 +4167,7 @@ impl ECStore {
             }
 
             if !truncated {
-                result.err = Some(Error::Unexpected.into());
+                result.err = Some(rustfs_filemeta::Error::Unexpected);
             }
         }
 
@@ -4306,7 +4367,7 @@ impl ECStore {
                     let reader_disks = disks.len();
 
                     let path = base_dir_from_prefix(prefix);
-                    ensure_non_empty_listing_disks(bucket, &path, &disks)?;
+                    ensure_non_empty_listing_disks(bucket, &path, &disks).map_err(to_filemeta_err)?;
 
                     let mut filter_prefix = {
                         prefix
@@ -4330,10 +4391,11 @@ impl ECStore {
                             path: path.clone(),
                             recursive: true,
                             incl_deleted: !opts.latest_only,
+                            skip_hidden_prefix_check: false,
                             filter_prefix: Some(filter_prefix.clone()),
                             forward_to: opts.marker.clone(),
                             per_disk_limit: bounded_usize_to_i32(opts.limit),
-                            skip_total_timeout: false,
+                            skip_total_timeout: opts.walkdir_timeout.is_none(),
                             walkdir_timeout: opts.walkdir_timeout,
                             walkdir_stall_timeout: opts.walkdir_stall_timeout,
                         },
@@ -4356,6 +4418,12 @@ impl ECStore {
                             forward_to: opts.marker.clone(),
                             min_disks: raw_min_disks,
                             per_disk_limit: bounded_usize_to_i32(opts.limit),
+                            // Skip the total walkdir timeout for listing operations.
+                            // Large buckets (millions of objects) can take longer than
+                            // the default 5s walkdir timeout to produce the first page
+                            // of results. The stall timeout still protects against
+                            // drives that stop making forward progress.
+                            skip_walkdir_total_timeout: opts.walkdir_timeout.is_none(),
                             walkdir_timeout: opts.walkdir_timeout,
                             walkdir_stall_timeout: opts.walkdir_stall_timeout,
                             agreed: Some(Box::new(move |entry: MetaCacheEntry| {
@@ -4640,7 +4708,7 @@ async fn gather_results(
             entry.name = entry.name.replace("\\", "/");
         }
 
-        // TODO: rx.recv()
+        // TODO(backlog): integrate rx.recv() for incremental listing results
 
         if let Some(marker) = &opts.marker
             && ((!opts.include_marker && &entry.name <= marker) || (opts.include_marker && &entry.name < marker))
@@ -4670,7 +4738,7 @@ async fn gather_results(
             continue;
         }
 
-        // TODO: Lifecycle
+        // TODO(backlog): integrate lifecycle evaluation during object listing
 
         entries.push(Some(entry));
         candidate_entries += 1;
@@ -4765,7 +4833,7 @@ async fn gather_results(
                 o: MetaCacheEntries(entries),
                 ..Default::default()
             }),
-            err: Some(Error::Unexpected.into()),
+            err: Some(rustfs_filemeta::Error::Unexpected),
         })
         .await
         .is_err()
@@ -5053,7 +5121,7 @@ impl Sets {
         // (notably `forward_past`) — see backlog#1047.
         opts.parse_marker();
 
-        if !opts.prefix.is_empty() && max_keys == 1 && opts.marker.is_none() {
+        if !opts.prefix.is_empty() && max_keys == 1 && opts.marker.is_none() && !incl_deleted {
             match self
                 .get_object_info(
                     &opts.bucket,
@@ -5065,17 +5133,16 @@ impl Sets {
                 )
                 .await
             {
-                Ok(res) => {
+                Ok(res) if !res.delete_marker => {
                     return Ok(ListObjectsInfo {
                         objects: vec![res],
                         ..Default::default()
                     });
                 }
-                Err(err) => {
-                    if is_err_bucket_not_found(&err) {
-                        return Err(err);
-                    }
+                Err(err) if is_err_bucket_not_found(&err) => {
+                    return Err(err);
                 }
+                _ => {}
             };
         }
 
@@ -5083,7 +5150,7 @@ impl Sets {
             .list_path(&opts)
             .await
             .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                err: Some(err.into()),
+                err: Some(to_filemeta_err(err)),
                 ..Default::default()
             });
         let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
@@ -5172,7 +5239,7 @@ impl Sets {
             .list_path(&opts)
             .await
             .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                err: Some(err.into()),
+                err: Some(to_filemeta_err(err)),
                 ..Default::default()
             });
         let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
@@ -5256,6 +5323,8 @@ impl Sets {
             o.recursive = true;
         }
 
+        o.skip_hidden_prefix_check = can_skip_hidden_prefix_check(&o).await;
+
         o.parse_marker();
 
         if o.base_dir.is_empty() {
@@ -5331,7 +5400,7 @@ impl Sets {
                 match res {
                     Ok(err) => {
                         log_list_path_worker_error("sets", "worker_error", &log_context, err.as_ref());
-                        MetaCacheEntriesSortedResult { entries: None, err: Some(err.as_ref().clone().into()) }
+                        MetaCacheEntriesSortedResult { entries: None, err: Some(to_filemeta_err(err.as_ref().clone())) }
                     },
                     Err(err) => {
                         log_list_path_worker_error("sets", "error_channel_closed", &log_context, &err);
@@ -5346,7 +5415,7 @@ impl Sets {
 
         if let Ok(err) = err_rx.try_recv() {
             log_list_path_worker_error("sets", "trailing_worker_error", &log_context, err.as_ref());
-            result.err = Some(err.as_ref().clone().into());
+            result.err = Some(to_filemeta_err(err.as_ref().clone()));
         }
 
         if result.err.is_some() {
@@ -5367,7 +5436,7 @@ impl Sets {
             }
 
             if !truncated {
-                result.err = Some(Error::Unexpected.into());
+                result.err = Some(rustfs_filemeta::Error::Unexpected);
             }
         }
 
@@ -5532,7 +5601,7 @@ impl Sets {
                 let reader_disks = disks.len();
 
                 let path = base_dir_from_prefix(prefix);
-                ensure_non_empty_listing_disks(bucket, &path, &disks)?;
+                ensure_non_empty_listing_disks(bucket, &path, &disks).map_err(to_filemeta_err)?;
 
                 let mut filter_prefix = prefix
                     .trim_start_matches(&path)
@@ -5551,10 +5620,11 @@ impl Sets {
                         path: path.clone(),
                         recursive: true,
                         incl_deleted: !opts.latest_only,
+                        skip_hidden_prefix_check: false,
                         filter_prefix: Some(filter_prefix.clone()),
                         forward_to: opts.marker.clone(),
                         per_disk_limit: bounded_usize_to_i32(opts.limit),
-                        skip_total_timeout: false,
+                        skip_total_timeout: opts.walkdir_timeout.is_none(),
                         walkdir_timeout: opts.walkdir_timeout,
                         walkdir_stall_timeout: opts.walkdir_stall_timeout,
                     },
@@ -5577,6 +5647,12 @@ impl Sets {
                         forward_to: opts.marker.clone(),
                         min_disks: raw_min_disks,
                         per_disk_limit: bounded_usize_to_i32(opts.limit),
+                        // Skip the total walkdir timeout for listing operations.
+                        // Large buckets (millions of objects) can take longer than
+                        // the default 5s walkdir timeout to produce the first page
+                        // of results. The stall timeout still protects against
+                        // drives that stop making forward progress.
+                        skip_walkdir_total_timeout: opts.walkdir_timeout.is_none(),
                         walkdir_timeout: opts.walkdir_timeout,
                         walkdir_stall_timeout: opts.walkdir_stall_timeout,
                         agreed: Some(Box::new(move |entry: MetaCacheEntry| {
@@ -5819,6 +5895,83 @@ impl Sets {
 }
 
 impl SetDisks {
+    pub(crate) async fn inner_list_object_versions_for_recursive_delete(
+        self: Arc<Self>,
+        bucket: &str,
+        prefix: &str,
+        marker: Option<String>,
+        version_marker: Option<String>,
+        max_keys: i32,
+    ) -> Result<ListObjectVersionsInfo> {
+        let max_keys = normalize_max_keys(max_keys);
+        if marker.is_none() && version_marker.is_some() {
+            return Err(StorageError::NotImplemented);
+        }
+
+        let has_version_marker = version_marker.is_some();
+        let version_marker = version_marker.map(parse_version_marker).transpose()?;
+        let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
+        let mut opts = ListPathOptions {
+            bucket: bucket.to_owned(),
+            prefix: prefix.to_owned(),
+            limit: effective_max_keys,
+            marker,
+            incl_deleted: true,
+            ask_disks: list_objects_quorum_from_env(),
+            versioned: true,
+            include_marker: has_version_marker,
+            ..Default::default()
+        };
+        opts.parse_marker();
+
+        let mut list_result = self
+            .list_path_result(&opts)
+            .await
+            .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
+                err: Some(to_filemeta_err(err)),
+                ..Default::default()
+            });
+        let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
+        let disk_has_more = list_result.err.is_none();
+        if let Some(err) = list_result.err.take()
+            && err != rustfs_filemeta::Error::Unexpected
+        {
+            return Err(to_object_err(err.into(), vec![bucket, prefix]));
+        }
+        if let Some(result) = list_result.entries.as_mut()
+            && !has_version_marker
+        {
+            result.forward_past(opts.marker.clone());
+        }
+        let version_marker = version_marker_for_entries(list_result.entries.as_ref(), opts.marker.as_deref(), version_marker);
+        let last_scanned_key = last_scanned_entry_name(list_result.entries.as_ref());
+        let entries = list_result.entries.unwrap_or_default();
+        let get_objects = ObjectInfo::from_meta_cache_entries_sorted_versions_for_recursive_delete(
+            &entries,
+            bucket,
+            prefix,
+            None,
+            version_marker,
+        )
+        .await?;
+        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate(
+            get_objects,
+            &None,
+            max_keys,
+            disk_has_more,
+            next_cache_id.as_deref(),
+            true,
+            last_scanned_key.as_deref(),
+        );
+        Ok(ListObjectVersionsInfo {
+            is_truncated,
+            next_marker,
+            next_version_idmarker,
+            objects,
+            prefixes,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn inner_list_objects_v2(
         self: Arc<Self>,
@@ -5904,7 +6057,7 @@ impl SetDisks {
             .list_path_result(&opts)
             .await
             .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                err: Some(err.into()),
+                err: Some(to_filemeta_err(err)),
                 ..Default::default()
             });
         let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
@@ -5992,7 +6145,7 @@ impl SetDisks {
             .list_path_result(&opts)
             .await
             .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                err: Some(err.into()),
+                err: Some(to_filemeta_err(err)),
                 ..Default::default()
             });
         let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
@@ -6223,6 +6376,8 @@ impl SetDisks {
             o.recursive = true;
         }
 
+        o.skip_hidden_prefix_check = can_skip_hidden_prefix_check(&o).await;
+
         o.parse_marker();
 
         if o.base_dir.is_empty() {
@@ -6298,7 +6453,7 @@ impl SetDisks {
                 match res {
                     Ok(err) => {
                         log_list_path_worker_error("set_disks", "worker_error", &log_context, err.as_ref());
-                        MetaCacheEntriesSortedResult { entries: None, err: Some(err.as_ref().clone().into()) }
+                        MetaCacheEntriesSortedResult { entries: None, err: Some(to_filemeta_err(err.as_ref().clone())) }
                     },
                     Err(err) => {
                         log_list_path_worker_error("set_disks", "error_channel_closed", &log_context, &err);
@@ -6313,7 +6468,7 @@ impl SetDisks {
 
         if let Ok(err) = err_rx.try_recv() {
             log_list_path_worker_error("set_disks", "trailing_worker_error", &log_context, err.as_ref());
-            result.err = Some(err.as_ref().clone().into());
+            result.err = Some(to_filemeta_err(err.as_ref().clone()));
         }
 
         if result.err.is_some() {
@@ -6334,7 +6489,7 @@ impl SetDisks {
             }
 
             if !truncated {
-                result.err = Some(Error::Unexpected.into());
+                result.err = Some(rustfs_filemeta::Error::Unexpected);
             }
         }
 
@@ -6447,6 +6602,7 @@ impl SetDisks {
                 path: opts.base_dir.clone(),
                 recursive: opts.recursive,
                 incl_deleted: opts.incl_deleted,
+                skip_hidden_prefix_check: opts.skip_hidden_prefix_check,
                 filter_prefix: opts.filter_prefix.clone(),
                 forward_to: opts.marker.clone(),
                 per_disk_limit: limit,
@@ -6469,6 +6625,7 @@ impl SetDisks {
                 path: opts.base_dir,
                 recursive: opts.recursive,
                 incl_deleted: opts.incl_deleted,
+                skip_hidden_prefix_check: opts.skip_hidden_prefix_check,
                 filter_prefix: opts.filter_prefix,
                 forward_to: opts.marker,
                 min_disks: raw_min_disks,
@@ -6845,6 +7002,7 @@ mod test {
                 path: String::new(),
                 recursive: true,
                 incl_deleted: false,
+                skip_hidden_prefix_check: false,
                 filter_prefix: None,
                 forward_to: None,
                 per_disk_limit: 100,
@@ -6861,6 +7019,7 @@ mod test {
                 path: String::new(),
                 recursive: true,
                 incl_deleted: false,
+                skip_hidden_prefix_check: false,
                 filter_prefix: None,
                 forward_to: None,
                 per_disk_limit: 0,
@@ -6917,6 +7076,7 @@ mod test {
                 path: String::new(),
                 recursive: true,
                 incl_deleted: false,
+                skip_hidden_prefix_check: false,
                 filter_prefix: None,
                 forward_to: None,
                 per_disk_limit: 0,
@@ -7606,6 +7766,31 @@ mod test {
             }
         }
         out
+    }
+
+    // A truncated versions listing ending on a null version must advertise the
+    // literal `null` continuation marker: a nil UUID parses to
+    // `VersionMarker::Version(nil)`, which no stored version matches, so the
+    // resumed page would replay every version (issue #6745).
+    #[test]
+    fn build_list_versions_next_marker_reports_null_for_nil_version_id() {
+        let null_version = ObjectInfo {
+            name: "obj-a".to_owned(),
+            version_id: Some(uuid::Uuid::nil()),
+            ..Default::default()
+        };
+        let real_version = ObjectInfo {
+            name: "obj-b".to_owned(),
+            version_id: Some(uuid::Uuid::from_u128(7)),
+            ..Default::default()
+        };
+
+        let (next_marker, next_version_idmarker) = super::build_list_versions_next_marker(&[null_version], &[], None);
+        assert_eq!(next_marker.as_deref(), Some("obj-a"));
+        assert_eq!(next_version_idmarker.as_deref(), Some("null"));
+
+        let (_, next_version_idmarker) = super::build_list_versions_next_marker(&[real_version], &[], None);
+        assert_eq!(next_version_idmarker.as_deref(), Some(uuid::Uuid::from_u128(7).to_string().as_str()));
     }
 
     // ECA-03 / #944: a page whose raw keys fully collapse into fewer than max_keys
@@ -9441,294 +9626,6 @@ mod test {
         walk_result_from_set_errors(&[None, Some(StorageError::DiskNotFound)])
             .expect("a partial outage with a healthy set must not fail the walk");
     }
-
-    // use std::sync::Arc;
-
-    // use crate::cache_value::metacache_set::list_path_raw;
-    // use crate::cache_value::metacache_set::ListPathRawOptions;
-    // use crate::disk::endpoint::Endpoint;
-    // use crate::disk::error::is_err_eof;
-    // use crate::disk::format::FormatV3;
-    // use crate::disk::new_disk;
-    // use crate::disk::DiskAPI;
-    // use crate::disk::DiskOption;
-    // use crate::disk::MetaCacheEntries;
-    // use crate::disk::MetaCacheEntry;
-    // use crate::disk::WalkDirOptions;
-    // use crate::layout::endpoints::EndpointServerPools;
-    // use crate::error::Error;
-    // use crate::metacache::writer::MetacacheReader;
-    // use crate::set_disk::SetDisks;
-    // use crate::store::list_objects::ListPathOptions;
-    // use crate::store::list_objects::WalkOptions;
-    // use crate::store::list_objects::WalkVersionsSortOrder;
-    // use futures::future::join_all;
-    // use rustfs_lock::namespace_lock::NsLockMap;
-    // use tokio::sync::broadcast;
-    // use tokio::sync::mpsc;
-    // use tokio::sync::RwLock;
-    // use uuid::Uuid;
-
-    // #[tokio::test]
-    // async fn test_walk_dir() {
-    //     let mut ep = Endpoint::try_from("/Users/weisd/project/weisd/s3-rustfs/target/volume/test").unwrap();
-    //     ep.pool_idx = 0;
-    //     ep.set_idx = 0;
-    //     ep.disk_idx = 0;
-    //     ep.is_local = true;
-
-    //     let disk = new_disk(&ep, &DiskOption::default()).await.expect("init disk fail");
-
-    //     // let disk = match LocalDisk::new(&ep, false).await {
-    //     //     Ok(res) => res,
-    //     //     Err(err) => {
-    //     //         println!("LocalDisk::new err {:?}", err);
-    //     //         return;
-    //     //     }
-    //     // };
-
-    //     let (rd, mut wr) = tokio::io::duplex(64);
-
-    //     let job = tokio::spawn(async move {
-    //         let opts = WalkDirOptions {
-    //             bucket: "dada".to_owned(),
-    //             base_dir: "".to_owned(),
-    //             recursive: true,
-    //             ..Default::default()
-    //         };
-
-    //         println!("walk opts {:?}", opts);
-    //         if let Err(err) = disk.walk_dir(opts, &mut wr).await {
-    //             println!("walk_dir err {:?}", err);
-    //         }
-    //     });
-
-    //     let job2 = tokio::spawn(async move {
-    //         let mut mrd = MetacacheReader::new(rd);
-
-    //         loop {
-    //             match mrd.peek().await {
-    //                 Ok(res) => {
-    //                     if let Some(info) = res {
-    //                         println!("info {:?}", info.name)
-    //                     } else {
-    //                         break;
-    //                     }
-    //                 }
-    //                 Err(err) => {
-    //                     if is_err_eof(&err) {
-    //                         break;
-    //                     }
-
-    //                     println!("get err {:?}", err);
-    //                     break;
-    //                 }
-    //             }
-    //         }
-    //     });
-    //     join_all(vec![job, job2]).await;
-    // }
-
-    // #[tokio::test]
-    // async fn test_list_path_raw() {
-    //     let mut ep = Endpoint::try_from("/Users/weisd/project/weisd/s3-rustfs/target/volume/test").unwrap();
-    //     ep.pool_idx = 0;
-    //     ep.set_idx = 0;
-    //     ep.disk_idx = 0;
-    //     ep.is_local = true;
-
-    //     let disk = new_disk(&ep, &DiskOption::default()).await.expect("init disk fail");
-
-    //     // let disk = match LocalDisk::new(&ep, false).await {
-    //     //     Ok(res) => res,
-    //     //     Err(err) => {
-    //     //         println!("LocalDisk::new err {:?}", err);
-    //     //         return;
-    //     //     }
-    //     // };
-
-    //     let (_, rx) = broadcast::channel(1);
-    //     let bucket = "dada".to_owned();
-    //     let forward_to = None;
-    //     let disks = vec![Some(disk)];
-    //     let fallback_disks = Vec::new();
-
-    //     list_path_raw(
-    //         rx,
-    //         ListPathRawOptions {
-    //             disks,
-    //             fallback_disks,
-    //             bucket,
-    //             path: "".to_owned(),
-    //             recursice: true,
-    //             forward_to,
-    //             min_disks: 1,
-    //             report_not_found: false,
-    //             agreed: Some(Box::new(move |entry: MetaCacheEntry| {
-    //                 Box::pin(async move { println!("get entry: {}", entry.name) })
-    //             })),
-    //             partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<Error>]| {
-    //                 Box::pin(async move { println!("get entries: {:?}", entries) })
-    //             })),
-    //             finished: None,
-    //             ..Default::default()
-    //         },
-    //     )
-    //     .await
-    //     .unwrap();
-    // }
-
-    // #[tokio::test]
-    // async fn test_set_list_path() {
-    //     let mut ep = Endpoint::try_from("/Users/weisd/project/weisd/s3-rustfs/target/volume/test").unwrap();
-    //     ep.pool_idx = 0;
-    //     ep.set_idx = 0;
-    //     ep.disk_idx = 0;
-    //     ep.is_local = true;
-
-    //     let disk = new_disk(&ep, &DiskOption::default()).await.expect("init disk fail");
-    //     let _ = disk.set_disk_id(Some(Uuid::new_v4())).await;
-
-    //     let set = SetDisks {
-    //         lockers: Vec::new(),
-    //         locker_owner: String::new(),
-    //         ns_mutex: Arc::new(RwLock::new(NsLockMap::new(false))),
-    //         disks: RwLock::new(vec![Some(disk)]),
-    //         set_endpoints: Vec::new(),
-    //         set_drive_count: 1,
-    //         default_parity_count: 0,
-    //         set_index: 0,
-    //         pool_index: 0,
-    //         format: FormatV3::new(1, 1),
-    //     };
-
-    //     let (_tx, rx) = broadcast::channel(1);
-
-    //     let bucket = "dada".to_owned();
-
-    //     let opts = ListPathOptions {
-    //         bucket,
-    //         recursive: true,
-    //         ..Default::default()
-    //     };
-
-    //     let (sender, mut recv) = mpsc::channel(10);
-
-    //     set.list_path(rx, opts, sender).await.unwrap();
-
-    //     while let Some(entry) = recv.recv().await {
-    //         println!("get entry {:?}", entry.name)
-    //     }
-    // }
-
-    // #[tokio::test]
-    //walk() {
-    //     let server_address = "localhost:9000";
-
-    //     let (endpoint_pools, _setup_type) = EndpointServerPools::from_volumes(
-    //         server_address,
-    //         vec!["/Users/weisd/project/weisd/s3-rustfs/target/volume/test".to_string()],
-    //     )
-    //     .unwrap();
-
-    //     let store = ECStore::new(server_address.to_string(), endpoint_pools.clone())
-    //         .await
-    //         .unwrap();
-
-    //     let (_tx, rx) = broadcast::channel(1);
-
-    //     let bucket = "dada".to_owned();
-    //     let opts = ListPathOptions {
-    //         bucket,
-    //         recursive: true,
-    //         ..Default::default()
-    //     };
-
-    //     let (sender, mut recv) = mpsc::channel(10);
-
-    //     store.list_merged(rx, opts, sender).await.unwrap();
-
-    //     while let Some(entry) = recv.recv().await {
-    //         println!("get entry {:?}", entry.name)
-    //     }
-    // }
-
-    // #[tokio::test]
-    // async fn test_list_path() {
-    //     let server_address = "localhost:9000";
-
-    //     let (endpoint_pools, _setup_type) = EndpointServerPools::from_volumes(
-    //         server_address,
-    //         vec!["/Users/weisd/project/weisd/s3-rustfs/target/volume/test".to_string()],
-    //     )
-    //     .unwrap();
-
-    //     let store = ECStore::new(server_address.to_string(), endpoint_pools.clone())
-    //         .await
-    //         .unwrap();
-
-    //     let bucket = "dada".to_owned();
-    //     let opts = ListPathOptions {
-    //         bucket,
-    //         recursive: true,
-    //         limit: 100,
-
-    //         ..Default::default()
-    //     };
-
-    //     let ret = store.list_path(&opts).await.unwrap();
-    //     println!("ret {:?}", ret);
-    // }
-
-    // #[tokio::test]
-    // async fn test_list_objects_v2() {
-    //     let server_address = "localhost:9000";
-
-    //     let (endpoint_pools, _setup_type) = EndpointServerPools::from_volumes(
-    //         server_address,
-    //         vec!["/Users/weisd/project/weisd/s3-rustfs/target/volume/test".to_string()],
-    //     )
-    //     .unwrap();
-
-    //     let store = ECStore::new(server_address.to_string(), endpoint_pools.clone())
-    //         .await
-    //         .unwrap();
-
-    //     let ret = store.list_objects_v2("data", "", "", "", 100, false, "").await.unwrap();
-    //     println!("ret {:?}", ret);
-    // }
-
-    // #[tokio::test]
-    // async fn test_walk() {
-    //     let server_address = "localhost:9000";
-
-    //     let (endpoint_pools, _setup_type) = EndpointServerPools::from_volumes(
-    //         server_address,
-    //         vec!["/Users/weisd/project/weisd/s3-rustfs/target/volume/test".to_string()],
-    //     )
-    //     .unwrap();
-
-    //     let store = ECStore::new(server_address.to_string(), endpoint_pools.clone())
-    //         .await
-    //         .unwrap();
-
-    //     ECStore::init(store.clone()).await.unwrap();
-
-    //     let (_tx, rx) = broadcast::channel(1);
-
-    //     let bucket = ".rustfs.sys";
-    //     let prefix = "config/iam/sts/";
-
-    //     let (sender, mut recv) = mpsc::channel(10);
-
-    //     let opts = WalkOptions::default();
-
-    //     store.walk(rx, bucket, prefix, sender, opts).await.unwrap();
-
-    //     while let Some(entry) = recv.recv().await {
-    //         println!("get entry {:?}", entry)
-    //     }
-    // }
 
     #[tokio::test]
     async fn merge_entry_channels_produces_sorted_unique_output_from_two_channels() {

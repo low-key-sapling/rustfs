@@ -17,6 +17,13 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+pub(crate) use s3s::dto::{
+    BucketLifecycleConfiguration as EcstoreBucketLifecycleConfiguration, LifecycleRuleFilter as EcstoreLifecycleRuleFilter,
+    ObjectLockConfiguration as EcstoreObjectLockConfiguration, VersioningConfiguration as EcstoreVersioningConfiguration,
+};
+#[cfg(test)]
+pub(crate) use s3s::dto::{ExpirationStatus as EcstoreExpirationStatus, LifecycleRule as EcstoreLifecycleRule};
+
 pub(crate) use rustfs_ecstore::api::bucket::bucket_target_sys::BucketTargetSys as EcstoreBucketTargetSys;
 pub(crate) use rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc as EcstoreLcEventSrc;
 pub(crate) use rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_ops::{
@@ -47,6 +54,8 @@ pub(crate) use rustfs_ecstore::api::bucket::versioning_sys::BucketVersioningSys 
 pub(crate) use rustfs_ecstore::api::cache::{
     ListPathRawOptions as EcstoreListPathRawOptions, list_path_raw as ecstore_list_path_raw,
 };
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::capacity::PoolDecommissionInfo as EcstorePoolDecommissionInfo;
 pub(crate) use rustfs_ecstore::api::capacity::{
     is_reserved_or_invalid_bucket as ecstore_is_reserved_or_invalid_bucket, path2_bucket_object as ecstore_path2_bucket_object,
     path2_bucket_object_with_base_path as ecstore_path2_bucket_object_with_base_path,
@@ -58,6 +67,7 @@ pub(crate) use rustfs_ecstore::api::config::storageclass::{
     RRS as ECSTORE_STORAGECLASS_RRS, STANDARD as ECSTORE_STORAGECLASS_STANDARD,
 };
 pub(crate) use rustfs_ecstore::api::data_usage::{
+    invalidate_admin_data_usage_snapshot_cache as ecstore_invalidate_admin_data_usage_snapshot_cache,
     invalidate_data_usage_snapshot_cache as ecstore_invalidate_data_usage_snapshot_cache,
     replace_bucket_usage_memory_from_info as ecstore_replace_bucket_usage_memory_from_info,
 };
@@ -77,9 +87,16 @@ pub(crate) use rustfs_ecstore::api::disk::{
 pub(crate) use rustfs_ecstore::api::error::{
     Error as EcstoreErrorType, Result as EcstoreResultType, StorageError as EcstoreStorageError,
 };
+pub(crate) use rustfs_ecstore::api::event::{EventArgs as EcstoreEventArgs, send_event as ecstore_send_event};
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::layout::{
     EndpointServerPools as EcstoreEndpointServerPools, Endpoints as EcstoreEndpoints, PoolEndpoints as EcstorePoolEndpoints,
+};
+pub(crate) use rustfs_ecstore::api::object::SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY;
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::rebalance::{
+    RebalStatus as EcstoreRebalStatus, RebalanceInfo as EcstoreRebalanceInfo, RebalanceMeta as EcstoreRebalanceMeta,
+    RebalanceStats as EcstoreRebalanceStats,
 };
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::runtime::InstanceContext as EcstoreInstanceContext;
@@ -89,10 +106,9 @@ pub(crate) use rustfs_ecstore::api::runtime::{
     setup_is_erasure_sd as ecstore_is_erasure_sd,
 };
 pub(crate) use rustfs_ecstore::api::set_disk::SetDisks as EcstoreSetDisks;
-pub(crate) use rustfs_ecstore::api::storage::ECStore as EcstoreStore;
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::storage::init_local_disks_with_instance_ctx as ecstore_init_local_disks_with_instance_ctx;
-pub(crate) use rustfs_ecstore::api::tier::tier_config::TierConfig as EcstoreTierConfig;
+pub(crate) use rustfs_ecstore::api::storage::{ECStore as EcstoreStore, SCANNER_PUBLICATION_LEASE_TTL_MS};
 use rustfs_storage_api as storage_contracts;
 
 pub(crate) mod owner {
@@ -102,27 +118,30 @@ pub(crate) mod owner {
 
     pub(crate) use super::{
         ECSTORE_BUCKET_META_PREFIX, ECSTORE_RUSTFS_META_BUCKET, ECSTORE_STORAGE_FORMAT_FILE, ECSTORE_STORAGECLASS_RRS,
-        ECSTORE_STORAGECLASS_STANDARD, ECSTORE_TRANSITION_COMPLETE, EcstoreBucketTargetSys, EcstoreBucketVersioningSys,
-        EcstoreDisk, EcstoreDiskAPI, EcstoreDiskBytes, EcstoreDiskError, EcstoreDiskInfo, EcstoreDiskInfoOptions,
-        EcstoreDiskLocation, EcstoreDiskResult, EcstoreErrorType, EcstoreEvaluator, EcstoreEvent, EcstoreLcEventSrc,
-        EcstoreLifecycle, EcstoreListPathRawOptions, EcstoreNsScannerOpenRequest, EcstoreObjectOpts,
-        EcstoreReplicationConfigurationExt, EcstoreReplicationScannerBridge, EcstoreResultType, EcstoreScanGuard,
-        EcstoreSetDisks, EcstoreStorageError, EcstoreStore, EcstoreTierConfig, EcstoreVersioningApi,
-        ScannerReplicationHealObject, ScannerReplicationHealResult, ScannerReplicationQueueAdmission, ecstore_apply_expiry_rule,
-        ecstore_apply_transition_rule, ecstore_expiry_state_handle, ecstore_get_global_tier_config_mgr,
-        ecstore_get_lifecycle_config, ecstore_get_object_lock_config, ecstore_get_replication_config,
+        ECSTORE_STORAGECLASS_STANDARD, ECSTORE_TRANSITION_COMPLETE, EcstoreBucketLifecycleConfiguration, EcstoreBucketTargetSys,
+        EcstoreBucketVersioningSys, EcstoreDisk, EcstoreDiskAPI, EcstoreDiskBytes, EcstoreDiskError, EcstoreDiskInfo,
+        EcstoreDiskInfoOptions, EcstoreDiskLocation, EcstoreDiskResult, EcstoreErrorType, EcstoreEvaluator, EcstoreEvent,
+        EcstoreEventArgs, EcstoreLcEventSrc, EcstoreLifecycle, EcstoreLifecycleRuleFilter, EcstoreListPathRawOptions,
+        EcstoreNsScannerOpenRequest, EcstoreObjectLockConfiguration, EcstoreObjectOpts, EcstoreReplicationConfigurationExt,
+        EcstoreReplicationScannerBridge, EcstoreResultType, EcstoreScanGuard, EcstoreSetDisks, EcstoreStorageError, EcstoreStore,
+        EcstoreVersioningApi, EcstoreVersioningConfiguration, SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY,
+        SCANNER_PUBLICATION_LEASE_TTL_MS, ScannerReplicationHealObject, ScannerReplicationHealResult,
+        ScannerReplicationQueueAdmission, ecstore_apply_expiry_rule, ecstore_apply_transition_rule, ecstore_expiry_state_handle,
+        ecstore_get_global_tier_config_mgr, ecstore_get_lifecycle_config, ecstore_get_object_lock_config,
+        ecstore_get_replication_config, ecstore_invalidate_admin_data_usage_snapshot_cache,
         ecstore_invalidate_data_usage_snapshot_cache, ecstore_is_erasure, ecstore_is_erasure_sd,
         ecstore_is_reserved_or_invalid_bucket, ecstore_list_path_raw, ecstore_object_opts_from_object_info,
         ecstore_path2_bucket_object, ecstore_path2_bucket_object_with_base_path, ecstore_read_config,
         ecstore_replace_bucket_usage_memory_from_info, ecstore_resolve_object_store_handle, ecstore_save_config,
-        scanner_replication_config_for_lifecycle_eval,
+        ecstore_send_event, scanner_replication_config_for_lifecycle_eval,
     };
 
     #[cfg(test)]
     pub(crate) use super::{
         EcstoreDiskOption, EcstoreDiskStore, EcstoreEndpoint, EcstoreEndpointServerPools, EcstoreEndpoints,
-        EcstoreInstanceContext, EcstorePoolEndpoints, ecstore_config_init, ecstore_init_bucket_metadata_sys,
-        ecstore_init_local_disks_with_instance_ctx, ecstore_new_disk,
+        EcstoreExpirationStatus, EcstoreInstanceContext, EcstoreLifecycleRule, EcstorePoolDecommissionInfo, EcstorePoolEndpoints,
+        EcstoreRebalStatus, EcstoreRebalanceInfo, EcstoreRebalanceMeta, EcstoreRebalanceStats, ecstore_config_init,
+        ecstore_init_bucket_metadata_sys, ecstore_init_local_disks_with_instance_ctx, ecstore_new_disk,
     };
 }
 
@@ -265,13 +284,13 @@ impl From<EcstoreReplicationHealQueueResult> for ScannerReplicationHealResult {
 }
 
 pub(crate) mod scan {
-    pub use super::storage_contracts::SCANNER_ACTIVITY_PROTOCOL_VERSION;
     pub(crate) use super::storage_contracts::{
         BucketOperations, BucketOptions, NamespaceLocking, SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION,
         SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION,
     };
     #[cfg(test)]
-    pub(crate) use super::storage_contracts::{MakeBucketOptions, ObjectIO};
+    pub(crate) use super::storage_contracts::{DeleteBucketOptions, MakeBucketOptions, ObjectIO};
+    pub use super::storage_contracts::{SCANNER_ACTIVITY_PROTOCOL_VERSION, SCANNER_ACTIVITY_V6_PROTOCOL_VERSION};
 }
 
 pub(crate) mod scanner_io {
